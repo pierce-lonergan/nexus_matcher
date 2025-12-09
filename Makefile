@@ -70,9 +70,17 @@ help:
 	@echo "  make start         Start the API server"
 	@echo "  make start-dev     Start in development mode (reload)"
 	@echo ""
+	@echo "$(GREEN)Publishing (PyPI):$(NC)"
+	@echo "  make build         Build distribution packages"
+	@echo "  make check-build   Verify built packages"
+	@echo "  make publish-test  Publish to TestPyPI"
+	@echo "  make publish       Publish to PyPI (production)"
+	@echo "  make release       Full release workflow"
+	@echo ""
 	@echo "$(GREEN)Maintenance:$(NC)"
 	@echo "  make clean         Remove venv and cache files"
 	@echo "  make clean-cache   Remove only cache files"
+	@echo "  make clean-build   Remove build artifacts"
 	@echo "  make update        Update all dependencies"
 	@echo ""
 	@echo "$(GREEN)Docker:$(NC)"
@@ -283,3 +291,53 @@ docs: $(VENV_DIR)
 docs-serve: $(VENV_DIR)
 	@$(PIP) install -e ".[docs]" --quiet
 	@$(VENV_BIN)/mkdocs serve
+
+# =============================================================================
+# PUBLISHING
+# =============================================================================
+
+## build: Build distribution packages
+build: $(VENV_DIR) clean-build
+	@echo "$(BLUE)[INFO]$(NC) Building packages..."
+	@$(PIP) install --upgrade build twine --quiet
+	@$(VENV_BIN)/python -m build
+	@echo "$(GREEN)[✓]$(NC) Build complete. Packages in dist/"
+
+## clean-build: Remove build artifacts
+clean-build:
+	@rm -rf dist/ build/
+	@find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
+
+## check-build: Verify built packages
+check-build: $(VENV_DIR)
+	@$(VENV_BIN)/twine check dist/*
+
+## publish-test: Publish to TestPyPI
+publish-test: build check-build
+	@echo "$(YELLOW)[WARN]$(NC) Publishing to TestPyPI..."
+	@$(VENV_BIN)/twine upload --repository testpypi dist/*
+	@echo "$(GREEN)[✓]$(NC) Published to TestPyPI"
+	@echo "Install with: pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ nexus-matcher"
+
+## publish: Publish to PyPI (PRODUCTION)
+publish: build check-build
+	@echo "$(RED)[WARN]$(NC) Publishing to PyPI (PRODUCTION)!"
+	@read -p "Are you sure? [y/N] " confirm && [ "$$confirm" = "y" ]
+	@$(VENV_BIN)/twine upload dist/*
+	@echo "$(GREEN)[✓]$(NC) Published to PyPI"
+	@echo "Install with: pip install nexus-matcher"
+
+## release: Full release workflow
+release: test lint typecheck build check-build
+	@echo ""
+	@echo "$(GREEN)═══════════════════════════════════════════════════════════════$(NC)"
+	@echo "$(GREEN)  Release Ready!$(NC)"
+	@echo "$(GREEN)  Version: $$($(VENV_BIN)/python -c 'import nexus_matcher; print(nexus_matcher.__version__)')$(NC)"
+	@echo "$(GREEN)═══════════════════════════════════════════════════════════════$(NC)"
+	@echo ""
+	@echo "Next steps:"
+	@echo "  1. make publish-test  # Test on TestPyPI first"
+	@echo "  2. make publish       # Publish to PyPI"
+	@echo "  3. git tag -a v$$($(VENV_BIN)/python -c 'import nexus_matcher; print(nexus_matcher.__version__)') -m 'Release'"
+	@echo "  4. git push origin --tags"
+	@echo ""

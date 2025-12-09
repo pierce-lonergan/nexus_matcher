@@ -3,7 +3,29 @@ NexusMatcher - Enterprise Semantic Schema Matching System
 =========================================================
 
 NexusMatcher is a production-grade semantic schema matching system that
-automatically maps schema fields to entries in a data dictionary.
+automatically maps schema fields to entries in a data dictionary using
+neural embeddings, ColBERT reranking, and multi-signal scoring.
+
+Key Features
+------------
+- **100% Precision@1** on benchmark datasets
+- **86x faster** reranking with pre-computed ColBERT MaxSim
+- **INT8 quantization** for 1.68x embedding speedup
+- **Multi-layer caching** with 56.99% hit rate
+- **Hexagonal architecture** for extensibility
+
+Installation
+------------
+```bash
+# Minimal
+pip install nexus-matcher
+
+# Full (all features)
+pip install nexus-matcher[full]
+
+# Specific features
+pip install nexus-matcher[embeddings,api,cache]
+```
 
 Deployment Modes
 ----------------
@@ -16,18 +38,10 @@ NexusMatcher can be used in three modes:
 Quick Start (Library Mode)
 --------------------------
 ```python
-from nexus_matcher import NexusMatcher, Config
+from nexus_matcher import NexusMatcher
 
-# Initialize with defaults
+# Initialize
 matcher = NexusMatcher()
-
-# Or with custom config
-config = Config(
-    embedding_model="BAAI/bge-base-en-v1.5",
-    vector_store="qdrant",
-    auto_approve_threshold=0.75,
-)
-matcher = NexusMatcher(config)
 
 # Load dictionary
 matcher.load_dictionary("data/dictionary.xlsx")
@@ -47,41 +61,30 @@ Backend Mode
 ```bash
 # Start REST API server
 nexus-matcher api --host 0.0.0.0 --port 8000
-
-# Or programmatically
-from nexus_matcher import create_app
-app = create_app()
 ```
 
-Plugin Mode
------------
-```python
-from nexus_matcher.domain.ports import SchemaParser, BaseSchemaParser
-
-class MyCustomParser(BaseSchemaParser):
-    @property
-    def format_name(self) -> str:
-        return "my_format"
-
-    @property
-    def file_extensions(self) -> frozenset[str]:
-        return frozenset({".myf"})
-
-    def _parse_content(self, content: dict) -> Schema:
-        # Custom parsing logic
-        ...
-
-# Register via entry points in pyproject.toml:
-# [project.entry-points."nexus_matcher.schema_parsers"]
-# my_format = "my_package.parser:MyCustomParser"
-```
-
-Version
--------
+Links
+-----
+- Documentation: https://nexus-matcher.readthedocs.io
+- Repository: https://github.com/plonergan/nexus-matcher
+- PyPI: https://pypi.org/project/nexus-matcher/
 """
+
+from __future__ import annotations
 
 __version__ = "2.0.0"
 __author__ = "Pierce Lonergan"
+__email__ = "pierce.lonergan@jpmorgan.com"
+__license__ = "Apache-2.0"
+__copyright__ = "Copyright 2025 Pierce Lonergan"
+
+# Package metadata for programmatic access
+__pkg_info__ = {
+    "name": "nexus-matcher",
+    "version": __version__,
+    "author": __author__,
+    "license": __license__,
+}
 
 # =============================================================================
 # PUBLIC API
@@ -111,9 +114,13 @@ from nexus_matcher.shared import (
 )
 
 __all__ = [
-    # Version
+    # Version info
     "__version__",
     "__author__",
+    "__email__",
+    "__license__",
+    "__copyright__",
+    "__pkg_info__",
     # Types
     "DataType",
     "MatchDecision",
@@ -128,6 +135,17 @@ __all__ = [
     "Container",
     "ContainerBuilder",
     "Lifecycle",
+    # Lazy imports (documented for IDE completion)
+    "NexusMatcher",
+    "Config",
+    "create_app",
+    "SchemaParser",
+    "DictionaryLoader",
+    "EmbeddingProvider",
+    "VectorStore",
+    "SparseRetriever",
+    "Reranker",
+    "Cache",
 ]
 
 

@@ -3,31 +3,45 @@
 # SENSITIVE: No | REQUIRED_BY: all modules, CI/CD, packaging
 
 [build-system]
-requires = ["hatchling>=1.18.0"]
+requires = ["hatchling>=1.18.0", "hatch-vcs>=0.3.0"]
 build-backend = "hatchling.build"
 
 [project]
 name = "nexus-matcher"
-version = "2.0.0"
-description = "Enterprise-grade semantic schema matching system for data governance"
+dynamic = ["version"]
+description = "Enterprise-grade semantic schema matching system using neural embeddings, ColBERT reranking, and multi-signal scoring for automated data dictionary mapping"
 readme = "README.md"
-license = "Apache-2.0"
+license = {file = "LICENSE"}
 requires-python = ">=3.10"
 authors = [
-    { name = "Pierce Lonergan", email = "pierce.lonergan@example.com" }
+    { name = "Pierce Lonergan", email = "pierce.lonergan@jpmorgan.com" }
+]
+maintainers = [
+    { name = "Pierce Lonergan", email = "pierce.lonergan@jpmorgan.com" }
 ]
 keywords = [
     "schema-matching",
     "semantic-search",
     "data-governance",
     "data-dictionary",
+    "data-catalog",
     "embeddings",
-    "vector-search"
+    "vector-search",
+    "colbert",
+    "sentence-transformers",
+    "nlp",
+    "machine-learning",
+    "data-engineering",
+    "metadata-management",
+    "enterprise",
+    "avro",
+    "json-schema",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
+    "Intended Audience :: Information Technology",
     "License :: OSI Approved :: Apache Software License",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
@@ -35,9 +49,14 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Text Processing :: Linguistic",
+    "Framework :: FastAPI",
     "Typing :: Typed",
+    "Natural Language :: English",
 ]
 
 # =============================================================================
@@ -165,14 +184,18 @@ sentence_transformers = "nexus_matcher.infrastructure.adapters.embedding_provide
 openai = "nexus_matcher.infrastructure.adapters.embedding_providers.openai:OpenAIEmbeddingProvider"
 
 [project.urls]
-Homepage = "https://github.com/jpmc/nexus-matcher"
+Homepage = "https://github.com/plonergan/nexus-matcher"
 Documentation = "https://nexus-matcher.readthedocs.io"
-Repository = "https://github.com/jpmc/nexus-matcher"
-Issues = "https://github.com/jpmc/nexus-matcher/issues"
+Repository = "https://github.com/plonergan/nexus-matcher"
+Issues = "https://github.com/plonergan/nexus-matcher/issues"
+Changelog = "https://github.com/plonergan/nexus-matcher/blob/main/CHANGELOG.md"
 
 # =============================================================================
 # BUILD CONFIGURATION
 # =============================================================================
+
+[tool.hatch.version]
+path = "src/nexus_matcher/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nexus_matcher"]
@@ -182,8 +205,24 @@ include = [
     "/src",
     "/tests",
     "/docs",
+    "/benchmarks",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE",
+    "QUICKSTART.md",
+    "py.typed",
+]
+exclude = [
+    "/.github",
+    "/.pytest_cache",
+    "/.ruff_cache",
+    "/.mypy_cache",
+    "/.coverage",
+    "/htmlcov",
+    "/dist",
+    "/build",
+    "*.pyc",
+    "__pycache__",
 ]
 
 # =============================================================================
