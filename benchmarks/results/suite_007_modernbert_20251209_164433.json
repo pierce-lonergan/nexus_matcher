@@ -1,0 +1,313 @@
+{
+  "timestamp": "2025-12-09T16:44:33.015032",
+  "models": {
+    "baseline": "sentence-transformers/all-MiniLM-L6-v2",
+    "modernbert": "nomic-ai/modernbert-embed-base"
+  },
+  "transformers_version": "4.54.1",
+  "config": {
+    "batch_sizes": [
+      1,
+      8,
+      16,
+      32,
+      64
+    ],
+    "warmup_iterations": 3,
+    "measurement_iterations": 10
+  },
+  "model_info": {
+    "baseline": {
+      "embedding_dim": 384,
+      "max_seq_length": 256
+    },
+    "modernbert": {
+      "embedding_dim": 768,
+      "max_seq_length": 8192
+    }
+  },
+  "quality": {
+    "baseline": {
+      "avg_similar": 0.6794398844242096,
+      "avg_dissimilar": 0.11107958853244781,
+      "separation": 0.5683602958917617
+    },
+    "modernbert": {
+      "avg_similar": 0.7210210680961608,
+      "avg_dissimilar": 0.4009606301784515,
+      "separation": 0.32006043791770933
+    }
+  },
+  "baseline_results": [
+    {
+      "model_name": "MiniLM-L6",
+      "batch_size": 1,
+      "avg_latency_ms": 3.7014800123870373,
+      "p50_latency_ms": 3.525799955241382,
+      "p95_latency_ms": 4.807709972374139,
+      "p99_latency_ms": 5.322581953369081,
+      "throughput_texts_per_sec": 270.1622044840147,
+      "embedding_dim": 384,
+      "latencies": [
+        5.451299948617816,
+        4.02110000140965,
+        3.889200044795871,
+        3.231300041079521,
+        3.7857000716030598,
+        3.2377999741584063,
+        3.263800172135234,
+        3.5249998327344656,
+        3.082999959588051,
+        3.5266000777482986
+      ]
+    },
+    {
+      "model_name": "MiniLM-L6",
+      "batch_size": 8,
+      "avg_latency_ms": 5.803769989870489,
+      "p50_latency_ms": 5.765600013546646,
+      "p95_latency_ms": 6.4531549462117255,
+      "p99_latency_ms": 6.46399098681286,
+      "throughput_texts_per_sec": 1378.414377889314,
+      "embedding_dim": 384,
+      "latencies": [
+        6.021300097927451,
+        5.4981999564915895,
+        5.000599892809987,
+        6.436599884182215,
+        5.787800066173077,
+        5.333400098606944,
+        5.743399960920215,
+        5.6078999768942595,
+        6.466699996963143,
+        6.141799967736006
+      ]
+    },
+    {
+      "model_name": "MiniLM-L6",
+      "batch_size": 16,
+      "avg_latency_ms": 6.936839991249144,
+      "p50_latency_ms": 6.797699956223369,
+      "p95_latency_ms": 8.096364932134746,
+      "p99_latency_ms": 8.505432987585664,
+      "throughput_texts_per_sec": 2306.5257408537714,
+      "embedding_dim": 384,
+      "latencies": [
+        8.607700001448393,
+        6.834000116214156,
+        6.768499966710806,
+        7.47139984741807,
+        6.826899945735931,
+        6.413399940356612,
+        6.525199860334396,
+        6.5570001024752855,
+        6.981900194659829,
+        6.382399937137961
+      ]
+    },
+    {
+      "model_name": "MiniLM-L6",
+      "batch_size": 32,
+      "avg_latency_ms": 11.039640009403229,
+      "p50_latency_ms": 10.831100051291287,
+      "p95_latency_ms": 12.83944505266845,
+      "p99_latency_ms": 13.599009094759822,
+      "throughput_texts_per_sec": 2898.6452432093233,
+      "embedding_dim": 384,
+      "latencies": [
+        13.788900105282664,
+        11.678999988362193,
+        11.358800111338496,
+        10.17290004529059,
+        11.480699991807342,
+        10.303399991244078,
+        10.159000055864453,
+        9.971499908715487,
+        10.003600036725402,
+        11.478599859401584
+      ]
+    },
+    {
+      "model_name": "MiniLM-L6",
+      "batch_size": 64,
+      "avg_latency_ms": 20.542230014689267,
+      "p50_latency_ms": 20.54580010008067,
+      "p95_latency_ms": 21.786665124818683,
+      "p99_latency_ms": 21.950213154777884,
+      "throughput_texts_per_sec": 3115.5332188489324,
+      "embedding_dim": 384,
+      "latencies": [
+        21.991100162267685,
+        19.566899864003062,
+        21.28019998781383,
+        20.715800113976,
+        21.53680007904768,
+        20.07570001296699,
+        20.784399937838316,
+        19.480299903079867,
+        20.375800086185336,
+        19.615299999713898
+      ]
+    }
+  ],
+  "modernbert_results": [
+    {
+      "model_name": "ModernBERT",
+      "batch_size": 1,
+      "avg_latency_ms": 24.60163999348879,
+      "p50_latency_ms": 24.013450019992888,
+      "p95_latency_ms": 27.97051502857357,
+      "p99_latency_ms": 28.814822961576283,
+      "throughput_texts_per_sec": 40.647696668379254,
+      "embedding_dim": 768,
+      "latencies": [
+        29.02589994482696,
+        24.761400185525417,
+        24.31259979493916,
+        23.590599885210395,
+        23.975800024345517,
+        26.680600130930543,
+        23.873499827459455,
+        21.941500017419457,
+        23.803400108590722,
+        24.05110001564026
+      ]
+    },
+    {
+      "model_name": "ModernBERT",
+      "batch_size": 8,
+      "avg_latency_ms": 38.116539968177676,
+      "p50_latency_ms": 38.34339999593794,
+      "p95_latency_ms": 39.665814908221364,
+      "p99_latency_ms": 39.84556281007826,
+      "throughput_texts_per_sec": 209.8826390506314,
+      "embedding_dim": 768,
+      "latencies": [
+        38.073299918323755,
+        37.44350001215935,
+        35.30219988897443,
+        38.99849997833371,
+        37.65459987334907,
+        39.39120005816221,
+        36.77739994600415,
+        39.020700147375464,
+        39.89049978554249,
+        38.61350007355213
+      ]
+    },
+    {
+      "model_name": "ModernBERT",
+      "batch_size": 16,
+      "avg_latency_ms": 58.610560023225844,
+      "p50_latency_ms": 58.862649952061474,
+      "p95_latency_ms": 60.70102502126247,
+      "p99_latency_ms": 60.98740498069674,
+      "throughput_texts_per_sec": 272.98834874909255,
+      "embedding_dim": 768,
+      "latencies": [
+        61.058999970555305,
+        60.263500083237886,
+        59.04219998046756,
+        55.71720004081726,
+        58.68309992365539,
+        59.06120012514293,
+        58.31010011024773,
+        57.63200018554926,
+        57.04029998742044,
+        59.296999825164676
+      ]
+    },
+    {
+      "model_name": "ModernBERT",
+      "batch_size": 32,
+      "avg_latency_ms": 94.95559001807123,
+      "p50_latency_ms": 94.77265004534274,
+      "p95_latency_ms": 99.41350001608953,
+      "p99_latency_ms": 99.77854002965614,
+      "throughput_texts_per_sec": 336.9996436640539,
+      "embedding_dim": 768,
+      "latencies": [
+        92.67090004868805,
+        89.19820003211498,
+        98.35850005038083,
+        98.85579999536276,
+        96.57950000837445,
+        93.03599991835654,
+        93.46050000749528,
+        91.44190000370145,
+        96.0848000831902,
+        99.8698000330478
+      ]
+    },
+    {
+      "model_name": "ModernBERT",
+      "batch_size": 64,
+      "avg_latency_ms": 178.22591001167893,
+      "p50_latency_ms": 178.2430000603199,
+      "p95_latency_ms": 183.45856002997607,
+      "p99_latency_ms": 183.6123520275578,
+      "throughput_texts_per_sec": 359.09481396844126,
+      "embedding_dim": 768,
+      "latencies": [
+        179.84879994764924,
+        183.22360003367066,
+        174.13639998994768,
+        176.08619993552566,
+        176.63720017299056,
+        173.6780998762697,
+        173.4961001202464,
+        181.51529994793236,
+        183.65080002695322,
+        179.98660006560385
+      ]
+    }
+  ],
+  "comparisons": [
+    {
+      "batch_size": 1,
+      "baseline_latency_ms": 3.7014800123870373,
+      "modernbert_latency_ms": 24.60163999348879,
+      "speedup_ratio": 0.15045663676757698,
+      "meets_target": false,
+      "target_speedup": 2.0
+    },
+    {
+      "batch_size": 8,
+      "baseline_latency_ms": 5.803769989870489,
+      "modernbert_latency_ms": 38.116539968177676,
+      "speedup_ratio": 0.1522638202396093,
+      "meets_target": false,
+      "target_speedup": 2.0
+    },
+    {
+      "batch_size": 16,
+      "baseline_latency_ms": 6.936839991249144,
+      "modernbert_latency_ms": 58.610560023225844,
+      "speedup_ratio": 0.11835478092173585,
+      "meets_target": false,
+      "target_speedup": 2.0
+    },
+    {
+      "batch_size": 32,
+      "baseline_latency_ms": 11.039640009403229,
+      "modernbert_latency_ms": 94.95559001807123,
+      "speedup_ratio": 0.11626108591713502,
+      "meets_target": false,
+      "target_speedup": 2.0
+    },
+    {
+      "batch_size": 64,
+      "baseline_latency_ms": 20.542230014689267,
+      "modernbert_latency_ms": 178.22591001167893,
+      "speedup_ratio": 0.1152595041503402,
+      "meets_target": false,
+      "target_speedup": 2.0
+    }
+  ],
+  "validation": {
+    "speedup_pass": false,
+    "quality_pass": false,
+    "avg_speedup": 0.13051916559927945,
+    "overall_pass": false
+  }
+}

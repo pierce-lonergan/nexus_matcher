@@ -1,0 +1,25 @@
+{
+  "suite": "SUITE-002",
+  "gap": "GAP-002",
+  "target": "INT8 Quantization",
+  "timestamp": "2025-12-09T13:24:41.167947",
+  "cpu_features": {
+    "vnni": true,
+    "avx2": true,
+    "avx512": true,
+    "amx": false
+  },
+  "vnni_available": true,
+  "quantization_recommended": true,
+  "batch_size": 32,
+  "latency_p50_ms": 5.5211494999412025,
+  "latency_p95_ms": 6.317967999848406,
+  "latency_p99_ms": 6.676731999959884,
+  "throughput_texts_per_sec": 5656.8311990806,
+  "baseline_latency_ms": 12.8,
+  "quantized_latency_ms": 5.5211494999412025,
+  "speedup_ratio": 2.3183577985229915,
+  "memory_mb": 2.9296875,
+  "targets_met": 3,
+  "targets_total": 4
+}

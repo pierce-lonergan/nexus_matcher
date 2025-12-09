@@ -1,0 +1,21 @@
+{
+  "suite": "SUITE-004c",
+  "gap": "GAP-006",
+  "target": "Enhanced Context Injection",
+  "timestamp": "2025-12-09T13:14:26.781756",
+  "fields_processed": 40,
+  "total_time_ms": 1.9282450002151563,
+  "throughput_fields_per_sec": 103721.25947568059,
+  "latency_per_field_p50_us": 8.471000001009088,
+  "latency_per_field_p95_us": 16.897000023163855,
+  "latency_per_field_p99_us": 17.39399999678426,
+  "depth_1_coverage_pct": 100.0,
+  "depth_2_coverage_pct": 100.0,
+  "depth_3_coverage_pct": 100.0,
+  "depth_4_plus_coverage_pct": 100.0,
+  "avg_enriched_length": 35.9,
+  "avg_hierarchy_tokens": 1.78125,
+  "humanization_rate_pct": 100.0,
+  "targets_met": 4,
+  "targets_total": 4
+}

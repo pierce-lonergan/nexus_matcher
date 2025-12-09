@@ -1,0 +1,221 @@
+{
+  "timestamp": "2025-12-09T16:57:49.187966",
+  "dependencies": {
+    "torch": true,
+    "networkx": true,
+    "sentence_transformers": true
+  },
+  "baseline": {
+    "precision_at_1": 1.0,
+    "precision_at_5": 1.0,
+    "mrr": 1.0
+  },
+  "gap009": {
+    "precision_at_1": 0.29411764705882354,
+    "precision_at_5": 0.7647058823529411,
+    "mrr": 0.4774509803921569,
+    "f1": 0.29411764705882354,
+    "latency_ms": 2.181099960580468,
+    "latency_per_field_ms": 0.128299997681204,
+    "f1_pass": false,
+    "details": [
+      {
+        "source": "customer.id",
+        "expected": "cust_id",
+        "predicted": [
+          "cust_id",
+          "ord_id",
+          "prod_id"
+        ],
+        "correct_at_1": true,
+        "correct_at_5": true
+      },
+      {
+        "source": "customer.name",
+        "expected": "cust_name",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": true,
+        "correct_at_5": true
+      },
+      {
+        "source": "customer.email",
+        "expected": "cust_email",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": true
+      },
+      {
+        "source": "customer.phone",
+        "expected": "cust_phone",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": true
+      },
+      {
+        "source": "customer.address.street",
+        "expected": "cust_street",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": true
+      },
+      {
+        "source": "customer.address.city",
+        "expected": "cust_city",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": true
+      },
+      {
+        "source": "customer.address.zip",
+        "expected": "cust_postal",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": false
+      },
+      {
+        "source": "customer.created_at",
+        "expected": "cust_created",
+        "predicted": [
+          "ord_date",
+          "cust_created",
+          "cust_name"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": true
+      },
+      {
+        "source": "customer.is_active",
+        "expected": "cust_active",
+        "predicted": [
+          "cust_active",
+          "cust_id",
+          "cust_name"
+        ],
+        "correct_at_1": true,
+        "correct_at_5": true
+      },
+      {
+        "source": "order.id",
+        "expected": "ord_id",
+        "predicted": [
+          "cust_id",
+          "ord_id",
+          "prod_id"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": true
+      },
+      {
+        "source": "order.amount",
+        "expected": "ord_total",
+        "predicted": [
+          "ord_total",
+          "prod_price",
+          "salary"
+        ],
+        "correct_at_1": true,
+        "correct_at_5": true
+      },
+      {
+        "source": "order.status",
+        "expected": "ord_status",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": false
+      },
+      {
+        "source": "order.date",
+        "expected": "ord_date",
+        "predicted": [
+          "ord_date",
+          "cust_created",
+          "cust_name"
+        ],
+        "correct_at_1": true,
+        "correct_at_5": true
+      },
+      {
+        "source": "product.id",
+        "expected": "prod_id",
+        "predicted": [
+          "cust_id",
+          "ord_id",
+          "prod_id"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": true
+      },
+      {
+        "source": "product.name",
+        "expected": "prod_name",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": false
+      },
+      {
+        "source": "product.price",
+        "expected": "prod_price",
+        "predicted": [
+          "ord_total",
+          "prod_price",
+          "salary"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": true
+      },
+      {
+        "source": "product.category",
+        "expected": "prod_category",
+        "predicted": [
+          "cust_name",
+          "cust_email",
+          "cust_phone"
+        ],
+        "correct_at_1": false,
+        "correct_at_5": false
+      }
+    ]
+  },
+  "gap008": {
+    "test_accuracy": 0.89,
+    "test_mrr": 0.5380545514427094,
+    "schema_mrr": 0.9705882352941176,
+    "separation": 0.7233479619026184,
+    "training_time_s": 1.0036700000055134,
+    "final_loss": 0.13099814942479135,
+    "final_accuracy": 0.974,
+    "mrr_pass": true
+  }
+}

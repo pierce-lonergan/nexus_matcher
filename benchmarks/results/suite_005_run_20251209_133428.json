@@ -1,0 +1,65 @@
+{
+  "suite_id": "SUITE-005",
+  "suite_name": "Incremental Update Performance",
+  "timestamp": "2025-12-09T13:34:27.999554",
+  "environment": {
+    "python_version": "3.12.3",
+    "platform": "Linux-4.4.0-x86_64-with-glibc2.39",
+    "blake3_available": true,
+    "hash_algorithm": "BLAKE3"
+  },
+  "results": [
+    {
+      "scenario": "initial_load",
+      "corpus_size": 50000,
+      "change_count": 50000,
+      "change_rate_pct": 100.0,
+      "detection_time_ms": 46.34516500004793,
+      "savings_pct": 0.0,
+      "throughput_entries_per_sec": 1078861.1929625948
+    },
+    {
+      "scenario": "0.1%_change",
+      "corpus_size": 50000,
+      "change_count": 50,
+      "change_rate_pct": 0.1,
+      "detection_time_ms": 111.71829999989313,
+      "savings_pct": 99.9,
+      "throughput_entries_per_sec": 447554.2502888768
+    },
+    {
+      "scenario": "1%_change",
+      "corpus_size": 50000,
+      "change_count": 500,
+      "change_rate_pct": 1.0,
+      "detection_time_ms": 105.12998000012885,
+      "savings_pct": 99.0,
+      "throughput_entries_per_sec": 475601.7265478289
+    },
+    {
+      "scenario": "5%_change",
+      "corpus_size": 50000,
+      "change_count": 2500,
+      "change_rate_pct": 5.0,
+      "detection_time_ms": 106.93128899993098,
+      "savings_pct": 95.0,
+      "throughput_entries_per_sec": 467589.98668792134
+    },
+    {
+      "scenario": "10%_change",
+      "corpus_size": 50000,
+      "change_count": 5000,
+      "change_rate_pct": 10.0,
+      "detection_time_ms": 107.94839899995168,
+      "savings_pct": 90.0,
+      "throughput_entries_per_sec": 463184.26640141633
+    }
+  ],
+  "hash_benchmark": {
+    "iterations": 10000,
+    "total_time_ms": 14.313405999928364,
+    "avg_time_us": 1.4313405999928364,
+    "throughput_per_sec": 698645.7311453366,
+    "content_length": 460
+  }
+}

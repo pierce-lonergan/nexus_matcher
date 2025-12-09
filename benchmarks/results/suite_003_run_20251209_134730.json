@@ -1,0 +1,61 @@
+{
+  "suite_id": "SUITE-003",
+  "suite_name": "ColBERT MaxSim Reranking Performance",
+  "timestamp": "2025-12-09T13:47:29.156167",
+  "environment": {
+    "python_version": "3.12.3",
+    "platform": "Linux-4.4.0-x86_64-with-glibc2.39",
+    "ragatouille_available": false
+  },
+  "reranker_type": "mock",
+  "results": [
+    {
+      "scenario": "10_candidates",
+      "num_candidates": 10,
+      "num_iterations": 50,
+      "p50_latency_ms": 1.0862889999998515,
+      "p95_latency_ms": 1.3891660000240336,
+      "p99_latency_ms": 1.8865909999874475,
+      "min_latency_ms": 0.88355700000875,
+      "max_latency_ms": 1.8865909999874475,
+      "avg_latency_ms": 1.1233827999990353,
+      "throughput_candidates_per_sec": 8901.685160221954
+    },
+    {
+      "scenario": "50_candidates",
+      "num_candidates": 50,
+      "num_iterations": 50,
+      "p50_latency_ms": 4.358482000014874,
+      "p95_latency_ms": 4.989211999998133,
+      "p99_latency_ms": 5.396453000003021,
+      "min_latency_ms": 4.078190999990738,
+      "max_latency_ms": 5.396453000003021,
+      "avg_latency_ms": 4.4371998800005485,
+      "throughput_candidates_per_sec": 11268.367743666715
+    },
+    {
+      "scenario": "100_candidates",
+      "num_candidates": 100,
+      "num_iterations": 50,
+      "p50_latency_ms": 8.609559999996463,
+      "p95_latency_ms": 9.814513999998553,
+      "p99_latency_ms": 10.660803999996915,
+      "min_latency_ms": 8.209389999990435,
+      "max_latency_ms": 10.660803999996915,
+      "avg_latency_ms": 8.761697099998287,
+      "throughput_candidates_per_sec": 11413.313980007315
+    },
+    {
+      "scenario": "200_candidates",
+      "num_candidates": 200,
+      "num_iterations": 50,
+      "p50_latency_ms": 16.44731600001137,
+      "p95_latency_ms": 18.21171800000343,
+      "p99_latency_ms": 19.616730999985066,
+      "min_latency_ms": 15.658293000001322,
+      "max_latency_ms": 19.616730999985066,
+      "avg_latency_ms": 16.626018260000137,
+      "throughput_candidates_per_sec": 12029.338406368282
+    }
+  ]
+}
