@@ -1460,6 +1460,6 @@ Apache 2.0 - See [LICENSE](LICENSE) for details.
 
 **Built for enterprise data engineering**
 
-[Documentation](docs/) • [Issues](https://github.com/your-org/nexus_matcher/issues) • [Discussions](https://github.com/your-org/nexus_matcher/discussions)
+[Documentation](docs/) • [Issues](https://github.com/pierce-lonergan/nexus_matcher/issues) • [Discussions](https://github.com/pierce-lonergan/nexus_matcher/discussions)
 
 </div>

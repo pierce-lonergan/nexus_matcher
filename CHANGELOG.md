@@ -186,7 +186,7 @@ with **86x faster reranking** through systematic research-driven enhancements.
 
 ## Links
 
-- [GitHub Repository](https://github.com/plonergan/nexus-matcher)
+- [GitHub Repository](https://github.com/pierce-lonergan/nexus_matcher)
 - [Documentation](https://nexus-matcher.readthedocs.io)
 - [PyPI Package](https://pypi.org/project/nexus-matcher/)
-- [Issue Tracker](https://github.com/plonergan/nexus-matcher/issues)
+- [Issue Tracker](https://github.com/pierce-lonergan/nexus_matcher/issues)

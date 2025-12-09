@@ -323,8 +323,8 @@ docker run -p 6333:6333 qdrant/qdrant
 
 ## Getting Help
 
-- **Issues**: [GitHub Issues](https://github.com/your-org/nexus_matcher/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/your-org/nexus_matcher/discussions)
+- **Issues**: [GitHub Issues](https://github.com/pierce-lonergan/nexus_matcher/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/pierce-lonergan/nexus_matcher/discussions)
 - **Documentation**: [docs/](docs/)
 
 ---

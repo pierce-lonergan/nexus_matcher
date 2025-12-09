@@ -184,11 +184,11 @@ sentence_transformers = "nexus_matcher.infrastructure.adapters.embedding_provide
 openai = "nexus_matcher.infrastructure.adapters.embedding_providers.openai:OpenAIEmbeddingProvider"
 
 [project.urls]
-Homepage = "https://github.com/plonergan/nexus-matcher"
+Homepage = "https://github.com/pierce-lonergan/nexus_matcher"
 Documentation = "https://nexus-matcher.readthedocs.io"
-Repository = "https://github.com/plonergan/nexus-matcher"
-Issues = "https://github.com/plonergan/nexus-matcher/issues"
-Changelog = "https://github.com/plonergan/nexus-matcher/blob/main/CHANGELOG.md"
+Repository = "https://github.com/pierce-lonergan/nexus_matcher"
+Issues = "https://github.com/pierce-lonergan/nexus_matcher/issues"
+Changelog = "https://github.com/pierce-lonergan/nexus_matcher/blob/main/CHANGELOG.md"
 
 # =============================================================================
 # BUILD CONFIGURATION

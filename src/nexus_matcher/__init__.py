@@ -66,7 +66,7 @@ nexus-matcher api --host 0.0.0.0 --port 8000
 Links
 -----
 - Documentation: https://nexus-matcher.readthedocs.io
-- Repository: https://github.com/plonergan/nexus-matcher
+- Repository: https://github.com/pierce-lonergan/nexus_matcher
 - PyPI: https://pypi.org/project/nexus-matcher/
 """
 

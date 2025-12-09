@@ -335,7 +335,7 @@ pip show nexus-matcher
 - **PyPI**: https://pypi.org/project/nexus-matcher/
 - **TestPyPI**: https://test.pypi.org/project/nexus-matcher/
 - **Documentation**: https://nexus-matcher.readthedocs.io
-- **Repository**: https://github.com/plonergan/nexus-matcher
+- **Repository**: https://github.com/pierce-lonergan/nexus_matcher
 
 ---
 
