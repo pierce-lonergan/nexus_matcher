@@ -72,9 +72,9 @@ Links
 
 from __future__ import annotations
 
-__version__ = "2.0.0"
+__version__ = "1.0.0"
 __author__ = "Pierce Lonergan"
-__email__ = "pierce.lonergan@jpmorgan.com"
+__email__ = "lonerganpierce@gmail.com"
 __license__ = "Apache-2.0"
 __copyright__ = "Copyright 2025 Pierce Lonergan"
 

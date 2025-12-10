@@ -14,10 +14,10 @@ readme = "README.md"
 license = {file = "LICENSE"}
 requires-python = ">=3.10"
 authors = [
-    { name = "Pierce Lonergan", email = "pierce.lonergan@jpmorgan.com" }
+    { name = "Pierce Lonergan", email = "lonerganpierce@gmail.com" }
 ]
 maintainers = [
-    { name = "Pierce Lonergan", email = "pierce.lonergan@jpmorgan.com" }
+    { name = "Pierce Lonergan", email = "lonerganpierce@gmail.com" }
 ]
 keywords = [
     "schema-matching",
