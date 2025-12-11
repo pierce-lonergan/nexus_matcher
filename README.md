@@ -1449,7 +1449,6 @@ Apache 2.0 - See [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 - **Pierce Lonergan** - Architecture and implementation
-- **Anthropic Claude** - AI-assisted development
 - **Sentence-Transformers** team - Embedding models
 - **Qdrant** team - Vector search infrastructure
 - **FastAPI** team - Web framework
