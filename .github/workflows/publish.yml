@@ -161,8 +161,8 @@ jobs:
       
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
-        # Uses trusted publishing - no API token needed!
-        # Configure at: https://pypi.org/manage/project/nexus-matcher/settings/publishing/
+        with:
+          password: ${{ secrets.PYPI_API_TOKEN }}
 
   create-github-release:
     name: Create GitHub Release Assets
