@@ -49,7 +49,7 @@ jobs:
           twine check dist/*
           # Show package info
           ls -la dist/
-
+      
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -65,23 +65,23 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python-version: ['3.10', '3.11', '3.12']
-
+    
     steps:
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
+      
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           name: python-package-distributions
           path: dist/
-
+      
       - name: List dist contents
         shell: bash
         run: ls -la dist/
-
+      
       - name: Install package
         shell: python
         run: |
@@ -106,12 +106,12 @@ jobs:
               check=True
           )
           sys.exit(result.returncode)
-
+      
       - name: Test import
         run: |
           python -c "import nexus_matcher; print(f'Version: {nexus_matcher.__version__}')"
           python -c "from nexus_matcher import SchemaField, DictionaryEntry; print('Core imports OK')"
-
+      
       - name: Test CLI (if available)
         run: |
           pip install typer rich
@@ -123,18 +123,18 @@ jobs:
     needs: [build, test-install]
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'testpypi'
-
+    
     environment:
       name: testpypi
       url: https://test.pypi.org/project/nexus-matcher/
-
+    
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           name: python-package-distributions
           path: dist/
-
+      
       - name: Publish to TestPyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
@@ -147,18 +147,18 @@ jobs:
     if: |
       (github.event_name == 'release' && github.event.action == 'published') ||
       (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'pypi')
-
+    
     environment:
       name: pypi
       url: https://pypi.org/project/nexus-matcher/
-
+    
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           name: python-package-distributions
           path: dist/
-
+      
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         # Uses trusted publishing - no API token needed!
@@ -168,19 +168,56 @@ jobs:
     name: Create GitHub Release Assets
     needs: publish-pypi
     runs-on: ubuntu-latest
-    if: github.event_name == 'release'
-
+    if: |
+      (github.event_name == 'release') ||
+      (github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'pypi')
+    
     permissions:
       contents: write
-
+    
     steps:
       - name: Download artifacts
         uses: actions/download-artifact@v4
         with:
           name: python-package-distributions
           path: dist/
+      
+      - name: Get version from wheel
+        id: version
+        shell: python
+        run: |
+          import os
+          from pathlib import Path
+          
+          wheels = list(Path("dist").glob("*.whl"))
+          if wheels:
+              # Extract version from wheel filename: nexus_matcher-1.0.0-py3-none-any.whl
+              name = wheels[0].stem  # nexus_matcher-1.0.0-py3-none-any
+              version = name.split("-")[1]  # 1.0.0
+              with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+                  f.write(f"version={version}\n")
+                  f.write(f"tag=v{version}\n")
 
-      - name: Upload to GitHub Release
+      - name: Upload to GitHub Release (on release event)
+        if: github.event_name == 'release'
         uses: softprops/action-gh-release@v1
         with:
           files: dist/*
+
+      - name: Create Release and Upload Assets (on workflow_dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }} - Release
+          body: |
+            ## Release ${{ steps.version.outputs.version }}
+            
+            Published to PyPI: https://pypi.org/project/nexus-matcher/${{ steps.version.outputs.version }}/
+            
+            ### Installation
+            ```bash
+            pip install nexus-matcher==${{ steps.version.outputs.version }}
+            ```
+          files: dist/*
+          generate_release_notes: true
