@@ -22,6 +22,7 @@ import dataclasses
 import json
 import math
 import re
+import sys
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -189,8 +190,19 @@ def _load_matching_config(source: MatchingConfig | str | Path | None) -> Matchin
         raise FileNotFoundError(f"Matching config not found: {path}")
 
     if path.suffix.lower() == ".toml":
-        import tomllib
-
+        # tomllib is stdlib from 3.11 only, and this package supports 3.10.
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover - version-dependent
+            try:
+                import tomli as tomllib  # type: ignore[no-redef]
+            except ModuleNotFoundError:
+                raise ModuleNotFoundError(
+                    f"Reading {path.name} needs a TOML parser on Python "
+                    f"{sys.version_info.major}.{sys.version_info.minor}. Either install "
+                    f"one (pip install tomli) or use a JSON config file, which needs "
+                    f"nothing extra."
+                ) from None
         data = tomllib.loads(path.read_text(encoding="utf-8"))
     else:
         data = json.loads(path.read_text(encoding="utf-8"))

@@ -12,6 +12,7 @@ believes the setting took effect.
 from __future__ import annotations
 
 import json
+import sys
 
 import pytest
 
@@ -41,6 +42,11 @@ class TestLoadMatchingConfig:
         assert cfg.fusion_alpha == 0.90  # untouched keys keep their defaults
 
     def test_toml_file(self, tmp_path):
+        """TOML needs a parser on 3.10, where tomllib is not yet stdlib."""
+        pytest.importorskip(
+            "tomllib" if sys.version_info >= (3, 11) else "tomli",
+            reason="no TOML parser on this interpreter",
+        )
         p = tmp_path / "m.toml"
         p.write_text("auto_approve_threshold = 0.92\nreview_threshold = 0.4\n")
         cfg = _load_matching_config(p)
