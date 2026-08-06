@@ -197,6 +197,10 @@ data/
 nexus_matcher.zip
 *.docx
 
-# Intermediate model exports (the shipped copy lives in src/nexus_matcher/_models/)
-models/
-dist_test/
+# Intermediate model exports (the shipped copy lives in src/nexus_matcher/_models/).
+# ANCHORED with a leading slash. An unanchored `models/` matches a directory of that name
+# at ANY depth, which silently swallowed src/nexus_matcher/domain/models/ -- hatchling
+# honours .gitignore for file selection, so the built wheel was missing the entities
+# module and every install of it failed at `import nexus_matcher`.
+/models/
+/dist_test/

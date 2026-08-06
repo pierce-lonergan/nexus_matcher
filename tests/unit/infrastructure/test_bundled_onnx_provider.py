@@ -30,8 +30,24 @@ from nexus_matcher.infrastructure.adapters.embedding_providers.bundled_onnx impo
     default_embedding_provider,
 )
 
+
+def _runtime_available() -> bool:
+    """Weights AND the runtime that loads them. Checking only the file made CI ERROR
+    rather than skip when onnxruntime was missing, which hid the real problem (the
+    runtime was never declared as a dependency) behind 20 identical tracebacks."""
+    if not bundled_model_available():
+        return False
+    try:
+        import onnxruntime  # noqa: F401
+        import tokenizers  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 pytestmark = pytest.mark.skipif(
-    not bundled_model_available(), reason="bundled model weights not present in this install"
+    not _runtime_available(),
+    reason="bundled encoder unavailable (missing weights, onnxruntime or tokenizers)",
 )
 
 

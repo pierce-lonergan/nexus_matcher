@@ -64,7 +64,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-        python-version: ['3.10', '3.11', '3.12']
+        python-version: ['3.10', '3.11', '3.12', '3.13']
 
     steps:
       - name: Set up Python ${{ matrix.python-version }}
@@ -111,6 +111,61 @@ jobs:
         run: |
           python -c "import nexus_matcher; print(f'Version: {nexus_matcher.__version__}')"
           python -c "from nexus_matcher import SchemaField, DictionaryEntry; print('Core imports OK')"
+
+      # Import alone is not enough. A wheel can import fine and still be missing a
+      # subpackage that only a deeper path touches -- exactly what happened when an
+      # unanchored `models/` gitignore rule silently dropped domain/models from the
+      # build. Walk EVERY module so a missing one fails here rather than for a user.
+      - name: Verify the wheel is complete
+        shell: python
+        run: |
+          import pkgutil, importlib, sys
+          import nexus_matcher
+          failed = []
+          for mod in pkgutil.walk_packages(nexus_matcher.__path__, "nexus_matcher."):
+              try:
+                  importlib.import_module(mod.name)
+              except ImportError as exc:
+                  # Optional extras (torch, qdrant, redis) are legitimately absent here.
+                  msg = str(exc).lower()
+                  optional = (
+                      "torch", "sentence_transformers", "qdrant", "redis", "fastapi",
+                      "typer", "pandas", "openpyxl", "fastavro", "sqlparse",
+                      "jsonschema", "bm25", "networkx", "model2vec", "sqlalchemy",
+                  )
+                  if any(k in msg for k in optional):
+                      continue
+                  failed.append(f"{mod.name}: {exc}")
+              except Exception as exc:
+                  failed.append(f"{mod.name}: {type(exc).__name__}: {exc}")
+          if failed:
+              print("Modules that failed to import from the built wheel:")
+              for f in failed:
+                  print("  " + f)
+              sys.exit(1)
+          print("all modules import cleanly")
+
+      # The headline promise is that `pip install nexus-matcher` works with no download.
+      # Prove it on every OS and Python version, with the network explicitly disabled.
+      - name: Verify the bundled encoder works offline
+        env:
+          HF_HUB_OFFLINE: '1'
+          TRANSFORMERS_OFFLINE: '1'
+        shell: python
+        run: |
+          import sys
+          from nexus_matcher.infrastructure.adapters.embedding_providers.bundled_onnx import (
+              bundled_model_available, default_embedding_provider,
+          )
+          assert bundled_model_available(), "the wheel does not carry its model weights"
+          provider = default_embedding_provider()
+          docs = provider.embed_documents(["Customer Account Balance", "Transaction Date"])
+          query = provider.embed_queries(["cust_acct_bal"])
+          assert docs.shape == (2, 384), docs.shape
+          sims = (query @ docs.T)[0]
+          assert sims[0] > sims[1], f"encoder produced nonsense: {sims}"
+          assert "torch" not in sys.modules, "the bundled path pulled in torch"
+          print(f"offline encoder OK on {sys.platform}, similarities {sims}")
 
       - name: Test CLI (if available)
         run: |

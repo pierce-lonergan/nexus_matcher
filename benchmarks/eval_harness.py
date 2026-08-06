@@ -87,6 +87,10 @@ class Query:
     data_type: str
     parent_path: str
     gold_id: str
+    # The source field's own documentation, when the corpus has one (Avro `doc`, FHIR
+    # `comment`). Kept on the QUERY side only: putting the target's definition here is
+    # what makes a benchmark degenerate, so this must be independently authored text.
+    doc: str = ""
 
 
 @dataclass

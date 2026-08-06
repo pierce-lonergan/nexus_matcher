@@ -71,6 +71,15 @@ dependencies = [
     "pydantic-settings>=2.0.0,<3.0.0",
     "structlog>=23.0.0",
     "typing-extensions>=4.5.0",
+    # The bundled int8 encoder is the DEFAULT provider and the reason `pip install
+    # nexus-matcher` works with no download. Its runtime therefore belongs in the core
+    # dependencies, not an extra -- making these optional produced a package that shipped
+    # a 33.8 MB model it could not load, and CI caught it on all four Python versions.
+    # Both are pure wheels with no torch and no compiler requirement.
+    "onnxruntime>=1.17.0",
+    "tokenizers>=0.15.0",
+    # C++ Levenshtein on the per-candidate hot path: ~145x the pure-Python DP fallback.
+    "rapidfuzz>=3.0.0",
 ]
 
 [project.optional-dependencies]
