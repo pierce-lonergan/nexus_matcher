@@ -1,0 +1,64 @@
+Third-party model bundled with nexus-matcher
+============================================
+
+Model      : bge-small-en-v1.5
+Upstream   : https://huggingface.co/BAAI/bge-small-en-v1.5
+Publisher  : Beijing Academy of Artificial Intelligence (BAAI)
+Licence    : MIT, as declared in the model repository metadata
+             (HuggingFace API `cardData.license` == "mit", `gated` == false,
+             verified 2026-08-06)
+
+What is bundled here
+--------------------
+`model_quantized.onnx` is a DERIVATIVE of the upstream weights: exported to ONNX and
+dynamically quantised to int8 (avx512_vnni, per-tensor) using Optimum/ONNX Runtime. The
+tokenizer files are redistributed unmodified. No training data is included.
+
+Why a derivative was necessary
+------------------------------
+The fp32 ONNX export is 127.8 MiB, which exceeds PyPI's 100 MB per-file limit. The int8
+build is 32.2 MiB and ships inside the wheel, which is what allows this library to work
+with no download and no HuggingFace access.
+
+Measured cost of the quantisation, comparing like with like (both using the model's
+official CLS pooling) on our labelled benchmark:
+
+    torch fp32, CLS   P@1 0.5596   MRR@10 0.6674   Recall@10 0.8648    973 q/s
+    int8 ONNX,  CLS   P@1 0.5378   MRR@10 0.6511   Recall@10 0.8532   1238 q/s
+
+So int8 costs 2.2 points of P@1 and buys a 27% throughput gain plus the removal of the
+torch dependency. Mean pooling was also measured (P@1 0.5407) and the difference from CLS
+is within run-to-run noise; CLS is used because it is what the model was trained with.
+
+A note on the licence notice
+----------------------------
+MIT requires that the copyright notice accompany redistribution. The upstream repository
+declares MIT in its metadata but does NOT publish a LICENSE file or an explicit copyright
+line, so there is no upstream notice to reproduce verbatim. This file records the
+provenance and the declared licence in full instead. The standard MIT terms follow.
+
+If you are redistributing nexus-matcher commercially and this matters to you, confirm the
+position with your own counsel -- this file is provenance documentation, not legal advice.
+To remove the bundled model entirely, delete this directory and install an extra:
+`pip install nexus-matcher[embeddings]`.
+
+---------------------------------------------------------------------------
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

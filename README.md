@@ -34,10 +34,26 @@ named next to the number. All of it is single-machine CPU measurement — see
 ## Install
 
 ```bash
+pip install nexus-matcher
+```
+
+That is the whole setup. The wheel **carries its own encoder** -- an int8 ONNX build of
+bge-small-en-v1.5, 33.8 MB inside a 22.6 MB wheel -- so there is no model download, no
+HuggingFace account, and no torch. It works in an airgapped container on first run.
+
+For the last ~2 points of accuracy, the transformer path is still there:
+
+```bash
+pip install "nexus-matcher[embeddings]"   # adds torch + sentence-transformers (~800 MB)
+```
+
+Or from source:
+
+```bash
 git clone https://github.com/pierce-lonergan/nexus_matcher.git
 cd nexus_matcher
 python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\activate
-pip install -e ".[embeddings,parsers,loaders,sparse,cli]"
+pip install -e ".[parsers,loaders,sparse,cli]"
 ```
 
 Extras defined in `pyproject.toml`: `embeddings`, `parsers`, `loaders`, `sparse`,
@@ -118,6 +134,82 @@ Avro parser, Excel/CSV dictionary loaders).
 nexus-matcher match customer.avsc -d dictionary.csv
 nexus-matcher match customer.avsc -d dictionary.csv -f json -o results.json
 ```
+
+---
+
+## Encoders
+
+Three tiers. The default needs no setup and no network.
+
+| Provider | Size | P@1 | Throughput | Needs |
+|---|---|---|---|---|
+| **`BundledOnnxProvider`** (default) | 33.8 MB, in the wheel | ~0.536 | ~1240 q/s | onnxruntime |
+| `SentenceTransformersProvider` | 130 MB + ~800 MB torch | 0.560 | ~973 q/s | torch, HF download |
+| `StaticEmbeddingProvider` | ~30 MB | 0.494 | ~71000 q/s | model2vec |
+
+```python
+from nexus_matcher.infrastructure.adapters.embedding_providers.bundled_onnx import (
+    default_embedding_provider,
+)
+
+provider = default_embedding_provider()           # bundled -> transformer -> static
+provider = default_embedding_provider("bundled")  # force fully offline
+```
+
+**int8 is not batch-invariant.** ONNX Runtime selects different quantised GEMM kernels per
+input shape, so the same corpus scores P@1 0.5276 at batch 8, 0.5378 at batch 64 and
+0.5436 at batch 128. That 1.6-point spread is wider than several effects worth acting on,
+so hold batch size fixed when comparing anything -- otherwise you are measuring kernel
+selection rather than your change. The fp32 torch path does not behave this way.
+
+**Static embeddings are a fallback, not a shortcut.** They cost 6.5 points on this
+benchmark and 8.9 on a FHIR-derived corpus built to mirror flattened-Avro matching. The
+fact that seven *transformer* encoders from 22M to 335M parameters all landed within 0.03
+P@1 does not transfer to static models. If you want their speed without the accuracy cost,
+use them as a first stage: static top-25 followed by transformer rescoring measured 0.5581
+against 0.5596 for transformer-only.
+
+---
+
+## Flattened Avro schemas
+
+Match a flattened Avro field to a governed glossary entry, so it inherits that entry's
+classification.
+
+```python
+import json
+from nexus_matcher.infrastructure.adapters.schema_parsers.flattened_avro import (
+    FlattenedAvroParser, flatten_avro_schema,
+)
+
+# From a flattener's output -- dict, list-of-rows, CSV and JSONL all work
+schema = FlattenedAvroParser().parse_file("customer_flat.json").unwrap()
+
+# Or straight from the .avsc, which also preserves `doc`
+fields = flatten_avro_schema(json.load(open("customer.avsc")))
+```
+
+Conventions follow `GAvroSchemaFlattener`: `_` joins path segments, `__` marks an array
+boundary, unions unwrap to their non-null branch, arrays of primitives serialise to a
+single column. Unrecognised columns (a `governance_status`, say) survive into
+`field.source_metadata`.
+
+**The parser rebuilds the hierarchy instead of treating the name as one token**, which is
+where the accuracy lives:
+
+```
+customer_addresses__street_name
+  -> 'customer, addresses, street name array Street line of the postal address'
+```
+
+Parent-path context is worth **+19.3 points of P@1** here, and reproduced at **+19.0** on
+an independent FHIR corpus. A flattened name already contains the path; embedding the raw
+identifier throws away more accuracy than any model choice would recover.
+
+**One gap worth closing upstream:** `GAvroSchemaFlattener` does not propagate the Avro
+`doc` attribute, so its output carries names but no definitions -- and definitions are the
+strongest signal after the path. `flatten_avro_schema()` flattens the `.avsc` directly and
+keeps `doc`, including inheriting a parent record's doc when a leaf has none.
 
 ---
 

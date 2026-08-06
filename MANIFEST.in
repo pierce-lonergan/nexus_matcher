@@ -64,4 +64,10 @@ global-exclude .ruff_cache
 global-exclude htmlcov
 global-exclude dist
 global-exclude build
-global-exclude *.onnx
+# NOTE: *.onnx is NOT globally excluded. The bundled int8 encoder at
+# src/nexus_matcher/_models/ is what makes this library work with no download and no
+# HuggingFace access; a blanket exclusion silently produces a wheel that falls back to
+# downloading, which is the exact failure mode we are trying to remove.
+# Stray ONNX artefacts elsewhere are excluded individually instead.
+exclude models/_bge_onnx_fp32/*.onnx
+recursive-include src/nexus_matcher/_models *

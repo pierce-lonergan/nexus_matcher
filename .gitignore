@@ -196,3 +196,7 @@ data/
 # Build/scratch cruft that is not part of the package
 nexus_matcher.zip
 *.docx
+
+# Intermediate model exports (the shipped copy lives in src/nexus_matcher/_models/)
+models/
+dist_test/

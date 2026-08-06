@@ -219,6 +219,12 @@ path = "src/nexus_matcher/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/nexus_matcher"]
+# The int8 ONNX encoder lives INSIDE the package so it ships in the wheel. It is 32.2 MiB
+# against PyPI's 100 MB per-file limit. The fp32 export (127.8 MiB) does not fit and is
+# deliberately not shipped.
+# force-include is deliberately NOT used: _models already sits inside the package, so
+# hatch picks it up via `packages` and a force-include would add every file twice.
+artifacts = ["src/nexus_matcher/_models/**"]
 
 [tool.hatch.build.targets.sdist]
 include = [
