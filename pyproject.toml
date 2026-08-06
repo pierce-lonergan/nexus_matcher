@@ -80,6 +80,19 @@ dependencies = [
     "tokenizers>=0.15.0",
     # C++ Levenshtein on the per-candidate hot path: ~145x the pure-Python DP fallback.
     "rapidfuzz>=3.0.0",
+    # The lexical arm of hybrid retrieval. Core, not an extra, because from_config()
+    # wires a BM25Retriever unconditionally and _index_dictionary raises rather than
+    # silently degrading to dense-only -- so without this a plain `pip install
+    # nexus-matcher` could not index a dictionary at all. It also earns its place:
+    # sparse-only reaches 0.542 P@1 and holds 10% of the fusion weight, rescuing the
+    # exact-token matches the embedding model misses. One pure-Python module whose only
+    # dependency is numpy, which is already required.
+    "rank-bm25>=0.2.2",
+    # Enterprise data dictionaries are overwhelmingly .xlsx, and the documented
+    # quickstart loads one. A 251 KB pure-Python wheel with a single small dependency
+    # is a fair price for `load_dictionary("glossary.xlsx")` working on a bare install;
+    # pandas, which this replaced, was ~50 MB of transitive weight for the same job.
+    "openpyxl>=3.1.0",
 ]
 
 [project.optional-dependencies]
@@ -102,7 +115,9 @@ vector-stores = [
     "usearch>=2.12.0",
 ]
 
-# Sparse retrieval
+# Sparse retrieval. Kept as an extra name so `nexus-matcher[sparse]` still resolves for
+# anyone who pinned it, but rank-bm25 moved into the core dependencies -- the default
+# pipeline cannot index a dictionary without it.
 sparse = [
     "rank-bm25>=0.2.2",
 ]

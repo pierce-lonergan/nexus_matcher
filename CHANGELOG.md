@@ -106,7 +106,7 @@ The following claims appeared in the README, this changelog, the package docstri
 | **10 documented REST endpoints** | The FastAPI app implements health and introspection endpoints only. There is no matching endpoint, no dictionary CRUD, no cache endpoints, no `/metrics`, no API-key auth and no rate limiting. See [docs/API_REFERENCE.md](docs/API_REFERENCE.md). |
 | **"Prometheus metrics endpoint"** listed under Added in 2.0.0 | A `PrometheusMetrics` backend class exists; no route exposes it. |
 | **Default model `all-MiniLM-L6-v2`** | The shipped default in `SentenceTransformersProvider` is `BAAI/bge-base-en-v1.5`. The published benchmark uses `BAAI/bge-small-en-v1.5`. |
-| **YAML / environment configuration of matching** | `NexusMatcher.from_config()` ignores its `config_path` argument, and the `NEXUS_*` settings classes are consumed only by the logging setup. Matching behaviour is configured by passing a `MatchingConfig` to the constructor. |
+| **YAML / environment configuration of matching** | `NexusMatcher.from_config()` accepts a `MatchingConfig` or a JSON/TOML file, but the `NEXUS_*` settings classes are still consumed only by the logging setup. There is no YAML path and no environment-variable control of matching behaviour. |
 | **Test count "433 tests"** | Current measured state: 551 passed, 0 failed, 35 skipped (skips are uninstalled optional dependencies). Line coverage 60% against a configured gate of 80%. |
 
 ### Planned

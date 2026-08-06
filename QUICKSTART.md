@@ -12,17 +12,19 @@ git clone https://github.com/pierce-lonergan/nexus_matcher.git
 cd nexus_matcher
 python -m venv .venv
 . .venv/bin/activate          # Windows: .venv\Scripts\activate
-pip install -e ".[embeddings,parsers,loaders,sparse,cli]"
+pip install -e ".[cli]"
 ```
 
-The first run downloads a sentence-transformers model (~130 MB for the default
-`BAAI/bge-base-en-v1.5`) from HuggingFace. Everything runs on CPU.
+No model download and no HuggingFace account: the package carries an int8 ONNX build
+of `bge-small-en-v1.5` and uses it by default. Everything runs on CPU. `[cli]` is only
+for the `nexus-matcher` command -- the Python API needs no extras at all.
 
 ---
 
 ## 2. Two input files
 
-**`dictionary.csv`** — these column headers are the CSV loader's defaults. If yours
+**`dictionary.csv`** — headers are auto-detected (`Term`, `Business Definition`,
+`Classification` and similar are all recognised). If yours
 differ, pass a `ColumnMapping` to `load_dictionary()`.
 
 ```csv
@@ -70,16 +72,20 @@ for field_path, matches in results.items():
 Real output:
 
 ```
-cid        -> Customer Identifier      0.78  REVIEW
-full_nm    -> Customer Full Name       0.83  REVIEW
-email      -> Email Address            0.83  REVIEW
-bal        -> Account Balance          0.86  AUTO_APPROVE
-birth_dt   -> Date of Birth            0.76  REVIEW
+cid        -> Account Balance        0.75  REVIEW
+full_nm    -> Customer Full Name     0.83  REVIEW
+email      -> Email Address          0.83  REVIEW
+bal        -> Account Balance        0.86  REVIEW
+birth_dt   -> Date of Birth          0.76  REVIEW
 ```
 
-All five top-1 matches are right; one clears the auto-approve bar. That is the design:
-the default `auto_approve_threshold` of 0.85 is calibrated for ~95% precision on the
-fields it approves, not for coverage. See the calibration table in the
+Four of five top-1 matches are right and nothing is auto-approved -- every score is under
+the 0.87 bar, so all five go to a human. That is the design: `auto_approve_threshold` is
+calibrated for ~95% precision on the fields it approves, not for coverage.
+
+`cid` is the miss, and it is the expected one: a bare three-letter abbreviation with no
+parent path and no description. The fp32 torch encoder gets it wrong too. See the
+calibration table in the
 [README](README.md#decision-policy).
 
 ### Two things that are easy to get wrong
@@ -88,11 +94,21 @@ fields it approves, not for coverage. See the calibration table in the
 `embedding_provider` and a `vector_store`. Use `NexusMatcher.from_config()` for the
 wired-up defaults, or pass components explicitly (below).
 
-**`from_config()` ignores its `config_path` argument.** It hardcodes the default
-component set. There is currently no YAML or environment-variable path that changes how
-matching behaves — the `NEXUS_*` settings in
-`nexus_matcher.infrastructure.config.settings` are only consumed by the logging setup.
-To change matching behaviour, construct the matcher yourself and pass a `MatchingConfig`.
+**`from_config()` honours what you pass it.** It takes a `MatchingConfig`, or a path to
+a JSON/TOML file holding its fields, or nothing for the calibrated defaults:
+
+```python
+from nexus_matcher import MatchingConfig, NexusMatcher
+
+matcher = NexusMatcher.from_config(MatchingConfig(auto_approve_threshold=0.85))
+matcher = NexusMatcher.from_config("matching.toml")
+```
+
+An unknown key in that file raises rather than being ignored -- every field is a measured
+number, and a silently dropped `auto_approve_treshold` would leave you believing you had
+raised the bar. (This argument was previously named `config_path` and was accepted and
+then never read.) The `NEXUS_*` settings in
+`nexus_matcher.infrastructure.config.settings` remain logging-only.
 
 ---
 
@@ -222,7 +238,8 @@ Python API or the CLI. See [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
 
 ## Troubleshooting
 
-**`No module named 'sentence_transformers'`** — `pip install -e ".[embeddings]"`.
+**`No module named 'sentence_transformers'`** — only needed for the optional torch
+encoder: `pip install -e ".[embeddings]"`. The default bundled encoder needs nothing.
 
 **`RuntimeError: Dictionary not loaded. Call load_dictionary() first.`** — `match_schema()`
 requires an indexed dictionary; `load_dictionary()` both loads and indexes.

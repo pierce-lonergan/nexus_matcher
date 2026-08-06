@@ -422,7 +422,7 @@ from nexus_matcher import NexusMatcher
 from nexus_matcher.core.type_projections import TypeProjectionManager
 
 # Initialize matcher
-matcher = NexusMatcher()
+matcher = NexusMatcher.from_config()
 
 # Load trained type projections
 type_manager = TypeProjectionManager()

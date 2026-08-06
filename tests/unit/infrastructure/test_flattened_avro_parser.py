@@ -242,3 +242,193 @@ class TestRawAvroFlattening:
     def test_dotted_paths_are_exact(self):
         assert self._by_flat()["address_street"].full_path == "address.street"
         assert self._by_flat()["address_street"].parent_path == "address"
+
+
+class TestNamedTypesAndRecursion:
+    """
+    Regressions for defects an adversarial review found. Both were silent and both are
+    ordinary Avro: defining a record once and reusing it, and a record that refers to
+    itself.
+    """
+
+    ORDER: ClassVar[dict] = {
+        "type": "record",
+        "name": "Order",
+        "fields": [
+            {"name": "id", "type": "long"},
+            {
+                "name": "ship_to",
+                "type": {
+                    "type": "record",
+                    "name": "Address",
+                    "fields": [
+                        {"name": "street", "type": "string"},
+                        {"name": "city", "type": "string"},
+                    ],
+                },
+            },
+            {
+                "name": "tax",
+                "type": {
+                    "type": "record",
+                    "name": "Money",
+                    "fields": [
+                        {"name": "amount", "type": "double"},
+                        {"name": "currency", "type": "string"},
+                    ],
+                },
+            },
+            {
+                "name": "lines",
+                "type": {
+                    "type": "array",
+                    "items": {
+                        "type": "record",
+                        "name": "Line",
+                        "fields": [
+                            {"name": "sku", "type": "string"},
+                            # A named REFERENCE, not an inline definition.
+                            {"name": "unit_price", "type": "Money"},
+                        ],
+                    },
+                },
+            },
+            {"name": "bill_to", "type": "Address"},
+        ],
+    }
+
+    def _flat(self, schema):
+        return [f.source_metadata["flattened_name"] for f in flatten_avro_schema(schema)]
+
+    def test_named_references_are_expanded(self):
+        """
+        `{"name": "bill_to", "type": "Address"}` is the commonest Avro idiom. It used to
+        produce ONE opaque UNKNOWN-typed leaf instead of the referenced record's fields,
+        so half the schema was never classified.
+        """
+        names = self._flat(self.ORDER)
+        for expected in (
+            "bill_to_street",
+            "bill_to_city",
+            "lines__unit_price_amount",
+            "lines__unit_price_currency",
+        ):
+            assert expected in names, f"{expected} missing from {names}"
+
+    def test_no_phantom_container_leaves(self):
+        """
+        The container itself must NOT be emitted as a leaf. A phantom column will happily
+        match a dictionary entry and inherit its governance level.
+        """
+        names = self._flat(self.ORDER)
+        for phantom in ("bill_to", "ship_to", "tax", "lines__unit_price"):
+            assert phantom not in names, f"phantom leaf {phantom!r} emitted"
+
+    def test_self_referencing_record_does_not_recurse_forever(self):
+        """Legal Avro. It used to exhaust the stack."""
+        import sys
+
+        tree = {
+            "type": "record",
+            "name": "Node",
+            "fields": [
+                {"name": "value", "type": "string"},
+                {"name": "child", "type": ["null", "Node"]},
+            ],
+        }
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(200)  # prove we are not merely under the default
+        try:
+            names = self._flat(tree)
+        finally:
+            sys.setrecursionlimit(limit)
+        assert "value" in names
+
+    def test_array_of_a_recursive_type_does_not_recurse_forever(self):
+        """
+        An employee with a manager AND a list of reports. The array branch iterates the
+        item's fields directly, so the item type never reached the cycle guard and this
+        crashed with RecursionError.
+        """
+        import sys
+
+        employee = {
+            "type": "record",
+            "name": "Employee",
+            "fields": [
+                {"name": "name", "type": "string"},
+                {"name": "manager", "type": ["null", "Employee"]},
+                {"name": "reports", "type": {"type": "array", "items": "Employee"}},
+            ],
+        }
+        limit = sys.getrecursionlimit()
+        sys.setrecursionlimit(200)
+        try:
+            names = self._flat(employee)
+        finally:
+            sys.setrecursionlimit(limit)
+        assert "name" in names
+
+    def test_a_cycle_point_is_emitted_not_dropped(self):
+        """
+        Stopping at a cycle must not silently omit the column. A column nobody sees is a
+        column nobody governs -- the same failure as a phantom leaf, in reverse.
+        """
+        tree = {
+            "type": "record",
+            "name": "Node",
+            "fields": [
+                {"name": "value", "type": "string"},
+                {"name": "child", "type": ["null", "Node"]},
+            ],
+        }
+        by_name = {f.source_metadata["flattened_name"]: f for f in flatten_avro_schema(tree)}
+        assert "child" in by_name
+        assert by_name["child"].source_metadata["recursive_reference"] == "Node"
+
+    def test_mutual_recursion(self):
+        """A -> B -> A must terminate too."""
+        schema = {
+            "type": "record",
+            "name": "A",
+            "fields": [
+                {"name": "x", "type": "string"},
+                {
+                    "name": "b",
+                    "type": {
+                        "type": "record",
+                        "name": "B",
+                        "fields": [
+                            {"name": "y", "type": "string"},
+                            {"name": "a", "type": "A"},
+                        ],
+                    },
+                },
+            ],
+        }
+        names = self._flat(schema)
+        assert "x" in names
+        assert "b_y" in names
+
+    def test_namespaced_references_resolve(self):
+        """Avro allows a fully-qualified reference to a namespaced type."""
+        schema = {
+            "type": "record",
+            "name": "Root",
+            "namespace": "com.example",
+            "fields": [
+                {
+                    "name": "a",
+                    "type": {
+                        "type": "record",
+                        "name": "Inner",
+                        "namespace": "com.example",
+                        "fields": [{"name": "v", "type": "string"}],
+                    },
+                },
+                {"name": "b", "type": "com.example.Inner"},
+            ],
+        }
+        names = self._flat(schema)
+        assert "a_v" in names
+        assert "b_v" in names, f"namespaced reference unresolved: {names}"

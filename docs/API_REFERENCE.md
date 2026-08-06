@@ -42,18 +42,25 @@ NexusMatcher(
 `NexusMatcher()` with no arguments raises `TypeError`.
 
 ```python
-NexusMatcher.from_config(config_path=None) -> NexusMatcher
+NexusMatcher.from_config(config: MatchingConfig | str | Path | None = None) -> NexusMatcher
 ```
 
-Returns a matcher wired with `SentenceTransformersProvider()`, `InMemoryVectorStore`,
-`BM25Retriever`, the Avro parser, and the Excel + CSV dictionary loaders.
+Returns a matcher wired with the **bundled int8 ONNX encoder** (falling back to
+sentence-transformers when the `embeddings` extra is installed, then to static
+embeddings), `InMemoryVectorStore`, `BM25Retriever`, the Avro and flattened-Avro parsers,
+and the Excel + CSV dictionary loaders.
 
-> **`config_path` is currently ignored.** The method body constructs the default
-> components unconditionally and never reads the path. There is no file-based or
-> environment-variable configuration of the matching pipeline; the `NEXUS_*` settings
-> classes in `nexus_matcher.infrastructure.config.settings` are consumed only by
-> `nexus_matcher.shared.logging`. To change matching behaviour, construct
-> `NexusMatcher` directly and pass a `MatchingConfig`.
+`config` accepts a `MatchingConfig`, a path to a JSON or TOML file holding its fields, or
+`None` for the calibrated defaults. A file may wrap the fields in a `[matching]` table.
+
+> **An unknown key raises `ValueError`.** Every field in `MatchingConfig` is a measured
+> number; silently discarding a mistyped `auto_approve_treshold` would leave the caller
+> believing they had raised the auto-approve bar while the matcher kept approving at
+> 0.87. A missing file raises `FileNotFoundError`.
+>
+> The parameter was previously named `config_path` and was accepted and then never read.
+> The `NEXUS_*` settings classes in `nexus_matcher.infrastructure.config.settings` remain
+> consumed only by `nexus_matcher.shared.logging`.
 
 #### Methods
 

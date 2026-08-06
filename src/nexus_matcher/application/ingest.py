@@ -41,7 +41,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Iterable, Sequence
+import re
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -141,20 +142,202 @@ def map_columns(columns: Sequence[str]) -> dict[str, str]:
 # =============================================================================
 
 
+def _excel_merged_ranges(path: Path, sheet_name: str) -> list[tuple[int, int, int, int]]:
+    """
+    Merged cell ranges for one sheet as (min_row, min_col, max_row, max_col), 1-based.
+
+    Read straight from the XLSX package rather than through openpyxl, for two reasons:
+    a `read_only=True` worksheet does not expose `.merged_cells` at all, and dropping
+    read-only mode to obtain it would pull an entire glossary into memory. The
+    workbook -> rels -> sheet lookup below is the documented OPC layout, so it does not
+    depend on openpyxl internals.
+
+    Returns [] for anything unreadable -- a missing part, a legacy .xls, an encrypted
+    package. Merge handling is an enhancement; failing to find merges must never stop a
+    file from loading.
+    """
+    import zipfile
+    from xml.etree import ElementTree as ET
+
+    from openpyxl.utils.cell import range_boundaries
+
+    ns = {
+        "m": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
+        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
+        "p": "http://schemas.openxmlformats.org/package/2006/relationships",
+    }
+    r_id = f"{{{ns['r']}}}id"
+
+    try:
+        with zipfile.ZipFile(path) as z:
+            book = ET.fromstring(z.read("xl/workbook.xml"))
+            rel_id = next(
+                (
+                    s.get(r_id)
+                    for s in book.findall("m:sheets/m:sheet", ns)
+                    if s.get("name") == sheet_name
+                ),
+                None,
+            )
+            if rel_id is None:
+                return []
+
+            rels = ET.fromstring(z.read("xl/_rels/workbook.xml.rels"))
+            target = next(
+                (
+                    rel.get("Target")
+                    for rel in rels.findall("p:Relationship", ns)
+                    if rel.get("Id") == rel_id
+                ),
+                None,
+            )
+            if target is None:
+                return []
+
+            # Targets are relative to xl/ unless already absolute within the package.
+            part = target.lstrip("/") if target.startswith("/") else f"xl/{target}"
+            sheet = ET.fromstring(z.read(part))
+
+        ranges = []
+        for merge in sheet.findall("m:mergeCells/m:mergeCell", ns):
+            ref = merge.get("ref")
+            if not ref:
+                continue
+            min_col, min_row, max_col, max_row = range_boundaries(ref)
+            ranges.append((min_row, min_col, max_row, max_col))
+        return ranges
+    except (KeyError, OSError, ET.ParseError, ValueError, zipfile.BadZipFile):
+        return []
+
+
+def _dedupe_header(names: list[str]) -> list[str]:
+    """
+    Make column names unique, preserving order and first occurrence.
+
+    Rows are built as `{header[i]: value}`, so two columns sharing a name silently
+    collapse and the LAST one wins. A glossary with two "Notes" columns would lose the
+    first outright; the same happens to a header merged across columns, which reads back
+    as the same name twice. Suffixed names simply fail to match an alias, which surfaces
+    as "column not found" rather than as wrong data.
+    """
+    seen: dict[str, int] = {}
+    out: list[str] = []
+    for name in names:
+        if name in seen:
+            seen[name] += 1
+            out.append(f"{name}_{seen[name]}")
+        else:
+            seen[name] = 0
+            out.append(name)
+    return out
+
+
+def _apply_merged_values(
+    rows: Iterator[tuple],
+    merges: list[tuple[int, int, int, int]],
+    first_data_row: int = 2,
+) -> Iterator[list]:
+    """
+    Propagate each merged cell's value across the range it visibly spans.
+
+    Excel stores a merged block's value ONCE, in the top-left cell; every other cell in
+    the block reads back as None. For a governance glossary that is a silent
+    misclassification, not a cosmetic gap -- a "Restricted" label merged down C2:C3 gives
+
+        Patient SSN -> RESTRICTED
+        Patient MRN -> INTERNAL      (blank, so it takes the default)
+
+    while the human author sees one label covering both rows and reasonably believes the
+    file says RESTRICTED twice. Downgrading a restricted field is the exact failure this
+    library exists to prevent, so the visible value wins.
+
+    Only cells inside a merged range are filled, and only when they are blank; an
+    ordinary empty cell stays empty.
+
+    The HEADER row (anything before `first_data_row`) is deliberately left alone. A merge
+    there is a layout banner spanning several columns, not a value belonging to each of
+    them, and copying it would produce duplicate column names -- which is a worse failure
+    than a blank one. Vertical merges in the data are the unambiguous case, and the one
+    that carries governance.
+    """
+    if not merges:
+        yield from (list(r) for r in rows)
+        return
+
+    starts: dict[int, list[tuple[int, int, int, int]]] = {}
+    for rng in merges:
+        starts.setdefault(rng[0], []).append(rng)
+
+    # Ranges currently spanning this row, each paired with its anchor value. Held as a
+    # list rather than expanded per-cell so that a full-column merge costs one entry
+    # instead of a million.
+    active: list[tuple[tuple[int, int, int, int], Any]] = []
+
+    for row_no, raw in enumerate(rows, start=1):
+        row = list(raw)
+        active = [(rng, v) for rng, v in active if rng[2] >= row_no]
+        for rng in starts.get(row_no, ()):
+            anchor_col = rng[1] - 1
+            active.append((rng, row[anchor_col] if anchor_col < len(row) else None))
+        # Anchors are still collected above for header-row merges, so a range starting in
+        # the header keeps feeding the data rows underneath it.
+        if row_no >= first_data_row:
+            for rng, value in active:
+                if value is None:
+                    continue
+                for col in range(rng[1], rng[3] + 1):
+                    if col - 1 < len(row) and row[col - 1] is None:
+                        row[col - 1] = value
+        yield row
+
+
 def _read_tabular(source: str | Path, **kwargs: Any) -> tuple[list[dict], list[str]]:
-    """Read any tabular file into rows + column names."""
+    """
+    Read any tabular file into rows + column names.
+
+    Args:
+        source: Path to a csv/tsv/txt/xlsx/xlsm/xls/json/jsonl/parquet file.
+        **kwargs: `header_row` (0-based index of the header, for spreadsheets that open
+            with a title banner above it), plus per-format options -- `delimiter` and
+            `encoding` for delimited text, `sheet` for Excel.
+    """
     path = Path(source)
     suffix = path.suffix.lower()
+    # Glossary exports very often carry a title//export-date banner above the real header.
+    header_row = int(kwargs.pop("header_row", 0) or 0)
 
     if suffix in (".csv", ".tsv", ".txt"):
         import csv
 
         delimiter = kwargs.pop("delimiter", "\t" if suffix == ".tsv" else ",")
+        # Feed the FILE to csv, not text.splitlines().
+        #
+        # str.splitlines() breaks on , , -, ,   and   --
+        # none of which are record separators in CSV. A vertical tab or U+2028 pasted in
+        # from Word therefore split one row into two: the real entry's definition was
+        # truncated and a PHANTOM entry was created, embedded, indexed, and returnable as
+        # a top-1 match carrying the default INTERNAL classification. splitlines() also
+        # destroys legitimate newlines inside quoted fields, mangling multi-line definitions.
+        #
+        # newline="" is required so the csv module handles quoted line breaks itself.
         # utf-8-sig strips the BOM Excel writes, which otherwise corrupts the first header.
-        text = path.read_text(encoding=kwargs.pop("encoding", "utf-8-sig"))
-        reader = csv.DictReader(text.splitlines(), delimiter=delimiter)
-        rows = [dict(r) for r in reader]
-        return rows, list(reader.fieldnames or [])
+        encoding = kwargs.pop("encoding", "utf-8-sig")
+        with path.open(newline="", encoding=encoding) as handle:
+            raw = csv.reader(handle, delimiter=delimiter)
+            for _ in range(header_row):
+                next(raw, None)
+            header = _dedupe_header(next(raw, []))
+            reader = csv.DictReader(
+                handle,
+                fieldnames=header,
+                delimiter=delimiter,
+                # Ragged rows land under a real string key rather than None, which would
+                # otherwise become the literal "null" after a JSON round-trip.
+                restkey="_extra_columns",
+                restval="",
+            )
+            rows = [dict(r) for r in reader]
+            return rows, header
 
     if suffix in (".xlsx", ".xlsm", ".xls"):
         try:
@@ -165,8 +348,17 @@ def _read_tabular(source: str | Path, **kwargs: Any) -> tuple[list[dict], list[s
             ) from exc
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         ws = wb[kwargs["sheet"]] if kwargs.get("sheet") else wb.active
-        it = ws.iter_rows(values_only=True)
-        header = [str(c) if c is not None else "" for c in next(it, ())]
+        # Merged cells read back as None everywhere except the top-left; see
+        # _apply_merged_values for why that silently downgrades a classification.
+        merges = _excel_merged_ranges(path, ws.title)
+        # Merge fill starts on the row after the header, wherever the header turns out
+        # to be -- a banner above it must not be treated as data.
+        it = _apply_merged_values(
+            ws.iter_rows(values_only=True), merges, first_data_row=header_row + 2
+        )
+        for _ in range(header_row):
+            next(it, None)
+        header = _dedupe_header([str(c) if c is not None else "" for c in next(it, [])])
         rows = [
             {header[i]: ("" if v is None else v) for i, v in enumerate(r) if i < len(header)}
             for r in it
@@ -417,21 +609,48 @@ _PROTECTION_WORDS: tuple[tuple[str, ProtectionLevel], ...] = (
 )
 
 
+# NEGATED forms, checked BEFORE the positive table.
+#
+# Substring matching alone inverts the meaning of real financial and defence vocabulary:
+# "Non-Public" and "NPI - Nonpublic" contain "public", and "Unrestricted" contains
+# "restricted", so a naive scan mapped GLBA nonpublic personal information to PUBLIC --
+# the weakest level in the enum, and precisely backwards. Word boundaries alone fix
+# "unrestricted"; the spaced variants are needed because separator normalisation runs first.
+_NEGATED_PROTECTION: tuple[tuple[str, ProtectionLevel], ...] = (
+    ("nonpublic", ProtectionLevel.CONFIDENTIAL),
+    ("non public", ProtectionLevel.CONFIDENTIAL),
+    ("not for public", ProtectionLevel.CONFIDENTIAL),
+    ("npi", ProtectionLevel.CONFIDENTIAL),
+    ("unrestricted", ProtectionLevel.PUBLIC),
+    ("un restricted", ProtectionLevel.PUBLIC),
+    ("not pii", ProtectionLevel.INTERNAL),
+    ("no pii", ProtectionLevel.INTERNAL),
+    ("non pii", ProtectionLevel.INTERNAL),
+)
+
+
 def _coerce_protection(value: str) -> ProtectionLevel:
     """
     Map a free-text classification onto ProtectionLevel.
 
-    Order matters: "highly confidential" must be checked before "confidential", and
-    "restricted" before anything weaker, so the STRICTEST reading wins on an ambiguous
-    label. Getting this wrong in the lenient direction would under-protect a field, which
-    is the expensive mistake. Unrecognised text falls back to INTERNAL rather than PUBLIC
-    for the same reason -- and the raw string is preserved in source_metadata regardless.
+    Two rules, in order:
+
+    1. NEGATIONS first. "Non-Public" is not public and "Unrestricted" is not restricted;
+       a plain substring scan gets both exactly backwards.
+    2. Then the positive table, strictest first, so "highly confidential" beats
+       "confidential" and an ambiguous label resolves to the stronger protection.
+       Under-protecting a field is the expensive mistake.
+
+    Matching is on WORD BOUNDARIES after normalising separators, so "un-restricted",
+    "un_restricted" and "Unrestricted" behave alike. Unrecognised text falls back to
+    INTERNAL rather than PUBLIC, and the raw string is preserved in source_metadata
+    regardless, because this enum cannot represent every organisation's taxonomy.
     """
     if not value:
         return ProtectionLevel.INTERNAL
-    text = value.strip().lower()
-    for token, level in _PROTECTION_WORDS:
-        if token in text:
+    text = re.sub(r"\s+", " ", re.sub(r"[-_/]+", " ", value.strip().lower()))
+    for token, level in (*_NEGATED_PROTECTION, *_PROTECTION_WORDS):
+        if re.search(rf"(?<!\w){re.escape(token)}(?!\w)", text):
             return level
     return ProtectionLevel.INTERNAL
 
@@ -675,8 +894,6 @@ def sync(
         appended_vectors: list[Any] = []
 
         for entry, vector in zip(to_embed, new_vectors, strict=True):
-            index.entries[entry.id] = entry
-            index.hashes[entry.id] = content_hash(entry)
             i = position.get(entry.id)
             if i is None:
                 appended.append(entry.id)
@@ -691,9 +908,17 @@ def sync(
                 if len(index.vectors)
                 else np.asarray(appended_vectors, dtype="float32")
             )
-    else:
-        for entry in entries:
-            index.entries[entry.id] = entry
+    # Refresh EVERY entry object, not only the re-embedded ones.
+    #
+    # content_hash covers just the embedded text, so a row whose classification changed
+    # but whose name and definition did not is reported "unchanged" -- correct for the
+    # vector, wrong for the entry. Updating entries only inside the `to_embed` branch
+    # meant a governance edit was applied or silently dropped depending on whether some
+    # UNRELATED row happened to change in the same sync. That is the worst failure mode
+    # this tool has: the index looks healthy and hands back a stale PII classification.
+    for entry in entries:
+        index.entries[entry.id] = entry
+        index.hashes[entry.id] = content_hash(entry)
 
     if removed:
         # Rebuild the alignment between `order` and `vectors`. Dropping rows from a numpy

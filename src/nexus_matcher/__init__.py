@@ -40,8 +40,10 @@ Quick Start (Library Mode)
 ```python
 from nexus_matcher import NexusMatcher
 
-# Initialize
-matcher = NexusMatcher()
+# Initialize -- from_config() wires every component and needs no arguments.
+# NexusMatcher(...) itself takes an embedding provider and a vector store, for
+# callers who want to supply their own.
+matcher = NexusMatcher.from_config()
 
 # Load dictionary
 matcher.load_dictionary("data/dictionary.xlsx")
@@ -139,6 +141,7 @@ __all__ = [
     "Lifecycle",
     "MatchDecision",
     "MatchResult",
+    "MatchingConfig",
     # Lazy imports (documented for IDE completion)
     "NexusMatcher",
     "ProtectionLevel",
@@ -188,6 +191,14 @@ def __getattr__(name: str):
         from nexus_matcher.application.use_cases.match_schema import NexusMatcher
 
         return NexusMatcher
+
+    # The matcher's configuration object. Exported alongside NexusMatcher because it is
+    # the only way to change a threshold or a fusion weight; leaving it out meant the
+    # documented `NexusMatcher(config=...)` argument had no importable type.
+    if name == "MatchingConfig":
+        from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+
+        return MatchingConfig
 
     # API app factory (requires fastapi)
     if name == "create_app":

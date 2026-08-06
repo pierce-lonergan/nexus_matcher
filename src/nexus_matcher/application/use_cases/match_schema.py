@@ -18,6 +18,8 @@ Core schema matching use case - the main orchestrator.
 
 from __future__ import annotations
 
+import dataclasses
+import json
 import math
 import re
 import time
@@ -164,6 +166,49 @@ class MatchingConfig:
     dictionary_alias_count: int = 0
 
 
+def _load_matching_config(source: MatchingConfig | str | Path | None) -> MatchingConfig:
+    """
+    Coerce a config argument into a MatchingConfig.
+
+    Accepts an instance (returned as-is), a path to a JSON or TOML file, or None for the
+    calibrated defaults.
+
+    An UNKNOWN KEY IS AN ERROR rather than a warning. Every field here is a tuned number
+    whose default was measured; a typo like `auto_approve_treshold` would otherwise be
+    dropped in silence and leave the user believing they had raised the bar while the
+    matcher went on auto-approving at 0.87. A loud failure at startup is far cheaper than
+    a mis-governed field discovered in an audit.
+    """
+    if source is None:
+        return MatchingConfig()
+    if isinstance(source, MatchingConfig):
+        return source
+
+    path = Path(source)
+    if not path.exists():
+        raise FileNotFoundError(f"Matching config not found: {path}")
+
+    if path.suffix.lower() == ".toml":
+        import tomllib
+
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    else:
+        data = json.loads(path.read_text(encoding="utf-8"))
+
+    # Tolerate a wrapping table so one project file can hold several sections.
+    if "matching" in data and isinstance(data["matching"], dict):
+        data = data["matching"]
+
+    known = {f.name for f in dataclasses.fields(MatchingConfig)}
+    unknown = sorted(set(data) - known)
+    if unknown:
+        raise ValueError(
+            f"Unknown matching config option(s) in {path}: {', '.join(unknown)}. "
+            f"Valid options: {', '.join(sorted(known))}"
+        )
+    return MatchingConfig(**data)
+
+
 # =============================================================================
 # TOKENIZATION
 # =============================================================================
@@ -301,30 +346,53 @@ class NexusMatcher:
         self._is_initialized = False
 
     @classmethod
-    def from_config(cls, config_path: str | Path | None = None) -> NexusMatcher:
+    def from_config(cls, config: MatchingConfig | str | Path | None = None) -> NexusMatcher:
         """
-        Create matcher from configuration file.
+        Build a fully wired matcher, with no components to assemble by hand.
 
         Args:
-            config_path: Path to config file (uses defaults if None)
+            config: A `MatchingConfig`, or a path to a JSON/TOML file holding its fields,
+                or None for the calibrated defaults.
 
         Returns:
-            Configured NexusMatcher instance
+            Configured NexusMatcher instance.
+
+        Example:
+            matcher = NexusMatcher.from_config()
+            matcher = NexusMatcher.from_config(MatchingConfig(auto_approve_threshold=0.85))
+            matcher = NexusMatcher.from_config("matching.json")
+
+        Note:
+            This parameter used to be named `config_path` and was accepted and then never
+            read, so passing a tuned config file silently produced default thresholds --
+            a failure that is invisible precisely because the matcher still works.
         """
+        matching_config = _load_matching_config(config)
         # Import infrastructure components
         from nexus_matcher.infrastructure.adapters.dictionary_loaders.excel import (
             CsvDictionaryLoader,
             ExcelDictionaryLoader,
         )
-        from nexus_matcher.infrastructure.adapters.embedding_providers.sentence_transformers import (
-            SentenceTransformersProvider,
+        from nexus_matcher.infrastructure.adapters.embedding_providers.bundled_onnx import (
+            default_embedding_provider,
         )
         from nexus_matcher.infrastructure.adapters.schema_parsers.avro import AvroSchemaParser
+        from nexus_matcher.infrastructure.adapters.schema_parsers.flattened_avro import (
+            FlattenedAvroParser,
+        )
         from nexus_matcher.infrastructure.adapters.sparse_retrievers.bm25 import BM25Retriever
         from nexus_matcher.infrastructure.adapters.vector_stores.memory import InMemoryVectorStore
 
-        # Create components with defaults
-        embedding_provider = SentenceTransformersProvider()
+        # Resolve the best provider AVAILABLE rather than hardcoding one.
+        #
+        # This used to construct SentenceTransformersProvider() directly, which needs
+        # torch. The result was that every documented entry point -- the README
+        # quickstart, `nexus-matcher match`, `nexus-matcher sync` -- raised
+        # ImportError on a plain `pip install nexus-matcher`, while the 33.8 MB encoder
+        # bundled into the wheel specifically to make that work was never reached.
+        # default_embedding_provider() prefers the bundled offline encoder and falls
+        # back to sentence-transformers when the extra is installed.
+        embedding_provider = default_embedding_provider()
         vector_store = InMemoryVectorStore(
             VectorStoreConfig(
                 collection_name="dictionary",
@@ -334,7 +402,11 @@ class NexusMatcher:
         sparse_retriever = BM25Retriever()
 
         # Register parsers and loaders
-        schema_parsers = {"avro": AvroSchemaParser()}
+        schema_parsers = {
+            "avro": AvroSchemaParser(),
+            # The production input shape: a flattened schema, not a nested .avsc.
+            "flattened_avro": FlattenedAvroParser(),
+        }
         dictionary_loaders = {
             "excel": ExcelDictionaryLoader(),
             "csv": CsvDictionaryLoader(),
@@ -346,6 +418,7 @@ class NexusMatcher:
             sparse_retriever=sparse_retriever,
             schema_parser_registry=schema_parsers,
             dictionary_loader_registry=dictionary_loaders,
+            config=matching_config,
         )
 
     def load_dictionary(

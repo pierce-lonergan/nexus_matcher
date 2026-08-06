@@ -478,3 +478,315 @@ class TestStableIdentity:
         p = tmp_path / "g.csv"
         self._write(p, 5)
         assert [e.id for e in ingest.load_entries(p)] == [e.id for e in ingest.load_entries(p)]
+
+
+class TestBugsFoundInReview:
+    """
+    Regressions for defects an adversarial review found in this module. Each one was
+    silent: no exception, no wrong-looking output, just an incorrect governance answer.
+    """
+
+    def test_classification_only_edit_is_applied(self, tmp_path):
+        """
+        sync() used to refresh the entry OBJECT only for rows it re-embedded. Since
+        content_hash covers just the embedded text, a row whose classification changed but
+        whose name and definition did not counted as "unchanged" and kept its stale entry
+        -- so the same edit was applied or dropped depending on whether an UNRELATED row
+        also changed. The index looked healthy and returned a stale PII level.
+        """
+        p = tmp_path / "g.csv"
+        p.write_text(
+            "Term,Business Definition,Classification\n"
+            "Alpha,First definition,Public\n"
+            "Beta,Second definition,Internal\n",
+            encoding="utf-8",
+        )
+        index = ingest.build_index(p)
+        alpha = next(i for i, e in index.entries.items() if e.business_name == "Alpha")
+        assert index.entries[alpha].protection_level == ProtectionLevel.PUBLIC
+
+        # Reclassify Alpha AND rewrite Beta, so to_embed is non-empty for a different row.
+        p.write_text(
+            "Term,Business Definition,Classification\n"
+            "Alpha,First definition,Restricted\n"
+            "Beta,A totally rewritten definition,Internal\n",
+            encoding="utf-8",
+        )
+        ingest.sync(index, p)
+        assert index.entries[alpha].protection_level == ProtectionLevel.RESTRICTED
+
+    def test_classification_edit_applies_when_nothing_else_changed(self, tmp_path):
+        """The same edit, with to_embed empty. Both paths must agree."""
+        p = tmp_path / "g.csv"
+        p.write_text(
+            "Term,Business Definition,Classification\nAlpha,A definition,Public\n", encoding="utf-8"
+        )
+        index = ingest.build_index(p)
+        alpha = next(iter(index.entries))
+        p.write_text(
+            "Term,Business Definition,Classification\nAlpha,A definition,Restricted\n",
+            encoding="utf-8",
+        )
+        ingest.sync(index, p)
+        assert index.entries[alpha].protection_level == ProtectionLevel.RESTRICTED
+
+    @pytest.mark.parametrize(
+        "label,expected",
+        [
+            # Substring matching inverted all of these: "Non-Public" contains "public",
+            # "Unrestricted" contains "restricted". GLBA nonpublic personal information
+            # was resolving to the WEAKEST level in the enum.
+            ("Non-Public", ProtectionLevel.CONFIDENTIAL),
+            ("Nonpublic", ProtectionLevel.CONFIDENTIAL),
+            ("NPI - Nonpublic", ProtectionLevel.CONFIDENTIAL),
+            ("Not for public release", ProtectionLevel.CONFIDENTIAL),
+            ("Unrestricted", ProtectionLevel.PUBLIC),
+            ("Un-Restricted", ProtectionLevel.PUBLIC),
+            ("No PII", ProtectionLevel.INTERNAL),
+            ("Not PII", ProtectionLevel.INTERNAL),
+        ],
+    )
+    def test_negated_classifications_are_not_inverted(self, label, expected):
+        assert ingest._coerce_protection(label) == expected
+
+    @pytest.mark.parametrize(
+        "label,expected",
+        [
+            ("Public", ProtectionLevel.PUBLIC),
+            ("Open Data", ProtectionLevel.PUBLIC),
+            ("Restricted - Legal Hold", ProtectionLevel.RESTRICTED),
+            ("Highly Confidential", ProtectionLevel.RESTRICTED),
+            ("Confidential - Internal Use Only", ProtectionLevel.CONFIDENTIAL),
+            ("PII / Sensitive", ProtectionLevel.PII),
+            ("Internal Use Only", ProtectionLevel.INTERNAL),
+        ],
+    )
+    def test_negation_handling_did_not_break_normal_labels(self, label, expected):
+        assert ingest._coerce_protection(label) == expected
+
+    def test_newlines_inside_quoted_fields_survive(self, tmp_path):
+        """splitlines() destroyed them, mangling every multi-line definition."""
+        p = tmp_path / "g.csv"
+        p.write_text(
+            'Term,Business Definition\nEmail,"The customer email.\nUsed for billing."\n',
+            encoding="utf-8",
+        )
+        rows, _ = ingest.read_source(p)
+        assert len(rows) == 1
+        assert "\n" in rows[0]["Business Definition"]
+
+    @pytest.mark.parametrize("char", ["\x0b", "\x0c", "\x85", "\u2028", "\u2029"])
+    def test_unicode_line_breaks_do_not_fabricate_rows(self, tmp_path, char):
+        """
+        str.splitlines() breaks on these; CSV does not. A vertical tab or U+2028 pasted
+        from Word split one record into two -- truncating the real definition and creating
+        a PHANTOM entry that got embedded, indexed, and could be returned as a top-1 match
+        carrying the default INTERNAL classification.
+        """
+        p = tmp_path / "g.csv"
+        p.write_text(f'Term,Business Definition\nEmail,"contact{char}billing"\n', encoding="utf-8")
+        rows, _ = ingest.read_source(p)
+        assert len(rows) == 1, f"{char!r} fabricated {len(rows)} rows"
+        assert rows[0]["Term"] == "Email"
+
+    def test_ragged_rows_do_not_produce_a_none_key(self, tmp_path):
+        """A None key becomes the literal string 'null' after a JSON round-trip."""
+        p = tmp_path / "g.csv"
+        p.write_text("Term,Business Definition\nA,B,EXTRA\n", encoding="utf-8")
+        rows, _ = ingest.read_source(p)
+        assert None not in rows[0]
+        assert "_extra_columns" in rows[0]
+
+
+class TestExcelMergedCells:
+    """
+    Excel stores a merged block's value once, in the top-left cell; every other cell in
+    the block reads back as None. For a governance glossary that is a silent
+    MISCLASSIFICATION rather than a cosmetic gap, so it gets its own class.
+    """
+
+    @staticmethod
+    def _write(path, rows, merges=(), sheet_title=None):
+        openpyxl = pytest.importorskip("openpyxl")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        if sheet_title:
+            ws.title = sheet_title
+        for row in rows:
+            ws.append(row)
+        for ref in merges:
+            ws.merge_cells(ref)
+        wb.save(path)
+        return path
+
+    def test_merged_classification_is_not_downgraded(self, tmp_path):
+        """
+        The reported defect. "Restricted" merged down C2:C3 gave RESTRICTED then
+        INTERNAL, while the author saw one label covering both rows. Downgrading a
+        restricted field is precisely what this library exists to prevent.
+        """
+        path = self._write(
+            tmp_path / "g.xlsx",
+            [
+                ["Term", "Definition", "Classification"],
+                ["Patient SSN", "Social security number", "Restricted"],
+                ["Patient MRN", "Medical record number", None],
+                ["Visit date", "Date of visit", "Public"],
+            ],
+            merges=["C2:C3"],
+        )
+        levels = {e.business_name: e.protection_level for e in ingest.load_entries(path)}
+        assert levels["Patient SSN"] is ProtectionLevel.RESTRICTED
+        assert levels["Patient MRN"] is ProtectionLevel.RESTRICTED
+        assert levels["Visit date"] is ProtectionLevel.PUBLIC
+
+    def test_unmerged_blank_is_left_alone(self, tmp_path):
+        """
+        The guard on the fix. A blank cell that is NOT merged must stay blank -- filling
+        every gap downward would invent classifications nobody wrote, which is the same
+        defect in the opposite direction.
+        """
+        path = self._write(
+            tmp_path / "g.xlsx",
+            [
+                ["Term", "Definition", "Classification"],
+                ["A", "d1", "Restricted"],
+                ["B", "d2", None],
+            ],
+        )
+        levels = {e.business_name: e.protection_level for e in ingest.load_entries(path)}
+        assert levels["A"] is ProtectionLevel.RESTRICTED
+        assert levels["B"] is ProtectionLevel.INTERNAL  # the default, not inherited
+
+    def test_span_covers_gap_rows_and_multiple_rows(self, tmp_path):
+        path = self._write(
+            tmp_path / "g.xlsx",
+            [
+                ["Term", "Class"],
+                ["alpha", "Restricted"],
+                [None, None],  # a blank row inside the span
+                ["beta", None],
+                ["gamma", None],
+            ],
+            merges=["B2:B5"],
+        )
+        rows, _ = ingest._read_tabular(path)
+        assert [r["Class"] for r in rows] == ["Restricted"] * 4
+
+    def test_merged_header_does_not_duplicate_a_column(self, tmp_path):
+        """
+        A merge in the HEADER is a layout banner spanning columns, not a value belonging
+        to each. Copying it produced two "Classification" columns, and since rows are
+        built as {header[i]: value} the second silently overwrote the first -- turning a
+        cosmetic merge into data loss.
+        """
+        path = self._write(
+            tmp_path / "g.xlsx",
+            [["Term", "Classification", None], ["A", "Public", "x"]],
+            merges=["B1:C1"],
+        )
+        rows, header = ingest._read_tabular(path)
+        assert header.count("Classification") == 1
+        assert rows[0]["Classification"] == "Public"
+
+    def test_named_sheet_resolves_its_own_merges(self, tmp_path):
+        """Merges are looked up by sheet name through the workbook rels, not by index."""
+        openpyxl = pytest.importorskip("openpyxl")
+        path = tmp_path / "g.xlsx"
+        wb = openpyxl.Workbook()
+        first = wb.active
+        first.title = "Cover"
+        first.append(["ignore me"])
+        second = wb.create_sheet("Glossary")
+        for row in [["Term", "Class"], ["A", "Restricted"], ["B", None]]:
+            second.append(row)
+        second.merge_cells("B2:B3")
+        wb.save(path)
+
+        rows, _ = ingest._read_tabular(path, sheet="Glossary")
+        assert [r["Class"] for r in rows] == ["Restricted", "Restricted"]
+
+    @pytest.mark.parametrize("payload", [b"not a zip at all", b"PK\x03\x04truncated"])
+    def test_unreadable_package_returns_no_merges(self, tmp_path, payload):
+        """Merge handling is an enhancement; it must never stop a file from loading."""
+        path = tmp_path / "bad.xlsx"
+        path.write_bytes(payload)
+        assert ingest._excel_merged_ranges(path, "Sheet") == []
+
+    def test_unknown_sheet_name_returns_no_merges(self, tmp_path):
+        path = self._write(tmp_path / "g.xlsx", [["Term"], ["A"]])
+        assert ingest._excel_merged_ranges(path, "NoSuchSheet") == []
+
+
+class TestDuplicateHeaders:
+    """
+    Rows are built as `{header[i]: value}`, so two columns sharing a name collapse and the
+    last one wins. Suffixing surfaces the problem as "column not found" instead.
+    """
+
+    def test_duplicate_csv_columns_both_survive(self, tmp_path):
+        path = tmp_path / "dup.csv"
+        path.write_bytes(b"Term,Notes,Notes\nA,first,second\n")
+        rows, header = ingest._read_tabular(path)
+        assert header == ["Term", "Notes", "Notes_1"]
+        assert rows[0]["Notes"] == "first"
+        assert rows[0]["Notes_1"] == "second"
+
+    def test_three_way_duplicate(self, tmp_path):
+        path = tmp_path / "dup3.csv"
+        path.write_bytes(b"A,A,A\n1,2,3\n")
+        rows, header = ingest._read_tabular(path)
+        assert header == ["A", "A_1", "A_2"]
+        assert [rows[0][c] for c in header] == ["1", "2", "3"]
+
+    def test_unique_headers_are_untouched(self, tmp_path):
+        path = tmp_path / "ok.csv"
+        path.write_bytes(b"Term,Definition\nA,d\n")
+        _, header = ingest._read_tabular(path)
+        assert header == ["Term", "Definition"]
+
+
+class TestCsvReaderRegressions:
+    """
+    Re-asserted after the header pre-read was added, because splitting the header off with
+    a separate csv.reader is exactly the kind of change that quietly breaks quoting.
+    """
+
+    def test_quoted_newline_survives_with_bom_and_crlf(self, tmp_path):
+        path = tmp_path / "m.csv"
+        path.write_bytes(
+            b'\xef\xbb\xbfTerm,Definition\r\n"Email","The customer email.\r\nUsed for billing."\r\n'
+        )
+        rows, header = ingest._read_tabular(path)
+        assert header == ["Term", "Definition"]  # BOM stripped
+        assert len(rows) == 1
+        assert rows[0]["Definition"] == "The customer email.\r\nUsed for billing."
+
+    @pytest.mark.parametrize(
+        "char", [b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e", b"\xc2\x85", b"\xe2\x80\xa8"]
+    )
+    def test_unicode_line_breaks_do_not_split_a_row(self, tmp_path, char):
+        """
+        str.splitlines() breaks on all of these; none is a CSV record separator. Each one
+        used to truncate a real definition AND fabricate a phantom entry that was
+        embedded, indexed, and returnable as a top-1 match.
+        """
+        path = tmp_path / "u.csv"
+        path.write_bytes(b'Term,Definition\nA,"before' + char + b'after"\n')
+        rows, _ = ingest._read_tabular(path)
+        assert len(rows) == 1
+
+    def test_ragged_rows_avoid_a_none_key(self, tmp_path):
+        path = tmp_path / "r.csv"
+        path.write_bytes(b"Term,Definition\nA,d,EXTRA\nB\n")
+        rows, _ = ingest._read_tabular(path)
+        assert not any(None in r for r in rows)
+        assert rows[0]["_extra_columns"] == ["EXTRA"]
+        assert rows[1]["Definition"] == ""
+
+    def test_tsv_delimiter(self, tmp_path):
+        path = tmp_path / "t.tsv"
+        path.write_bytes(b"Term\tDefinition\nA\td1\n")
+        rows, header = ingest._read_tabular(path)
+        assert header == ["Term", "Definition"]
+        assert rows[0]["Definition"] == "d1"

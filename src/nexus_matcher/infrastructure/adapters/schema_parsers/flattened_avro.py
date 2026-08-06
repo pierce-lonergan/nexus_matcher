@@ -357,6 +357,54 @@ class FlattenedAvroParser:
         )
 
 
+class _NamedTypes:
+    """
+    Registry of Avro named types, so a reference by name can be expanded.
+
+    Avro's commonest idiom is to define a record ONCE and refer to it by name later
+    (`{"name": "bill_to", "type": "Address"}`). Without a registry those references are
+    opaque strings: the referenced record's leaves are never emitted, and the reference
+    itself is emitted as a single UNKNOWN-typed leaf. On a realistic order schema that
+    lost 5 of 14 columns and invented 2 that do not exist -- and an invented column will
+    happily match a dictionary entry and inherit its governance level.
+    """
+
+    __slots__ = ("_types",)
+
+    _NAMED = frozenset({"record", "enum", "fixed", "error"})
+
+    def __init__(self) -> None:
+        self._types: dict[str, Any] = {}
+
+    def register(self, node: Any) -> None:
+        """Record a type definition under both its bare and fully-qualified name."""
+        if not isinstance(node, Mapping):
+            return
+        name = node.get("name")
+        if not name or node.get("type") not in self._NAMED:
+            return
+        self._types[name] = node
+        namespace = node.get("namespace")
+        if namespace:
+            self._types[f"{namespace}.{name}"] = node
+
+    def resolve(self, node: Any) -> Any:
+        """Follow a named-type reference, if that is what this is."""
+        if isinstance(node, str):
+            return self._types.get(node, node)
+        return node
+
+
+def _unwrap_union(node: Any) -> tuple[Any, bool]:
+    """Resolve a union to its non-null branch; report nullability."""
+    if not isinstance(node, list):
+        return node, False
+    non_null = [
+        n for n in node if n != "null" and (not isinstance(n, Mapping) or n.get("type") != "null")
+    ]
+    return (non_null[0] if non_null else "null"), len(non_null) < len(node)
+
+
 def flatten_avro_schema(
     schema: Mapping[str, Any],
     separator: str = "_",
@@ -382,20 +430,62 @@ def flatten_avro_schema(
         SchemaFields with full_path, parent_path, description and array flags populated.
     """
     fields: list[SchemaField] = []
+    named = _NamedTypes()
 
-    def unwrap(node: Any) -> tuple[Any, bool]:
-        """Resolve a union to its non-null branch; report nullability."""
-        if isinstance(node, list):
-            non_null = [
-                n
-                for n in node
-                if n != "null" and (not isinstance(n, Mapping) or n.get("type") != "null")
-            ]
-            return (non_null[0] if non_null else "null"), len(non_null) < len(node)
-        return node, False
+    def emit(
+        path: list[str],
+        flat: list[str],
+        data_type: DataType,
+        doc: str,
+        nullable: bool,
+        is_array: bool = False,
+        item_type: DataType | None = None,
+        **metadata: Any,
+    ) -> None:
+        """Append one leaf. Every emission site goes through here so that the flattened
+        name, the dotted path and the parent path can never drift apart."""
+        fields.append(
+            SchemaField(
+                name=path[-1] if path else "value",
+                data_type=data_type,
+                full_path=".".join(path),
+                parent_path=".".join(path[:-1]),
+                description=doc.strip(),
+                is_nullable=nullable,
+                is_array=is_array,
+                array_item_type=item_type,
+                source_metadata={"flattened_name": separator.join(flat), **metadata},
+            )
+        )
 
-    def walk(node: Any, path: list[str], flat: list[str], doc: str, in_array: bool) -> None:
-        node, nullable = unwrap(node)
+    def walk(
+        node: Any,
+        path: list[str],
+        flat: list[str],
+        doc: str,
+        in_array: bool,
+        active: frozenset = frozenset(),
+    ) -> None:
+        node, nullable = _unwrap_union(node)
+        node = named.resolve(node)
+        named.register(node)
+
+        # Break self-reference. A record containing itself (a tree node with children, an
+        # employee with a manager) is legal Avro and would otherwise recurse until the
+        # stack gives out. `active` holds the type names being expanded on THIS branch, so
+        # a cycle stops while sibling branches still expand normally.
+        type_name = node.get("name") if isinstance(node, Mapping) else None
+        if type_name and type_name in active:
+            # Emit the cycle point as a single leaf rather than returning nothing.
+            # Dropping it would silently omit a real column from the schema, and a column
+            # nobody sees is a column nobody governs -- the same class of failure as the
+            # phantom leaves above, just in the other direction.
+            emit(
+                path, flat, DataType.RECORD, doc, nullable, in_array, recursive_reference=type_name
+            )
+            return
+        if type_name:
+            active = active | {type_name}
         node_type = node.get("type") if isinstance(node, Mapping) else node
         node_doc = (node.get("doc") if isinstance(node, Mapping) else "") or ""
         carried = node_doc or (doc if inherit_doc else "")
@@ -412,13 +502,35 @@ def flatten_avro_schema(
                     [*flat, cname],
                     cdoc or carried,
                     in_array,
+                    active,
                 )
             return
 
         if node_type == "array" and isinstance(node, Mapping):
-            items, _ = unwrap(node.get("items"))
+            items, _ = _unwrap_union(node.get("items"))
+            items = named.resolve(items)
+            named.register(items)
             item_type = items.get("type") if isinstance(items, Mapping) else items
             if item_type == "record":
+                # The ITEM type must join `active` before descending. The cycle guard in
+                # walk() only sees types passed to walk(), and this branch iterates the
+                # item's fields directly -- so `array<Employee>` inside Employee never
+                # tripped it and recursed until the stack died. An employee with a manager
+                # AND a list of reports is an entirely ordinary schema.
+                item_name = items.get("name")
+                if item_name and item_name in active:
+                    emit(
+                        path,
+                        flat,
+                        DataType.ARRAY,
+                        carried,
+                        nullable,
+                        True,
+                        recursive_reference=item_name,
+                    )
+                    return
+                item_active = active | ({item_name} if item_name else set())
+
                 # Exploded into one column per leaf; mark the boundary.
                 for child in items.get("fields", []):
                     cname = child.get("name")
@@ -435,56 +547,27 @@ def flatten_avro_schema(
                         [*flat[:-1], f"{flat[-1]}{pad}", cname] if flat else [cname],
                         child.get("doc") or carried,
                         True,
+                        item_active,
                     )
                 return
             # Array of primitives: serialised to a single string column.
-            fields.append(
-                SchemaField(
-                    name=path[-1] if path else "value",
-                    data_type=DataType.ARRAY,
-                    full_path=".".join(path),
-                    parent_path=".".join(path[:-1]),
-                    description=carried.strip(),
-                    is_nullable=nullable,
-                    is_array=True,
-                    array_item_type=map_data_type(item_type),
-                    source_metadata={
-                        "flattened_name": separator.join(flat),
-                        "array_serialized": True,
-                    },
-                )
+            emit(
+                path,
+                flat,
+                DataType.ARRAY,
+                carried,
+                nullable,
+                True,
+                item_type=map_data_type(item_type),
+                array_serialized=True,
             )
             return
 
         if node_type == "map":
-            fields.append(
-                SchemaField(
-                    name=path[-1] if path else "value",
-                    data_type=DataType.JSON,
-                    full_path=".".join(path),
-                    parent_path=".".join(path[:-1]),
-                    description=carried.strip(),
-                    is_nullable=nullable,
-                    source_metadata={
-                        "flattened_name": separator.join(flat),
-                        "map_serialized": True,
-                    },
-                )
-            )
+            emit(path, flat, DataType.JSON, carried, nullable, map_serialized=True)
             return
 
-        fields.append(
-            SchemaField(
-                name=path[-1] if path else "value",
-                data_type=map_data_type(node),
-                full_path=".".join(path),
-                parent_path=".".join(path[:-1]),
-                description=carried.strip(),
-                is_nullable=nullable,
-                is_array=in_array,
-                source_metadata={"flattened_name": separator.join(flat)},
-            )
-        )
+        emit(path, flat, map_data_type(node), carried, nullable, in_array)
 
     walk(schema, [], [], "", False)
     return fields

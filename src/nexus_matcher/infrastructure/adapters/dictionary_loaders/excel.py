@@ -1,16 +1,16 @@
 """
 nexus_matcher.infrastructure.adapters.dictionary_loaders.excel | Layer: INFRASTRUCTURE
-Excel dictionary loader implementation.
+Excel and CSV dictionary loaders.
 
 ## Relationships
 # IMPLEMENTS → domain/ports/dictionary_loader :: DictionaryLoader protocol
-# DEPENDS_ON → pandas :: Excel reading
-# DEPENDS_ON → openpyxl :: .xlsx support
+# DEPENDS_ON → openpyxl :: .xlsx reading (no pandas; CSV needs nothing beyond stdlib)
+# DELEGATES_TO → application/ingest :: _read_tabular, the shared hardened reader
 # USED_BY    → application/use_cases/sync_dictionary :: dictionary loading
 
 ## Attributes
 # Security: Validates file paths, sanitizes input
-# Performance: Uses pandas for efficient reading, supports streaming
+# Performance: Streams rows via openpyxl read-only mode; no DataFrame materialised
 # Reliability: Handles malformed files gracefully
 """
 
@@ -70,53 +70,41 @@ class ExcelDictionaryLoader(BaseDictionaryLoader):
         Args:
             source: Path to Excel file
             **options:
-                sheet_name: Sheet to read (default: first sheet)
-                header_row: Row containing headers (default: 0)
-                skip_rows: Rows to skip at start
+                sheet_name: Sheet to read by NAME (default: the active sheet)
+                header_row: 0-based row holding the headers (default: 0), for exports
+                    that open with a title banner above the real header
+                skip_rows: Data rows to skip after the header
 
         Yields:
             Row dictionaries
         """
-        try:
-            import pandas as pd
-        except ImportError:
-            raise ImportError(
-                "pandas and openpyxl are required for Excel loading. "
-                "Install with: pip install nexus-matcher[loaders]"
-            ) from None
-
         path = Path(source)
         if not path.exists():
             raise FileNotFoundError(f"Excel file not found: {path}")
 
-        # Parse options
-        sheet_name = options.get("sheet_name", 0)
-        header_row = options.get("header_row", 0)
+        # openpyxl alone, without pandas.
+        #
+        # pandas was pulling ~50 MB of transitive dependency to read a spreadsheet that
+        # openpyxl already reads, and the documented quickstart
+        # (`matcher.load_dictionary("data/dictionary.xlsx")`) raised ImportError without
+        # it. The shared reader also fills MERGED CELLS, which pandas leaves as NaN --
+        # a classification merged down two rows silently downgraded the second one.
+        from nexus_matcher.application.ingest import _read_tabular
+
+        kwargs: dict[str, Any] = {"header_row": options.get("header_row", 0)}
+        sheet_name = options.get("sheet_name")
+        if isinstance(sheet_name, str):
+            kwargs["sheet"] = sheet_name
+
+        rows, header = _read_tabular(path, **kwargs)
+
         skip_rows = options.get("skip_rows")
+        if skip_rows:
+            rows = rows[skip_rows:]
 
-        # Read Excel file
-        df = pd.read_excel(
-            path,
-            sheet_name=sheet_name,
-            header=header_row,
-            skiprows=skip_rows,
-            engine="openpyxl" if path.suffix == ".xlsx" else None,
-        )
-
-        # Clean column names
-        df.columns = df.columns.str.strip()
-
-        # Yield rows as dictionaries
-        for _, row in df.iterrows():
-            # Convert row to dict, handling NaN values
-            row_dict = {}
-            for col in df.columns:
-                value = row[col]
-                if pd.isna(value):
-                    row_dict[col] = ""
-                else:
-                    row_dict[col] = value
-            yield row_dict
+        stripped = {col: col.strip() for col in header}
+        for row in rows:
+            yield {stripped.get(k, k): ("" if v is None else v) for k, v in row.items()}
 
 
 class CsvDictionaryLoader(BaseDictionaryLoader):
@@ -155,51 +143,40 @@ class CsvDictionaryLoader(BaseDictionaryLoader):
             source: Path to CSV file
             **options:
                 delimiter: Field delimiter (default: auto-detect)
-                encoding: File encoding (default: utf-8)
-                skip_rows: Rows to skip at start
+                encoding: File encoding (default: utf-8-sig, so an Excel BOM is stripped)
+                header_row: 0-based row holding the headers (default: 0)
+                skip_rows: Data rows to skip after the header
 
         Yields:
             Row dictionaries
         """
-        try:
-            import pandas as pd
-        except ImportError:
-            raise ImportError(
-                "pandas is required for CSV loading. "
-                "Install with: pip install nexus-matcher[loaders]"
-            ) from None
-
         path = Path(source)
         if not path.exists():
             raise FileNotFoundError(f"CSV file not found: {path}")
 
-        # Parse options
-        delimiter = options.get("delimiter")
-        encoding = options.get("encoding", "utf-8")
+        # Read with the standard library, not pandas.
+        #
+        # CSV has never needed pandas, and requiring it broke the documented quickstart:
+        # `matcher.load_dictionary("glossary.csv")` raised ImportError on a plain
+        # `pip install nexus-matcher`, telling the user to install an extra in order to
+        # read a comma-separated file. The shared reader in `application.ingest` is also
+        # strictly more correct here -- it strips the BOM Excel writes, preserves newlines
+        # inside quoted definitions, and keeps ragged rows off a None key.
+        from nexus_matcher.application.ingest import _read_tabular
+
+        kwargs: dict[str, Any] = {"header_row": options.get("header_row", 0)}
+        if options.get("delimiter") is not None:
+            kwargs["delimiter"] = options["delimiter"]
+        if options.get("encoding") is not None:
+            kwargs["encoding"] = options["encoding"]
+
+        rows, header = _read_tabular(path, **kwargs)
+
         skip_rows = options.get("skip_rows")
+        if skip_rows:
+            rows = rows[skip_rows:]
 
-        # Auto-detect delimiter
-        if delimiter is None:
-            delimiter = "\t" if path.suffix == ".tsv" else ","
-
-        # Read CSV file
-        df = pd.read_csv(
-            path,
-            delimiter=delimiter,
-            encoding=encoding,
-            skiprows=skip_rows,
-        )
-
-        # Clean column names
-        df.columns = df.columns.str.strip()
-
-        # Yield rows as dictionaries
-        for _, row in df.iterrows():
-            row_dict = {}
-            for col in df.columns:
-                value = row[col]
-                if pd.isna(value):
-                    row_dict[col] = ""
-                else:
-                    row_dict[col] = value
-            yield row_dict
+        # Header cells often carry stray spaces from a spreadsheet export.
+        stripped = {col: col.strip() for col in header}
+        for row in rows:
+            yield {stripped.get(k, k): ("" if v is None else v) for k, v in row.items()}

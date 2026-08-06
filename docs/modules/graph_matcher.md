@@ -457,7 +457,7 @@ from nexus_matcher import NexusMatcher
 from nexus_matcher.core.graph_matcher import HybridMatcher
 
 # Initialize matcher
-matcher = NexusMatcher()
+matcher = NexusMatcher.from_config()
 matcher.load_dictionary("data/dictionary.xlsx")
 
 # Add graph-based reranking

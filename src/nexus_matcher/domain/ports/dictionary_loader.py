@@ -20,7 +20,7 @@ Port interface for loading data dictionaries from various sources.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
@@ -58,6 +58,22 @@ class ColumnMapping:
         return cls()
 
     @classmethod
+    def detect(cls, columns: Sequence[str]) -> ColumnMapping:
+        """
+        Infer a mapping from the columns a file actually has.
+
+        Uses the same alias table as the ingest API, so "Term", "Business Term",
+        "Business Definition", "Subject Area" and "Classification" are all understood.
+        Fields with no match keep their literal default, which simply finds nothing --
+        the same outcome as before, but only for the columns that are genuinely absent
+        rather than for all of them.
+
+        >>> ColumnMapping.detect(["Term", "Business Definition"]).business_name_column
+        'Term'
+        """
+        return detect_column_mapping(columns)
+
+    @classmethod
     def snake_case(cls) -> ColumnMapping:
         """Get snake_case column mapping."""
         return cls(
@@ -72,6 +88,35 @@ class ColumnMapping:
             sample_values_column="sample_values",
             synonyms_column="synonyms",
         )
+
+
+def detect_column_mapping(columns: Sequence[str]) -> ColumnMapping:
+    """
+    Build a ColumnMapping from the columns a source actually has.
+
+    The alias table lives in `application.ingest` and is shared deliberately: two
+    independent notions of "which column is the business name" is how the loader path
+    ended up rejecting files the ingest path read without complaint.
+
+    Import is deferred to keep the domain layer free of an import-time dependency on the
+    application layer.
+    """
+    from nexus_matcher.application.ingest import map_columns
+
+    found = map_columns(list(columns))
+    defaults = ColumnMapping()
+    return ColumnMapping(
+        id_column=found.get("id", defaults.id_column),
+        business_name_column=found.get("business_name", defaults.business_name_column),
+        logical_name_column=found.get("logical_name", defaults.logical_name_column),
+        definition_column=found.get("definition", defaults.definition_column),
+        data_type_column=found.get("data_type", defaults.data_type_column),
+        protection_level_column=found.get("protection_level", defaults.protection_level_column),
+        domain_column=found.get("domain", defaults.domain_column),
+        parent_table_column=defaults.parent_table_column,
+        sample_values_column=defaults.sample_values_column,
+        synonyms_column=defaults.synonyms_column,
+    )
 
 
 # =============================================================================
@@ -292,13 +337,24 @@ class BaseDictionaryLoader(ABC):
         **options: Any,
     ) -> Result[tuple[list[DictionaryEntry], LoadStatistics]]:
         """Load dictionary entries from source."""
-        mapping = column_mapping or ColumnMapping.default()
         stats = LoadStatistics()
         entries: list[DictionaryEntry] = []
+        mapping = column_mapping
 
         try:
             for row_index, row in enumerate(self._load_rows(source, **options), start=1):
                 stats.total_rows += 1
+
+                if mapping is None:
+                    # Infer the mapping from the header actually present.
+                    #
+                    # ColumnMapping.default() names exact literal columns ("Business
+                    # Name", "Definition"). Real glossaries say "Term", "Business Term",
+                    # "Business Definition", "Classification" -- none of which matched, so
+                    # every row failed on "Missing business name" and the load reported
+                    # SUCCESS with zero entries. detect_column_mapping reuses the same
+                    # alias table the ingest API already applies to these files.
+                    mapping = detect_column_mapping(list(row))
 
                 result = self._convert_row(row, mapping, row_index)
 
@@ -308,6 +364,17 @@ class BaseDictionaryLoader(ABC):
                 else:
                     stats.error_rows += 1
                     stats.errors.append(result.error or "Unknown error")
+
+            # Reading rows and producing nothing is a FAILURE, not a quiet success.
+            # It means the columns were not understood; returning an empty dictionary
+            # leaves the matcher with nothing to match against and no indication why.
+            if stats.total_rows and not entries:
+                sample = stats.errors[0] if stats.errors else "no rows converted"
+                return Result.failure(
+                    f"Read {stats.total_rows} row(s) from {source} but produced no "
+                    f"entries -- the columns were not recognised (first error: {sample}). "
+                    f"Pass an explicit column_mapping=ColumnMapping(...)."
+                )
 
             return Result.success((entries, stats))
 

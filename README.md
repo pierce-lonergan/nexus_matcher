@@ -41,6 +41,11 @@ That is the whole setup. The wheel **carries its own encoder** -- an int8 ONNX b
 bge-small-en-v1.5, 33.8 MB inside a 22.6 MB wheel -- so there is no model download, no
 HuggingFace account, and no torch. It works in an airgapped container on first run.
 
+The base install is the *complete* pipeline, not a stub: the bundled encoder, BM25
+lexical retrieval, and CSV/Excel glossary loading all work with nothing else installed.
+Anything the default path needs is a real dependency, not an extra -- an extra you have
+to install before the quickstart runs is a bug, and this package shipped three of them.
+
 For the last ~2 points of accuracy, the transformer path is still there:
 
 ```bash
@@ -57,17 +62,20 @@ pip install -e ".[parsers,loaders,sparse,cli]"
 ```
 
 Extras defined in `pyproject.toml`: `embeddings`, `parsers`, `loaders`, `sparse`,
-`vector-stores`, `cache`, `api`, `cli`, `async`, `docs`, `dev`, and `full`. The four
-above are what the quickstart needs; the CLI additionally needs `cli`. The first run
-downloads a sentence-transformers model from HuggingFace (the shipped default is
-`BAAI/bge-base-en-v1.5`; the published benchmark uses the smaller
-`BAAI/bge-small-en-v1.5`).
+`vector-stores`, `cache`, `api`, `cli`, `async`, `docs`, `dev`, and `full`. **None of
+them are needed for the quickstart** — install extras only for what they add:
+`cli` for the `nexus-matcher` command, `api` for the REST server, `vector-stores` for
+Qdrant/HNSW, `cache` for Redis, `embeddings` for the torch encoder. `loaders` and
+`sparse` are kept as names so existing pins keep resolving, but their contents moved
+into the core dependencies.
 
 ---
 
 ## Quickstart
 
-**`dictionary.csv`** — column names are the loader's defaults:
+**`dictionary.csv`** — column names are auto-detected, so `Term` / `Business Definition`
+/ `Subject Area` / `Classification` work just as well as the canonical names below. Pass
+`column_mapping=ColumnMapping(...)` to override the detection:
 
 ```csv
 ID,Business Name,Logical Name,Definition,Data Type,Domain
@@ -109,24 +117,41 @@ for field_path, matches in results.items():
           f"{top.final_confidence:.2f}  {top.decision.name}")
 ```
 
-Actual output of that script:
+Actual output of that script, on a bare `pip install nexus-matcher`:
 
 ```
-cid        -> Customer Identifier      0.78  REVIEW
-full_nm    -> Customer Full Name       0.83  REVIEW
-email      -> Email Address            0.83  REVIEW
-bal        -> Account Balance          0.86  AUTO_APPROVE
-birth_dt   -> Date of Birth            0.76  REVIEW
+cid        -> Account Balance        0.75  REVIEW
+full_nm    -> Customer Full Name     0.83  REVIEW
+email      -> Email Address          0.83  REVIEW
+bal        -> Account Balance        0.86  REVIEW
+birth_dt   -> Date of Birth          0.76  REVIEW
 ```
 
-All five top-1 matches are correct; only one clears the auto-approve bar. That is the
-intended behaviour — the threshold is tuned for precision on auto-approval, not for
-coverage (see [Decision policy](#decision-policy)).
+Four of the five top-1 matches are correct and **nothing is auto-approved** — every score
+sits under the 0.87 bar, so all five go to a human. That is the intended behaviour: the
+threshold is tuned for precision on auto-approval, not coverage
+(see [Decision policy](#decision-policy)).
+
+The miss is worth reading rather than hiding. `cid` is a bare three-letter abbreviation
+with no parent path and no `doc`, which is the hardest input this system takes and the
+one case it is measurably weakest on (see [Known limits](#known-limits)). It is not a
+quantization artifact — the fp32 sentence-transformers encoder also gets it wrong, just
+differently (`Customer Full Name`, 0.74). Give that field either a parent path or a one
+-line description and it resolves; that single signal is worth +19.3 P@1 on the
+benchmark, far more than any change of model.
 
 Note `NexusMatcher.from_config()`, not `NexusMatcher()`. The constructor requires an
 embedding provider and a vector store to be passed in; `from_config()` wires up the
-defaults (sentence-transformers provider, in-memory vector store, BM25 sparse retriever,
-Avro parser, Excel/CSV dictionary loaders).
+defaults (**bundled int8 ONNX encoder**, in-memory vector store, BM25 sparse retriever,
+Avro + flattened-Avro parsers, Excel/CSV dictionary loaders). It also accepts a
+`MatchingConfig`, or a path to a JSON/TOML file holding its fields:
+
+```python
+from nexus_matcher import MatchingConfig, NexusMatcher
+
+matcher = NexusMatcher.from_config(MatchingConfig(auto_approve_threshold=0.85))
+matcher = NexusMatcher.from_config("matching.toml")
+```
 
 ### Same thing from the CLI
 
