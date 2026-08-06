@@ -6,6 +6,7 @@ Unit tests for CLI commands.
 # TESTS → presentation/cli/main :: CLI commands
 """
 
+import pytest
 from typer.testing import CliRunner
 
 from nexus_matcher.presentation.cli.main import app
@@ -83,30 +84,44 @@ class TestAPICommand:
     """Test api command help."""
 
     def test_api_help_runs(self):
-        """`api --help` must succeed. What it LOOKS like is asserted separately."""
+        """`api --help` must succeed."""
         result = runner.invoke(app, ["api", "--help"])
         assert result.exit_code == 0
 
-    def test_api_exposes_expected_options(self):
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            # Value-taking options need their value, or the option swallows "--help"
+            # as its argument and the command tries to start a real server.
+            ["--host", "127.0.0.1", "--help"],
+            ["--port", "9999", "--help"],
+            ["--reload", "--help"],
+        ],
+        ids=["--host", "--port", "--reload"],
+    )
+    def test_api_accepts_expected_options(self, argv):
         """
-        Assert the command's declared INTERFACE, not its rendered help text.
+        Verify the options BEHAVIOURALLY -- that the CLI accepts them -- rather than by
+        introspecting Click, and rather than by scraping rendered help.
 
-        This previously scraped `result.stdout` for "--host". That passed locally and
-        failed on all four Python versions in CI, because Typer renders help through Rich
-        and the layout depends on the Rich version and terminal width -- the option names
-        can be wrapped or truncated out of the visible text while the options themselves
-        are perfectly well defined. Scraping the rendering tests Typer and Rich, not this
-        CLI. Introspecting the parameters tests what we actually own, and fails for a real
-        reason if an option is ever removed or renamed.
+        Both of those were tried and both were wrong:
+
+        * Scraping `result.stdout` for "--host" depends on Rich's wrapping and the
+          terminal width. Passed locally, failed on all four Python versions in CI.
+        * Introspecting `command.params` / `get_params(ctx)` returns an EMPTY list on
+          typer 0.27.1 (CI resolved that from an unpinned `typer[all]>=0.9.0`, while this
+          machine had 0.20.0). Typer builds parameters lazily at invocation time, so no
+          Click-level introspection sees them -- yet the CLI works perfectly: the options
+          are accepted and unknown flags are rejected. The introspection test would have
+          reported a breakage that does not exist.
+
+        Invoking the command is the only check that tests what a user actually gets and
+        holds across typer versions.
         """
-        import click
-        import typer
+        result = runner.invoke(app, ["api", *argv])
+        assert result.exit_code == 0, f"api rejected {argv}: {result.output[:300]}"
 
-        command = typer.main.get_command(app)
-        api_cmd = command.commands["api"]  # type: ignore[attr-defined]
-
-        declared = {
-            opt for param in api_cmd.params if isinstance(param, click.Option) for opt in param.opts
-        }
-        for expected in ("--host", "--port", "--reload"):
-            assert expected in declared, f"{expected} missing; api declares {sorted(declared)}"
+    def test_api_rejects_unknown_option(self):
+        """The counterpart: accepting everything would make the test above vacuous."""
+        result = runner.invoke(app, ["api", "--definitely-not-a-real-flag"])
+        assert result.exit_code != 0
