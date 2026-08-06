@@ -10,7 +10,11 @@ from typer.testing import CliRunner
 
 from nexus_matcher.presentation.cli.main import app
 
-runner = CliRunner()
+# Pin the terminal width. Typer renders help through Rich, which wraps and truncates to
+# the terminal, so an unpinned runner makes every help-scraping assertion depend on the
+# environment it happens to run in. A test that passes locally and fails in CI for that
+# reason costs more to diagnose than it ever catches.
+runner = CliRunner(env={"COLUMNS": "200", "TERM": "dumb", "NO_COLOR": "1"})
 
 
 class TestCLIBasics:
@@ -78,10 +82,31 @@ class TestSyncCommand:
 class TestAPICommand:
     """Test api command help."""
 
-    def test_api_help(self):
-        """Test api --help."""
+    def test_api_help_runs(self):
+        """`api --help` must succeed. What it LOOKS like is asserted separately."""
         result = runner.invoke(app, ["api", "--help"])
         assert result.exit_code == 0
-        assert "--host" in result.stdout
-        assert "--port" in result.stdout
-        assert "--reload" in result.stdout
+
+    def test_api_exposes_expected_options(self):
+        """
+        Assert the command's declared INTERFACE, not its rendered help text.
+
+        This previously scraped `result.stdout` for "--host". That passed locally and
+        failed on all four Python versions in CI, because Typer renders help through Rich
+        and the layout depends on the Rich version and terminal width -- the option names
+        can be wrapped or truncated out of the visible text while the options themselves
+        are perfectly well defined. Scraping the rendering tests Typer and Rich, not this
+        CLI. Introspecting the parameters tests what we actually own, and fails for a real
+        reason if an option is ever removed or renamed.
+        """
+        import click
+        import typer
+
+        command = typer.main.get_command(app)
+        api_cmd = command.commands["api"]  # type: ignore[attr-defined]
+
+        declared = {
+            opt for param in api_cmd.params if isinstance(param, click.Option) for opt in param.opts
+        }
+        for expected in ("--host", "--port", "--reload"):
+            assert expected in declared, f"{expected} missing; api declares {sorted(declared)}"
