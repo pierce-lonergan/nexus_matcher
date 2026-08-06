@@ -8,7 +8,6 @@ Gap: GAP-003 - L1 LRU Cache Layer
 """
 
 import time
-import pytest
 from datetime import timedelta
 
 
@@ -17,8 +16,8 @@ class TestL1CacheProperties:
 
     def test_cache_type_is_memory(self):
         """Test cache type is 'memory'."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -26,8 +25,8 @@ class TestL1CacheProperties:
 
     def test_accepts_max_size_config(self):
         """Test cache accepts max_size configuration."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=5000)
         cache = L1LRUCache(config)
@@ -46,8 +45,8 @@ class TestL1CacheBasicOperations:
 
     def test_set_and_get_value(self):
         """Test setting and getting a value."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -58,8 +57,8 @@ class TestL1CacheBasicOperations:
 
     def test_get_nonexistent_returns_none(self):
         """Test getting nonexistent key returns None."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -69,8 +68,8 @@ class TestL1CacheBasicOperations:
 
     def test_set_multiple_values(self):
         """Test setting multiple values."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -85,8 +84,8 @@ class TestL1CacheBasicOperations:
 
     def test_overwrite_existing_key(self):
         """Test overwriting an existing key."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -97,8 +96,8 @@ class TestL1CacheBasicOperations:
 
     def test_delete_key(self):
         """Test deleting a key."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -109,8 +108,8 @@ class TestL1CacheBasicOperations:
 
     def test_exists_returns_true_for_existing_key(self):
         """Test exists returns True for existing key."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -121,8 +120,8 @@ class TestL1CacheBasicOperations:
 
     def test_clear_removes_all_entries(self):
         """Test clear removes all entries."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -141,8 +140,8 @@ class TestL1CacheLRUEviction:
 
     def test_evicts_lru_when_full(self):
         """Test LRU eviction when cache is full."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=3)
         cache = L1LRUCache(config)
@@ -162,8 +161,8 @@ class TestL1CacheLRUEviction:
 
     def test_access_updates_lru_order(self):
         """Test accessing a key updates its LRU position."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=3)
         cache = L1LRUCache(config)
@@ -185,8 +184,8 @@ class TestL1CacheLRUEviction:
 
     def test_tracks_eviction_count(self):
         """Test that eviction count is tracked in stats."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=2)
         cache = L1LRUCache(config)
@@ -205,8 +204,8 @@ class TestL1CacheStats:
 
     def test_tracks_hits(self):
         """Test cache tracks hit count."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -221,8 +220,8 @@ class TestL1CacheStats:
 
     def test_tracks_misses(self):
         """Test cache tracks miss count."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -235,8 +234,8 @@ class TestL1CacheStats:
 
     def test_tracks_size(self):
         """Test cache tracks current size."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -249,8 +248,8 @@ class TestL1CacheStats:
 
     def test_hit_rate_calculation(self):
         """Test hit rate is calculated correctly."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -270,8 +269,8 @@ class TestL1CacheTTL:
 
     def test_entry_expires_after_ttl(self):
         """Test entry expires after TTL."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100, ttl=timedelta(milliseconds=50))
         cache = L1LRUCache(config)
@@ -286,8 +285,8 @@ class TestL1CacheTTL:
 
     def test_per_key_ttl_override(self):
         """Test per-key TTL override."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100, ttl=timedelta(hours=1))
         cache = L1LRUCache(config)
@@ -307,8 +306,8 @@ class TestL1CacheLatency:
 
     def test_get_latency_under_1ms(self):
         """Test get operation completes in under 1ms (research target)."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=5000)
         cache = L1LRUCache(config)
@@ -324,12 +323,14 @@ class TestL1CacheLatency:
         elapsed = time.perf_counter() - start
 
         avg_latency_ms = (elapsed / 100) * 1000
-        assert avg_latency_ms < 1.0, f"Average get latency {avg_latency_ms:.3f}ms exceeds 1ms target"
+        assert avg_latency_ms < 1.0, (
+            f"Average get latency {avg_latency_ms:.3f}ms exceeds 1ms target"
+        )
 
     def test_set_latency_under_1ms(self):
         """Test set operation completes in under 1ms."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=5000)
         cache = L1LRUCache(config)
@@ -341,7 +342,9 @@ class TestL1CacheLatency:
         elapsed = time.perf_counter() - start
 
         avg_latency_ms = (elapsed / 100) * 1000
-        assert avg_latency_ms < 1.0, f"Average set latency {avg_latency_ms:.3f}ms exceeds 1ms target"
+        assert avg_latency_ms < 1.0, (
+            f"Average set latency {avg_latency_ms:.3f}ms exceeds 1ms target"
+        )
 
 
 class TestL1CacheComplexValues:
@@ -349,8 +352,8 @@ class TestL1CacheComplexValues:
 
     def test_cache_dict_values(self):
         """Test caching dictionary values."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -363,8 +366,8 @@ class TestL1CacheComplexValues:
 
     def test_cache_list_values(self):
         """Test caching list values."""
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -378,8 +381,9 @@ class TestL1CacheComplexValues:
     def test_cache_numpy_array(self):
         """Test caching numpy arrays (embeddings)."""
         import numpy as np
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
+
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=100)
         cache = L1LRUCache(config)
@@ -398,8 +402,9 @@ class TestL1CacheThreadSafety:
     def test_concurrent_reads_and_writes(self):
         """Test concurrent read/write operations."""
         import threading
-        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
+
         from nexus_matcher.domain.ports.cache import CacheConfig
+        from nexus_matcher.infrastructure.adapters.caches.memory import L1LRUCache
 
         config = CacheConfig(max_size=1000)
         cache = L1LRUCache(config)

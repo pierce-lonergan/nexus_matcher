@@ -1,5 +1,16 @@
 # Optimal Open-Source Architecture for Avro-to-Excel Semantic Matching
 
+
+> **Third-party literature survey — not a measurement of this system.**
+> This document summarises published research and vendor benchmarks. Every accuracy,
+> latency and speedup figure in it refers to *other people's systems on other people's
+> data*. Nothing here has been reproduced on NexusMatcher. For this system's measured
+> numbers see [BENCHMARK_REGISTRY.md](BENCHMARK_REGISTRY.md).
+>
+> For calibration: this survey projects 90-95% precision@top-5. NexusMatcher measures
+> **P@5 0.888** end-to-end on 793 labelled pairs, and **P@1 0.490** on the
+> abbreviation-heavy half of that benchmark.
+
 The optimal architecture for matching Avro schema fields to 30,000 Excel dictionary entries combines **BGE-base-en-v1.5** embeddings with **Qdrant** vector storage, **hybrid BM25+dense retrieval**, and **cross-encoder re-ranking** to achieve 100-150% accuracy improvement over basic similarity matching while maintaining sub-2-second latency on CPU. Recent 2023-2025 research demonstrates zero-shot LLM approaches and contrastive learning eliminate training data requirements, while INT8 quantization delivers 3-4x CPU speedup with minimal accuracy loss.
 
 **Why this matters**: Bypassing data governance review requires extremely high precision—false positives create compliance risk while false negatives waste manual effort. The recommended three-stage pipeline (fast retrieval → intelligent re-ranking → confidence filtering) achieves 90-95% precision@top-5 while processing queries in 1-2 seconds on commodity CPUs.

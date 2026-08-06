@@ -5,11 +5,9 @@ Integration tests for type compatibility with NexusMatcher.
 
 import pytest
 
-from nexus_matcher.domain.models.entities import DictionaryEntry, SchemaField
 from nexus_matcher.domain.services.type_compatibility import (
     CompatibilityLevel,
     TypeCategory,
-    TypeCompatibilityResult,
     TypeCompatibilityScorer,
 )
 from nexus_matcher.shared.types.base import DataType

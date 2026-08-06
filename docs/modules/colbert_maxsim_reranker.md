@@ -2,12 +2,21 @@
 
 > **Layer:** Infrastructure / Adapters / Rerankers
 > **Gap:** GAP-001 (ColBERT MaxSim Implementation)
-> **Status:** IN_PROGRESS
+> **Status:** IMPLEMENTED, optional, off by default
 > **Research:** README_RESEARCH_3.md, Lines 5-8
 
 ## Overview
 
-The ColBERT MaxSim reranker implements proper late interaction scoring instead of the incorrect bi-encoder approach. This is a critical fix that delivers **+10-20% accuracy improvement**.
+The ColBERT MaxSim reranker implements proper late interaction scoring instead of the incorrect bi-encoder approach. The **+10-20% accuracy improvement** figure is a projection from the literature, not a
+measurement of this implementation. What *was* measured
+(`benchmarks/results/suite_003_real_20251209_162900.json`) is a **latency** result:
+pre-computing document token embeddings takes 100-candidate reranking from 274.0 ms
+average to 2.93 ms (93.6x). The same artifact records **100% top-5 ranking agreement
+with the plain bi-encoder** on its sample — i.e. MaxSim did not change the ranking at
+all there. Treat the accuracy benefit as unproven on this corpus. For measured reranking
+accuracy, see the cross-encoder result in
+[BENCHMARK_REGISTRY.md](../BENCHMARK_REGISTRY.md#exp-rerank--cross-encoder-reranking)
+(+5.5 points P@1).
 
 ## Research Context
 

@@ -20,7 +20,7 @@ import logging
 from datetime import timedelta
 from typing import Any, TypeVar
 
-from nexus_matcher.domain.ports.cache import BaseCache, CacheConfig, CacheStats
+from nexus_matcher.domain.ports.cache import BaseCache, CacheConfig
 
 # Lazy import to avoid hard dependency
 try:
@@ -87,10 +87,7 @@ class RedisCache(BaseCache[Any]):
             connection_pool: Optional connection pool
         """
         if redis is None:
-            raise ImportError(
-                "redis is required for RedisCache. "
-                "Install with: pip install redis"
-            )
+            raise ImportError("redis is required for RedisCache. Install with: pip install redis")
 
         super().__init__(config)
 
@@ -225,7 +222,7 @@ class RedisCache(BaseCache[Any]):
             values = self._client.mget(full_keys)
 
             result = {}
-            for key, value in zip(keys, values):
+            for key, value in zip(keys, values, strict=False):
                 if value is not None:
                     result[key] = self._deserialize(value)
                     self._stats.record_hit()

@@ -74,9 +74,9 @@ from nexus_matcher.domain.ports.embedding_provider import (
 from nexus_matcher.domain.ports.retrieval import (
     BaseReranker,
     BaseSparseRetriever,
+    RerankCandidate,
     Reranker,
     RerankerRegistry,
-    RerankCandidate,
     RerankResult,
     SparseDocument,
     SparseRetriever,
@@ -99,50 +99,50 @@ from nexus_matcher.domain.ports.vector_store import (
 )
 
 __all__ = [
-    # Schema Parser
-    "SchemaParser",
-    "BaseSchemaParser",
-    "SchemaParserRegistry",
-    # Dictionary Loader
-    "DictionaryLoader",
+    "BaseCache",
     "BaseDictionaryLoader",
-    "DictionaryLoaderRegistry",
-    "ColumnMapping",
-    "LoadStatistics",
-    # Embedding Provider
-    "EmbeddingProvider",
     "BaseEmbeddingProvider",
-    "EmbeddingProviderRegistry",
-    "EmbeddingConfig",
-    "EmbeddingResult",
-    # Vector Store
-    "VectorStore",
-    "BaseVectorStore",
-    "VectorStoreRegistry",
-    "VectorStoreConfig",
-    "VectorDocument",
-    "SearchResult",
-    "CollectionInfo",
-    # Sparse Retriever
-    "SparseRetriever",
-    "BaseSparseRetriever",
-    "SparseRetrieverRegistry",
-    "SparseDocument",
-    "SparseSearchResult",
-    # Reranker
-    "Reranker",
     "BaseReranker",
-    "RerankerRegistry",
-    "RerankCandidate",
-    "RerankResult",
+    "BaseSchemaParser",
+    "BaseSparseRetriever",
+    "BaseVectorStore",
     # Cache
     "Cache",
-    "BaseCache",
-    "CacheRegistry",
     "CacheConfig",
+    "CacheRegistry",
     "CacheStats",
-    "SemanticCache",
-    "SemanticCacheConfig",
+    "CollectionInfo",
+    "ColumnMapping",
+    # Dictionary Loader
+    "DictionaryLoader",
+    "DictionaryLoaderRegistry",
+    "EmbeddingConfig",
+    # Embedding Provider
+    "EmbeddingProvider",
+    "EmbeddingProviderRegistry",
+    "EmbeddingResult",
     "HierarchicalCache",
     "HierarchicalCacheStats",
+    "LoadStatistics",
+    "RerankCandidate",
+    "RerankResult",
+    # Reranker
+    "Reranker",
+    "RerankerRegistry",
+    # Schema Parser
+    "SchemaParser",
+    "SchemaParserRegistry",
+    "SearchResult",
+    "SemanticCache",
+    "SemanticCacheConfig",
+    "SparseDocument",
+    # Sparse Retriever
+    "SparseRetriever",
+    "SparseRetrieverRegistry",
+    "SparseSearchResult",
+    "VectorDocument",
+    # Vector Store
+    "VectorStore",
+    "VectorStoreConfig",
+    "VectorStoreRegistry",
 ]

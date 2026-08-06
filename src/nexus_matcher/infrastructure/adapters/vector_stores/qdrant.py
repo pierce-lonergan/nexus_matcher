@@ -15,7 +15,8 @@ Qdrant vector store implementation for production use.
 
 from __future__ import annotations
 
-from typing import Any, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 
@@ -34,6 +35,7 @@ def _get_qdrant_client():
     """Get QdrantClient class with lazy import."""
     try:
         from qdrant_client import QdrantClient
+
         return QdrantClient
     except ImportError as e:
         raise ImportError(
@@ -46,6 +48,7 @@ def _get_qdrant_models():
     """Get Qdrant models with lazy import."""
     try:
         from qdrant_client import models
+
         return models
     except ImportError as e:
         raise ImportError(
@@ -57,7 +60,7 @@ def _get_qdrant_models():
 def _map_distance_metric(metric: str):
     """Map distance metric string to Qdrant Distance enum."""
     models = _get_qdrant_models()
-    
+
     mapping = {
         "cosine": models.Distance.COSINE,
         "euclidean": models.Distance.EUCLID,
@@ -165,9 +168,7 @@ class QdrantVectorStore(BaseVectorStore):
 
             # Check if collection already exists
             if self._client.collection_exists(config.collection_name):
-                return Result.failure(
-                    f"Collection '{config.collection_name}' already exists"
-                )
+                return Result.failure(f"Collection '{config.collection_name}' already exists")
 
             # Create collection
             self._client.create_collection(
@@ -182,13 +183,15 @@ class QdrantVectorStore(BaseVectorStore):
                 ),
             )
 
-            return Result.success(CollectionInfo(
-                name=config.collection_name,
-                dimension=config.dimension,
-                count=0,
-                index_type="hnsw",
-                distance_metric=config.distance_metric,
-            ))
+            return Result.success(
+                CollectionInfo(
+                    name=config.collection_name,
+                    dimension=config.dimension,
+                    count=0,
+                    index_type="hnsw",
+                    distance_metric=config.distance_metric,
+                )
+            )
 
         except Exception as e:
             return Result.failure(f"Failed to create collection: {e}")
@@ -213,13 +216,15 @@ class QdrantVectorStore(BaseVectorStore):
             # Access dimension from config.params.vectors.size
             dimension = info.config.params.vectors.size
 
-            return Result.success(CollectionInfo(
-                name=name,
-                dimension=dimension,
-                count=info.points_count or 0,
-                index_type="hnsw",
-                distance_metric=str(info.config.params.vectors.distance.value).lower(),
-            ))
+            return Result.success(
+                CollectionInfo(
+                    name=name,
+                    dimension=dimension,
+                    count=info.points_count or 0,
+                    index_type="hnsw",
+                    distance_metric=str(info.config.params.vectors.distance.value).lower(),
+                )
+            )
 
         except Exception as e:
             return Result.failure(f"Failed to get collection info: {e}")

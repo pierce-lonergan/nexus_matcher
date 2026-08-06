@@ -22,15 +22,15 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Callable, Iterator, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any
 
-from nexus_matcher.application.use_cases.match_schema import MatchingConfig, NexusMatcher
+from nexus_matcher.application.use_cases.match_schema import NexusMatcher
 from nexus_matcher.domain.models.entities import MatchingSession
 from nexus_matcher.shared.types.base import Result
-
 
 # =============================================================================
 # BATCH CONFIGURATION
@@ -191,10 +191,7 @@ class BatchProcessor:
 
         # Process with thread pool for I/O parallelism
         with ThreadPoolExecutor(max_workers=self._config.max_workers) as executor:
-            futures = {
-                executor.submit(self._process_single, path, options): path
-                for path in paths
-            }
+            futures = {executor.submit(self._process_single, path, options): path for path in paths}
 
             for future in as_completed(futures):
                 path = futures[future]
@@ -233,9 +230,7 @@ class BatchProcessor:
         # Final stats
         result.total_duration_ms = (time.time() - start_time) * 1000
         result.avg_duration_ms = (
-            result.total_duration_ms / result.successful
-            if result.successful > 0
-            else 0.0
+            result.total_duration_ms / result.successful if result.successful > 0 else 0.0
         )
 
         update_progress(None)
@@ -264,10 +259,7 @@ class BatchProcessor:
         if not dir_path.is_dir():
             raise ValueError(f"Not a directory: {directory}")
 
-        if recursive:
-            paths = list(dir_path.rglob(pattern))
-        else:
-            paths = list(dir_path.glob(pattern))
+        paths = list(dir_path.rglob(pattern)) if recursive else list(dir_path.glob(pattern))
 
         return self.process_schemas(paths, **options)
 
@@ -296,8 +288,8 @@ class BatchProcessor:
 
         paths = []
         with manifest.open() as f:
-            for line in f:
-                line = line.strip()
+            for raw_line in f:
+                line = raw_line.strip()
                 if line and not line.startswith("#"):
                     path = Path(line)
                     if not path.is_absolute():
@@ -324,10 +316,7 @@ class BatchProcessor:
         paths = [Path(p) for p in schema_paths]
 
         with ThreadPoolExecutor(max_workers=self._config.max_workers) as executor:
-            futures = {
-                executor.submit(self._process_single, path, options): path
-                for path in paths
-            }
+            futures = {executor.submit(self._process_single, path, options): path for path in paths}
 
             for future in as_completed(futures):
                 path = futures[future]
@@ -360,9 +349,7 @@ class BatchProcessor:
             "successful": result.successful,
             "failed": result.failed,
             "errors": result.errors,
-            "completed_schemas": [
-                s.schema.name for s in result.sessions
-            ],
+            "completed_schemas": [s.schema.name for s in result.sessions],
         }
 
         with checkpoint_file.open("w") as f:

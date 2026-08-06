@@ -6,9 +6,10 @@ TDD Phase: RED → Tests written before implementation
 """
 
 import json
-import pytest
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+
+import pytest
 
 from nexus_matcher.shared.types.base import DataType
 
@@ -50,12 +51,7 @@ class TestJsonSchemaParserSimpleTypes:
 
     def test_parse_string_property(self, parser):
         """Test parsing string property."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"}
-            }
-        }
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}}
 
         result = parser.parse(schema)
 
@@ -67,12 +63,7 @@ class TestJsonSchemaParserSimpleTypes:
 
     def test_parse_integer_property(self, parser):
         """Test parsing integer property."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "count": {"type": "integer"}
-            }
-        }
+        schema = {"type": "object", "properties": {"count": {"type": "integer"}}}
 
         result = parser.parse(schema)
 
@@ -82,12 +73,7 @@ class TestJsonSchemaParserSimpleTypes:
 
     def test_parse_number_property(self, parser):
         """Test parsing number property (maps to DOUBLE)."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "amount": {"type": "number"}
-            }
-        }
+        schema = {"type": "object", "properties": {"amount": {"type": "number"}}}
 
         result = parser.parse(schema)
 
@@ -97,12 +83,7 @@ class TestJsonSchemaParserSimpleTypes:
 
     def test_parse_boolean_property(self, parser):
         """Test parsing boolean property."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "active": {"type": "boolean"}
-            }
-        }
+        schema = {"type": "object", "properties": {"active": {"type": "boolean"}}}
 
         result = parser.parse(schema)
 
@@ -112,12 +93,7 @@ class TestJsonSchemaParserSimpleTypes:
 
     def test_parse_null_type(self, parser):
         """Test parsing null type."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "nothing": {"type": "null"}
-            }
-        }
+        schema = {"type": "object", "properties": {"nothing": {"type": "null"}}}
 
         result = parser.parse(schema)
 
@@ -142,9 +118,7 @@ class TestJsonSchemaParserFormatTypes:
         """Test parsing date format."""
         schema = {
             "type": "object",
-            "properties": {
-                "birth_date": {"type": "string", "format": "date"}
-            }
+            "properties": {"birth_date": {"type": "string", "format": "date"}},
         }
 
         result = parser.parse(schema)
@@ -157,9 +131,7 @@ class TestJsonSchemaParserFormatTypes:
         """Test parsing date-time format."""
         schema = {
             "type": "object",
-            "properties": {
-                "created_at": {"type": "string", "format": "date-time"}
-            }
+            "properties": {"created_at": {"type": "string", "format": "date-time"}},
         }
 
         result = parser.parse(schema)
@@ -170,12 +142,7 @@ class TestJsonSchemaParserFormatTypes:
 
     def test_parse_uuid_format(self, parser):
         """Test parsing uuid format."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "id": {"type": "string", "format": "uuid"}
-            }
-        }
+        schema = {"type": "object", "properties": {"id": {"type": "string", "format": "uuid"}}}
 
         result = parser.parse(schema)
 
@@ -185,12 +152,7 @@ class TestJsonSchemaParserFormatTypes:
 
     def test_parse_byte_format(self, parser):
         """Test parsing byte format (base64)."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "data": {"type": "string", "format": "byte"}
-            }
-        }
+        schema = {"type": "object", "properties": {"data": {"type": "string", "format": "byte"}}}
 
         result = parser.parse(schema)
 
@@ -215,12 +177,7 @@ class TestJsonSchemaParserArrayTypes:
         """Test parsing array of strings."""
         schema = {
             "type": "object",
-            "properties": {
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"}
-                }
-            }
+            "properties": {"tags": {"type": "array", "items": {"type": "string"}}},
         }
 
         result = parser.parse(schema)
@@ -235,12 +192,7 @@ class TestJsonSchemaParserArrayTypes:
         """Test parsing array of integers."""
         schema = {
             "type": "object",
-            "properties": {
-                "scores": {
-                    "type": "array",
-                    "items": {"type": "integer"}
-                }
-            }
+            "properties": {"scores": {"type": "array", "items": {"type": "integer"}}},
         }
 
         result = parser.parse(schema)
@@ -270,12 +222,9 @@ class TestJsonSchemaParserNestedObjects:
             "properties": {
                 "address": {
                     "type": "object",
-                    "properties": {
-                        "street": {"type": "string"},
-                        "city": {"type": "string"}
-                    }
+                    "properties": {"street": {"type": "string"}, "city": {"type": "string"}},
                 }
-            }
+            },
         }
 
         result = parser.parse(schema)
@@ -297,15 +246,10 @@ class TestJsonSchemaParserNestedObjects:
                 "customer": {
                     "type": "object",
                     "properties": {
-                        "contact": {
-                            "type": "object",
-                            "properties": {
-                                "email": {"type": "string"}
-                            }
-                        }
-                    }
+                        "contact": {"type": "object", "properties": {"email": {"type": "string"}}}
+                    },
                 }
-            }
+            },
         }
 
         result = parser.parse(schema)
@@ -313,9 +257,7 @@ class TestJsonSchemaParserNestedObjects:
         assert result.is_success
         schema_obj = result.unwrap()
 
-        email_field = next(
-            (f for f in schema_obj.fields if f.name == "email"), None
-        )
+        email_field = next((f for f in schema_obj.fields if f.name == "email"), None)
         assert email_field is not None
         assert email_field.full_path == "customer.contact.email"
         assert email_field.parent_path == "customer.contact"
@@ -337,11 +279,8 @@ class TestJsonSchemaParserRequiredFields:
         """Test required fields are not nullable."""
         schema = {
             "type": "object",
-            "properties": {
-                "id": {"type": "string"},
-                "name": {"type": "string"}
-            },
-            "required": ["id"]
+            "properties": {"id": {"type": "string"}, "name": {"type": "string"}},
+            "required": ["id"],
         }
 
         result = parser.parse(schema)
@@ -370,12 +309,7 @@ class TestJsonSchemaParserNullableTypes:
 
     def test_type_array_with_null(self, parser):
         """Test type array with null is nullable."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "optional_name": {"type": ["string", "null"]}
-            }
-        }
+        schema = {"type": "object", "properties": {"optional_name": {"type": ["string", "null"]}}}
 
         result = parser.parse(schema)
 
@@ -401,12 +335,7 @@ class TestJsonSchemaParserMetadata:
         """Test description is extracted."""
         schema = {
             "type": "object",
-            "properties": {
-                "balance": {
-                    "type": "number",
-                    "description": "Account balance in USD"
-                }
-            }
+            "properties": {"balance": {"type": "number", "description": "Account balance in USD"}},
         }
 
         result = parser.parse(schema)
@@ -419,12 +348,7 @@ class TestJsonSchemaParserMetadata:
         """Test default value is extracted."""
         schema = {
             "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "default": "active"
-                }
-            }
+            "properties": {"status": {"type": "string", "default": "active"}},
         }
 
         result = parser.parse(schema)
@@ -438,9 +362,7 @@ class TestJsonSchemaParserMetadata:
         schema = {
             "title": "CustomerProfile",
             "type": "object",
-            "properties": {
-                "id": {"type": "string"}
-            }
+            "properties": {"id": {"type": "string"}},
         }
 
         result = parser.parse(schema)
@@ -466,12 +388,7 @@ class TestJsonSchemaParserEnums:
         """Test parsing string enum."""
         schema = {
             "type": "object",
-            "properties": {
-                "status": {
-                    "type": "string",
-                    "enum": ["active", "inactive", "pending"]
-                }
-            }
+            "properties": {"status": {"type": "string", "enum": ["active", "inactive", "pending"]}},
         }
 
         result = parser.parse(schema)
@@ -495,12 +412,7 @@ class TestJsonSchemaParserFileOperations:
 
     def test_parse_file(self, parser):
         """Test parsing from file."""
-        schema = {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"}
-            }
-        }
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}}
 
         with NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
             json.dump(schema, f)
@@ -543,10 +455,7 @@ class TestJsonSchemaParserCanParse:
 
     def test_can_parse_valid_schema(self, parser):
         """Test can_parse returns True for valid schema."""
-        schema = {
-            "type": "object",
-            "properties": {"name": {"type": "string"}}
-        }
+        schema = {"type": "object", "properties": {"name": {"type": "string"}}}
 
         assert parser.can_parse(schema)
 
@@ -555,7 +464,7 @@ class TestJsonSchemaParserCanParse:
         avro_schema = {
             "type": "record",
             "name": "Test",
-            "fields": [{"name": "id", "type": "string"}]
+            "fields": [{"name": "id", "type": "string"}],
         }
 
         assert not parser.can_parse(avro_schema)
@@ -579,10 +488,7 @@ class TestJsonSchemaParserEdgeCases:
 
     def test_empty_properties(self, parser):
         """Test schema with empty properties."""
-        schema = {
-            "type": "object",
-            "properties": {}
-        }
+        schema = {"type": "object", "properties": {}}
 
         result = parser.parse(schema)
 
@@ -591,9 +497,7 @@ class TestJsonSchemaParserEdgeCases:
 
     def test_schema_without_properties(self, parser):
         """Test schema without properties key."""
-        schema = {
-            "type": "object"
-        }
+        schema = {"type": "object"}
 
         result = parser.parse(schema)
 
@@ -609,10 +513,7 @@ class TestJsonSchemaParserEdgeCases:
 
     def test_source_format_set(self, parser):
         """Test source_format is set correctly."""
-        schema = {
-            "type": "object",
-            "properties": {"id": {"type": "string"}}
-        }
+        schema = {"type": "object", "properties": {"id": {"type": "string"}}}
 
         result = parser.parse(schema)
 

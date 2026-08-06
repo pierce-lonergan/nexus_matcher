@@ -24,14 +24,34 @@ Production-grade CrossEncoder reranker adapter for semantic reranking. Uses tran
 
 ## CrossEncoder Models
 
-### Recommended Models
+### Measured on this corpus
 
-| Model | Size | Quality | Speed |
-|-------|------|---------|-------|
-| BAAI/bge-reranker-v2-m3 | 568M | Excellent | Slow |
-| BAAI/bge-reranker-base | 278M | Good | Medium |
-| cross-encoder/ms-marco-MiniLM-L-6-v2 | 22M | Good | Fast |
-| cross-encoder/ms-marco-TinyBERT-L-2-v2 | 4.4M | Fair | Very Fast |
+`benchmarks/results/exp_rerank_combined.json`, reranking the dense shortlist on the
+793-pair combined benchmark. First stage alone: P@1 0.691, MRR@10 0.771.
+
+| Model | Size | P@1 | MRR@10 | Rerank throughput |
+|-------|------|-----|--------|-------------------|
+| `cross-encoder/ms-marco-MiniLM-L-6-v2` | 22M | **0.747** (+0.055) | 0.809 | 18.1 queries/sec |
+
+**Bigger is not better here.** Also measured, though not preserved in the committed
+artifact: `BAAI/bge-reranker-base` scored **4.7 points below** the 22M MiniLM-L-6, and
+`ms-marco-MiniLM-L-12-v2` also underperformed the L-6. Re-run
+`python benchmarks/exp_rerank.py --benchmark combined` to regenerate the comparison.
+
+Reranking is **off by default**: +5.5 points of P@1 costs roughly an order of magnitude
+of throughput (652 fields/sec un-reranked).
+
+### Size and speed, for reference
+
+| Model | Size | Speed |
+|-------|------|-------|
+| BAAI/bge-reranker-v2-m3 | 568M | Slow |
+| BAAI/bge-reranker-base | 278M | Medium — **measured worse than MiniLM-L-6 here** |
+| cross-encoder/ms-marco-MiniLM-L-6-v2 | 22M | Fast — best measured |
+| cross-encoder/ms-marco-TinyBERT-L-2-v2 | 4.4M | Very fast — unmeasured on this corpus |
+
+Quality columns have been removed: general-purpose quality rankings did not predict
+performance on this corpus.
 
 ### How CrossEncoders Work
 
@@ -42,7 +62,7 @@ Unlike bi-encoders that independently encode query and document, CrossEncoders:
 
 This gives much higher quality scores but is O(n) per candidate vs O(1) for bi-encoders.
 
-## Planned Implementation
+## Implementation
 
 - [x] Domain analysis complete
 - [ ] CrossEncoderReranker class

@@ -1,5 +1,12 @@
 # Research Fidelity Evaluation — NexusMatcher v2.0
 
+
+> **Assessment document, not a measurement.** Alignment percentages here are subjective
+> judgements about how closely the implementation follows a literature survey. They are
+> not accuracy or performance results, and a high alignment score does not imply the
+> system works well. For measured results see
+> [BENCHMARK_REGISTRY.md](BENCHMARK_REGISTRY.md).
+
 ## Executive Summary
 
 The NexusMatcher implementation demonstrates **strong alignment** with the foundational research in core architecture patterns, but has **notable gaps** in advanced optimizations that could yield significant performance and accuracy improvements.

@@ -5,21 +5,18 @@ Tests: Qdrant vector store | Target: src/infrastructure/adapters/vector_stores/q
 TDD Phase: RED → Tests written before implementation
 """
 
-import pytest
 import numpy as np
-from unittest.mock import Mock, patch, MagicMock
+import pytest
 
 from nexus_matcher.domain.ports.vector_store import (
-    VectorStoreConfig,
     VectorDocument,
-    CollectionInfo,
-    SearchResult,
+    VectorStoreConfig,
 )
-from nexus_matcher.shared.types.base import DataType
 
 # Check if qdrant-client is available
 try:
     from qdrant_client import QdrantClient, models
+
     QDRANT_AVAILABLE = True
 except ImportError:
     QDRANT_AVAILABLE = False
@@ -47,9 +44,7 @@ class TestQdrantVectorStoreProperties:
         )
 
         config = VectorStoreConfig(
-            collection_name="test_collection",
-            dimension=384,
-            distance_metric="cosine"
+            collection_name="test_collection", dimension=384, distance_metric="cosine"
         )
 
         store = QdrantVectorStore(config, location=":memory:")
@@ -62,14 +57,15 @@ class TestQdrantVectorStoreInMemory:
 
     def test_create_and_use_collection(self):
         """Test complete workflow: create, upsert, search."""
+        import uuid
+
         from nexus_matcher.infrastructure.adapters.vector_stores.qdrant import (
             QdrantVectorStore,
         )
-        import uuid
 
         config = VectorStoreConfig(collection_name="workflow_test", dimension=4)
         store = QdrantVectorStore(config, location=":memory:")
-        
+
         # Create collection
         result = store.create_collection(config)
         assert result.is_success
@@ -81,12 +77,12 @@ class TestQdrantVectorStoreInMemory:
             VectorDocument(
                 id=doc1_id,
                 embedding=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                payload={"name": "first"}
+                payload={"name": "first"},
             ),
             VectorDocument(
                 id=doc2_id,
                 embedding=np.array([0.0, 1.0, 0.0, 0.0], dtype=np.float32),
-                payload={"name": "second"}
+                payload={"name": "second"},
             ),
         ]
         upsert_result = store.upsert(docs, collection="workflow_test")
@@ -110,10 +106,10 @@ class TestQdrantVectorStoreInMemory:
 
         config = VectorStoreConfig(collection_name="dupe_test", dimension=4)
         store = QdrantVectorStore(config, location=":memory:")
-        
+
         # Create first time
         store.create_collection(config)
-        
+
         # Try to create again
         result = store.create_collection(config)
         assert result.is_failure
@@ -165,10 +161,11 @@ class TestQdrantVectorStoreInMemory:
 
     def test_get_nonexistent_document(self):
         """Test getting non-existent document."""
+        import uuid
+
         from nexus_matcher.infrastructure.adapters.vector_stores.qdrant import (
             QdrantVectorStore,
         )
-        import uuid
 
         config = VectorStoreConfig(collection_name="get_test", dimension=4)
         store = QdrantVectorStore(config, location=":memory:")
@@ -195,10 +192,11 @@ class TestQdrantVectorStoreInMemory:
 
     def test_search_with_filter(self):
         """Test search with metadata filter."""
+        import uuid
+
         from nexus_matcher.infrastructure.adapters.vector_stores.qdrant import (
             QdrantVectorStore,
         )
-        import uuid
 
         config = VectorStoreConfig(collection_name="filter_test", dimension=4)
         store = QdrantVectorStore(config, location=":memory:")
@@ -211,12 +209,12 @@ class TestQdrantVectorStoreInMemory:
             VectorDocument(
                 id=cust_id,
                 embedding=np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
-                payload={"domain": "customer"}
+                payload={"domain": "customer"},
             ),
             VectorDocument(
                 id=acct_id,
                 embedding=np.array([0.9, 0.1, 0.0, 0.0], dtype=np.float32),
-                payload={"domain": "account"}
+                payload={"domain": "account"},
             ),
         ]
         store.upsert(docs, collection="filter_test")
@@ -224,10 +222,7 @@ class TestQdrantVectorStoreInMemory:
         # Search with filter - should only get customer domain
         query = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
         result = store.search(
-            query, 
-            top_k=2, 
-            filter={"domain": "customer"}, 
-            collection="filter_test"
+            query, top_k=2, filter={"domain": "customer"}, collection="filter_test"
         )
 
         assert result.is_success
@@ -242,28 +237,31 @@ class TestQdrantVectorStoreDistanceMetrics:
 
     def test_cosine_distance(self):
         """Test cosine distance metric mapping."""
+        from qdrant_client import models
+
         from nexus_matcher.infrastructure.adapters.vector_stores.qdrant import (
             _map_distance_metric,
         )
-        from qdrant_client import models
 
         assert _map_distance_metric("cosine") == models.Distance.COSINE
 
     def test_euclidean_distance(self):
         """Test euclidean distance metric mapping."""
+        from qdrant_client import models
+
         from nexus_matcher.infrastructure.adapters.vector_stores.qdrant import (
             _map_distance_metric,
         )
-        from qdrant_client import models
 
         assert _map_distance_metric("euclidean") == models.Distance.EUCLID
 
     def test_dot_distance(self):
         """Test dot product distance metric mapping."""
+        from qdrant_client import models
+
         from nexus_matcher.infrastructure.adapters.vector_stores.qdrant import (
             _map_distance_metric,
         )
-        from qdrant_client import models
 
         assert _map_distance_metric("dot") == models.Distance.DOT
 

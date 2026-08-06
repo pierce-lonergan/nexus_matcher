@@ -4,7 +4,14 @@
 
 Content-based embedding cache using BLAKE3 hashing for deduplication. Eliminates redundant embedding computations by caching results keyed by normalized content hash.
 
-## Status: VALIDATED (GAP-004) ✓
+## Status: IMPLEMENTED, NOT VALIDATED
+
+> **Status correction.** This component is implemented and unit-tested, but it is
+> **not wired into the matching pipeline** — `NexusMatcher` performs no cache lookups
+> and hardcodes `PerformanceMetrics.cache_hit = False`. Its benchmark script writes no
+> artifact, so the performance figures previously published for it are unverifiable.
+> See [BENCHMARK_REGISTRY.md](../BENCHMARK_REGISTRY.md#d--claims-with-no-artifact).
+
 
 ## Research Reference
 
@@ -73,14 +80,20 @@ contents = ["field_a", "field_b", "field_c", "field_a"]  # field_a is duplicate
 results = cache.batch_get_or_compute(contents, batch_compute)
 ```
 
-## Performance Characteristics
+## Performance Characteristics — UNVERIFIABLE
 
-| Metric | Achieved | Target |
+`benchmarks/suite_004b_semantic_cache.py` prints and exits; it writes no artifact, and
+the run id previously cited for it (`run_20251209_062xxx`) is a literal placeholder. The
+figures below are recorded only so they are not mistaken for validated results.
+
+| Metric | Previously claimed | Status |
 |--------|----------|--------|
-| Cost Reduction | 99.3% | ≥50% |
-| Hit Rate (50% rep) | 50.0% | ≥40% |
-| Hashing Throughput | 781K ops/s | - |
-| Batch Efficiency | 50.0% | ≥40% |
+| Cost Reduction | 99.3% | No artifact |
+| Hit Rate (50% rep) | 50.0% | No artifact — and a hit rate is a property of the query workload, which that benchmark generated with a configured repetition rate. Reporting it as a system capability is circular. |
+| Hashing Throughput | 781K ops/s | No artifact |
+| Batch Efficiency | 50.0% | No artifact |
+
+Re-run the suite and make it persist a JSON artifact before citing any of this.
 
 ## Integration Example
 

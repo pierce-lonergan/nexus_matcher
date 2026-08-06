@@ -12,11 +12,10 @@ import pytest
 
 from nexus_matcher.shared.metrics import (
     InMemoryMetrics,
-    MetricType,
     MetricsCollector,
+    configure_metrics,
     get_metrics,
     reset_metrics,
-    configure_metrics,
 )
 
 
@@ -127,10 +126,12 @@ class TestMetricsCollector:
 
         backend = collector.backend
         assert isinstance(backend, InMemoryMetrics)
-        assert backend.get_counter(
-            "match_requests_total",
-            {"schema": "test.avsc", "status": "success"}
-        ) == 1.0
+        assert (
+            backend.get_counter(
+                "match_requests_total", {"schema": "test.avsc", "status": "success"}
+            )
+            == 1.0
+        )
 
     def test_record_match_latency(self, collector):
         """Test match latency recording."""
@@ -140,10 +141,7 @@ class TestMetricsCollector:
         backend = collector.backend
         assert isinstance(backend, InMemoryMetrics)
 
-        stats = backend.get_histogram_stats(
-            "match_latency_seconds",
-            {"operation": "embedding"}
-        )
+        stats = backend.get_histogram_stats("match_latency_seconds", {"operation": "embedding"})
         assert stats is not None
         assert stats["count"] == 1
 
@@ -163,14 +161,8 @@ class TestMetricsCollector:
 
         backend = collector.backend
         assert isinstance(backend, InMemoryMetrics)
-        assert backend.get_counter(
-            "cache_requests_total",
-            {"cache": "L1", "result": "hit"}
-        ) == 2.0
-        assert backend.get_counter(
-            "cache_requests_total",
-            {"cache": "L1", "result": "miss"}
-        ) == 1.0
+        assert backend.get_counter("cache_requests_total", {"cache": "L1", "result": "hit"}) == 2.0
+        assert backend.get_counter("cache_requests_total", {"cache": "L1", "result": "miss"}) == 1.0
 
     def test_time_operation_context_manager(self, collector):
         """Test time_operation context manager."""
@@ -180,16 +172,14 @@ class TestMetricsCollector:
         backend = collector.backend
         assert isinstance(backend, InMemoryMetrics)
 
-        stats = backend.get_histogram_stats(
-            "operation_duration_seconds",
-            {"operation": "test_op"}
-        )
+        stats = backend.get_histogram_stats("operation_duration_seconds", {"operation": "test_op"})
         assert stats is not None
         assert stats["count"] == 1
         assert stats["min"] >= 0.01  # At least 10ms
 
     def test_timed_decorator(self, collector):
         """Test timed decorator."""
+
         @collector.timed("decorated_op")
         def slow_function():
             time.sleep(0.01)
@@ -202,8 +192,7 @@ class TestMetricsCollector:
         assert isinstance(backend, InMemoryMetrics)
 
         stats = backend.get_histogram_stats(
-            "operation_duration_seconds",
-            {"operation": "decorated_op"}
+            "operation_duration_seconds", {"operation": "decorated_op"}
         )
         assert stats is not None
         assert stats["count"] == 1

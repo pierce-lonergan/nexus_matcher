@@ -24,9 +24,9 @@ from __future__ import annotations
 
 import threading
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
+from collections.abc import Callable
 from enum import Enum
-from typing import Any, Callable, Generic, TypeVar, overload
+from typing import Any, Generic, TypeVar
 
 T = TypeVar("T")
 
@@ -269,9 +269,7 @@ class Container:
             Self for chaining
         """
         with self._lock:
-            self._providers[interface] = FactoryProvider(
-                factory, args, kwargs, lifecycle
-            )
+            self._providers[interface] = FactoryProvider(factory, args, kwargs, lifecycle)
         return self
 
     def register_provider(

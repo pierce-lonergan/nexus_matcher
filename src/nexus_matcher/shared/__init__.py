@@ -27,6 +27,6 @@ __all__ = [
     "Lifecycle",
     "Provider",
     "get_container",
-    "set_container",
     "reset_container",
+    "set_container",
 ]

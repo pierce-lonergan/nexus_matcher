@@ -2,9 +2,18 @@
 
 > Learned Type Embeddings via Contrastive Learning
 > 
-> **Location**: `src/nexus_matcher/core/type_projections.py`  
-> **Status**: VALIDATED ✓  
-> **MRR**: 0.9706 (Target: 0.80)
+> **Location**: `src/nexus_matcher/core/type_projections.py`
+> **Status**: EXPERIMENTAL — not part of the benchmarked matching path
+>
+> The frequently quoted **MRR 0.9706** comes from `benchmarks/suite_008_combined.py`,
+> which evaluates on **17 hand-written source fields against a 20-entry hand-written
+> target set** and never calls `NexusMatcher`. It is not a system result. The two
+> archived runs of that suite disagree with each other on the related figures
+> (`test_accuracy` 0.89 vs 0.905), which is what you would expect from a 17-pair sample.
+>
+> Type projections are **not enabled in the default pipeline**. Type information is used
+> as a numeric scoring signal (`type_weight = 0.05`) instead. Separately, injecting type
+> information *as query text* was measured to cost 2.1 points of P@1.
 
 ---
 
@@ -316,12 +325,12 @@ from nexus_matcher.core.type_projections import (
     TypeProjectionManager,
     TrainingDataGenerator,
 )
-from nexus_matcher.infrastructure.adapters.embeddings import (
-    SentenceTransformerEmbeddingProvider,
+from nexus_matcher.infrastructure.adapters.embedding_providers.sentence_transformers import (
+    SentenceTransformersProvider,
 )
 
 # Initialize embedder
-embedder = SentenceTransformerEmbeddingProvider(
+embedder = SentenceTransformersProvider(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
@@ -479,7 +488,7 @@ def type_aware_match(field, dictionary_entries, embedder, type_manager):
 | Metric | Value | Target |
 |--------|-------|--------|
 | Test Accuracy | 89.0% | - |
-| Schema Matching MRR | **0.9706** | ≥0.80 ✓ |
+| Schema Matching MRR | 0.9706 on a 17-pair toy set | not a system result — see the header |
 | Avg Positive Similarity | 0.6387 | - |
 | Avg Negative Similarity | -0.0847 | - |
 | Separation | 0.7233 | >0.5 ✓ |

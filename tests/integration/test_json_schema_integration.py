@@ -3,16 +3,15 @@ tests.integration.test_json_schema_integration | Layer: TEST
 Integration tests for JSON Schema parser with NexusMatcher.
 """
 
-import pytest
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-import json
 
-from nexus_matcher.infrastructure.adapters.schema_parsers import (
-    JsonSchemaParser,
-    AvroSchemaParser,
-)
+import pytest
+
 from nexus_matcher.domain.ports.schema_parser import SchemaParserRegistry
+from nexus_matcher.infrastructure.adapters.schema_parsers import (
+    AvroSchemaParser,
+    JsonSchemaParser,
+)
 from nexus_matcher.shared.types.base import DataType
 
 
@@ -34,42 +33,19 @@ class TestJsonSchemaParserIntegration:
                 "customer_id": {
                     "type": "string",
                     "format": "uuid",
-                    "description": "Unique customer identifier"
+                    "description": "Unique customer identifier",
                 },
-                "first_name": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 50
-                },
-                "last_name": {
-                    "type": "string",
-                    "minLength": 1,
-                    "maxLength": 50
-                },
-                "email": {
-                    "type": "string",
-                    "format": "email"
-                },
-                "birth_date": {
-                    "type": "string",
-                    "format": "date"
-                },
+                "first_name": {"type": "string", "minLength": 1, "maxLength": 50},
+                "last_name": {"type": "string", "minLength": 1, "maxLength": 50},
+                "email": {"type": "string", "format": "email"},
+                "birth_date": {"type": "string", "format": "date"},
                 "account_balance": {
                     "type": "number",
-                    "description": "Current account balance in USD"
+                    "description": "Current account balance in USD",
                 },
-                "is_active": {
-                    "type": "boolean",
-                    "default": True
-                },
-                "created_at": {
-                    "type": "string",
-                    "format": "date-time"
-                },
-                "tags": {
-                    "type": "array",
-                    "items": {"type": "string"}
-                },
+                "is_active": {"type": "boolean", "default": True},
+                "created_at": {"type": "string", "format": "date-time"},
+                "tags": {"type": "array", "items": {"type": "string"}},
                 "address": {
                     "type": "object",
                     "properties": {
@@ -77,12 +53,12 @@ class TestJsonSchemaParserIntegration:
                         "city": {"type": "string"},
                         "state": {"type": "string"},
                         "zip_code": {"type": "string"},
-                        "country": {"type": "string", "default": "USA"}
+                        "country": {"type": "string", "default": "USA"},
                     },
-                    "required": ["street", "city"]
-                }
+                    "required": ["street", "city"],
+                },
             },
-            "required": ["customer_id", "first_name", "last_name", "email"]
+            "required": ["customer_id", "first_name", "last_name", "email"],
         }
 
         result = parser.parse(schema)
@@ -129,7 +105,7 @@ class TestJsonSchemaParserIntegration:
                 "account_number": {"type": "string"},
                 "transaction_type": {
                     "type": "string",
-                    "enum": ["DEPOSIT", "WITHDRAWAL", "TRANSFER"]
+                    "enum": ["DEPOSIT", "WITHDRAWAL", "TRANSFER"],
                 },
                 "amount": {"type": "number"},
                 "currency": {"type": "string", "default": "USD"},
@@ -137,13 +113,10 @@ class TestJsonSchemaParserIntegration:
                 "description": {"type": ["string", "null"]},
                 "metadata": {
                     "type": "object",
-                    "properties": {
-                        "channel": {"type": "string"},
-                        "device_id": {"type": "string"}
-                    }
-                }
+                    "properties": {"channel": {"type": "string"}, "device_id": {"type": "string"}},
+                },
             },
-            "required": ["transaction_id", "account_number", "transaction_type", "amount"]
+            "required": ["transaction_id", "account_number", "transaction_type", "amount"],
         }
 
         result = parser.parse(schema)
@@ -170,10 +143,7 @@ class TestSchemaParserRegistry:
         registry.register(AvroSchemaParser())
         registry.register(JsonSchemaParser())
 
-        json_schema = {
-            "type": "object",
-            "properties": {"name": {"type": "string"}}
-        }
+        json_schema = {"type": "object", "properties": {"name": {"type": "string"}}}
 
         detected = registry.detect_parser(json_schema)
 
@@ -189,7 +159,7 @@ class TestSchemaParserRegistry:
         avro_schema = {
             "type": "record",
             "name": "Test",
-            "fields": [{"name": "id", "type": "string"}]
+            "fields": [{"name": "id", "type": "string"}],
         }
 
         detected = registry.detect_parser(avro_schema)
@@ -234,11 +204,8 @@ class TestJsonSchemaWithNexusMatcher:
         schema = {
             "type": "object",
             "properties": {
-                "cust_acct_bal": {
-                    "type": "number",
-                    "description": "Customer account balance"
-                }
-            }
+                "cust_acct_bal": {"type": "number", "description": "Customer account balance"}
+            },
         }
 
         result = parser.parse(schema)
@@ -266,15 +233,13 @@ class TestJsonSchemaWithNexusMatcher:
                             "properties": {
                                 "level3": {
                                     "type": "object",
-                                    "properties": {
-                                        "value": {"type": "string"}
-                                    }
+                                    "properties": {"value": {"type": "string"}},
                                 }
-                            }
+                            },
                         }
-                    }
+                    },
                 }
-            }
+            },
         }
 
         result = parser.parse(schema)

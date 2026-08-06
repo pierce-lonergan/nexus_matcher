@@ -22,7 +22,7 @@ import uuid
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from functools import lru_cache
-from typing import Any, Callable, Mapping, MutableMapping
+from typing import Any
 
 import structlog
 from structlog.types import EventDict, Processor, WrappedLogger
@@ -34,10 +34,11 @@ from structlog.types import EventDict, Processor, WrappedLogger
 # Correlation ID for request tracing
 correlation_id_var: ContextVar[str | None] = ContextVar("correlation_id", default=None)
 
-# Additional context that can be added per-request
-request_context_var: ContextVar[dict[str, Any]] = ContextVar(
-    "request_context", default={}
-)
+# Additional context that can be added per-request.
+# The default is None rather than {} on purpose: a mutable default is a single
+# dict shared by every context that never called set(), so any in-place mutation
+# would leak context between requests. Readers below normalise None to {}.
+request_context_var: ContextVar[dict[str, Any] | None] = ContextVar("request_context", default=None)
 
 
 def get_correlation_id() -> str:
@@ -56,7 +57,7 @@ def set_correlation_id(cid: str) -> None:
 
 def add_request_context(**kwargs: Any) -> None:
     """Add key-value pairs to request context."""
-    ctx = request_context_var.get().copy()
+    ctx = dict(request_context_var.get() or {})
     ctx.update(kwargs)
     request_context_var.set(ctx)
 
@@ -85,23 +86,25 @@ PII_PATTERNS: list[tuple[re.Pattern, str]] = [
 ]
 
 # Keys that should have their values redacted
-SENSITIVE_KEYS = frozenset({
-    "password",
-    "passwd",
-    "secret",
-    "token",
-    "api_key",
-    "apikey",
-    "api-key",
-    "authorization",
-    "auth",
-    "credential",
-    "private_key",
-    "ssn",
-    "social_security",
-    "credit_card",
-    "card_number",
-})
+SENSITIVE_KEYS = frozenset(
+    {
+        "password",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "api-key",
+        "authorization",
+        "auth",
+        "credential",
+        "private_key",
+        "ssn",
+        "social_security",
+        "credit_card",
+        "card_number",
+    }
+)
 
 
 def redact_pii(value: str) -> str:
@@ -130,8 +133,11 @@ def redact_dict(d: dict[str, Any], redact: bool = True) -> dict[str, Any]:
             result[key] = redact_dict(value, redact)
         elif isinstance(value, (list, tuple)):
             result[key] = [
-                redact_dict(v, redact) if isinstance(v, dict) else
-                redact_pii(v) if isinstance(v, str) else v
+                redact_dict(v, redact)
+                if isinstance(v, dict)
+                else redact_pii(v)
+                if isinstance(v, str)
+                else v
                 for v in value
             ]
         else:
@@ -145,9 +151,7 @@ def redact_dict(d: dict[str, Any], redact: bool = True) -> dict[str, Any]:
 # =============================================================================
 
 
-def add_correlation_id(
-    logger: WrappedLogger, method_name: str, event_dict: EventDict
-) -> EventDict:
+def add_correlation_id(logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
     """Add correlation ID to log events."""
     event_dict["correlation_id"] = get_correlation_id()
     return event_dict
@@ -163,17 +167,13 @@ def add_request_context_processor(
     return event_dict
 
 
-def add_timestamp(
-    logger: WrappedLogger, method_name: str, event_dict: EventDict
-) -> EventDict:
+def add_timestamp(logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
     """Add ISO timestamp to log events."""
     event_dict["timestamp"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     return event_dict
 
 
-def add_service_info(
-    logger: WrappedLogger, method_name: str, event_dict: EventDict
-) -> EventDict:
+def add_service_info(logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
     """Add service metadata to log events."""
     event_dict["service"] = "nexus-matcher"
     event_dict["version"] = "2.0.0"
@@ -186,9 +186,7 @@ class PIIRedactor:
     def __init__(self, enabled: bool = True) -> None:
         self.enabled = enabled
 
-    def __call__(
-        self, logger: WrappedLogger, method_name: str, event_dict: EventDict
-    ) -> EventDict:
+    def __call__(self, logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
         if not self.enabled:
             return event_dict
         return redact_dict(dict(event_dict), redact=True)
@@ -229,15 +227,19 @@ def get_processors(
         processors.append(PIIRedactor(enabled=True))
 
     if json_format:
-        processors.extend([
-            drop_color_message_key,
-            structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer(),
-        ])
+        processors.extend(
+            [
+                drop_color_message_key,
+                structlog.processors.format_exc_info,
+                structlog.processors.JSONRenderer(),
+            ]
+        )
     else:
-        processors.extend([
-            structlog.dev.ConsoleRenderer(colors=True),
-        ])
+        processors.extend(
+            [
+                structlog.dev.ConsoleRenderer(colors=True),
+            ]
+        )
 
     return processors
 

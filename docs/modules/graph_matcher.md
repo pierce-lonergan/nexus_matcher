@@ -2,9 +2,14 @@
 
 > Graph-Based Structural Schema Matching
 > 
-> **Location**: `src/nexus_matcher/core/graph_matcher.py`  
-> **Status**: VALIDATED ✓  
-> **Use Case**: Hybrid complement to semantic matching
+> **Location**: `src/nexus_matcher/core/graph_matcher.py`
+> **Status**: EXPERIMENTAL — not part of the benchmarked matching path
+>
+> Its measured numbers (Precision@1 0.294, MRR 0.477) come from
+> `benchmarks/suite_008_combined.py`: 17 hand-written source fields, a 20-entry target
+> set, and no call to `NexusMatcher`. Graph matching alone performs far worse than
+> semantic matching even on that toy set. It is not enabled by default and its value in
+> the real pipeline is unmeasured.
 
 ---
 
@@ -409,15 +414,15 @@ for source_field in source_fields:
 
 ```python
 from nexus_matcher.core.graph_matcher import HybridMatcher
-from nexus_matcher.infrastructure.adapters.embeddings import (
-    SentenceTransformerEmbeddingProvider,
+from nexus_matcher.infrastructure.adapters.embedding_providers.sentence_transformers import (
+    SentenceTransformersProvider,
 )
-from nexus_matcher.infrastructure.adapters.vector_stores import (
+from nexus_matcher.infrastructure.adapters.vector_stores.memory import (
     InMemoryVectorStore,
 )
 
 # 1. Set up semantic matching
-embedder = SentenceTransformerEmbeddingProvider()
+embedder = SentenceTransformersProvider()
 vector_store = InMemoryVectorStore(dimension=embedder.dimension)
 
 # Index dictionary

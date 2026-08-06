@@ -7,7 +7,7 @@ Tests real-world scenarios where abbreviation expansion improves matching.
 
 import pytest
 
-from nexus_matcher.domain.services.abbreviation import AbbreviationExpander, ExpandedText
+from nexus_matcher.domain.services.abbreviation import AbbreviationExpander
 
 
 class TestAbbreviationIntegration:

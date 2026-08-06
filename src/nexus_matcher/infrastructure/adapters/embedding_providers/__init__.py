@@ -3,35 +3,35 @@ nexus_matcher.infrastructure.adapters.embedding_providers | Layer: INFRASTRUCTUR
 Embedding provider implementations.
 """
 
-from nexus_matcher.infrastructure.adapters.embedding_providers.sentence_transformers import (
-    MockEmbeddingProvider,
-    SentenceTransformersProvider,
-)
 from nexus_matcher.infrastructure.adapters.embedding_providers.quantized import (
     MockQuantizedProvider,
-    QuantizedEmbeddingProvider,
     QuantizationConfig,
     QuantizationStats,
+    QuantizedEmbeddingProvider,
     create_quantized_provider,
     detect_cpu_features,
     get_quantization_info,
     is_backend_available,
     is_quantization_recommended,
 )
+from nexus_matcher.infrastructure.adapters.embedding_providers.sentence_transformers import (
+    MockEmbeddingProvider,
+    SentenceTransformersProvider,
+)
 
 __all__ = [
-    # Standard providers
-    "SentenceTransformersProvider",
     "MockEmbeddingProvider",
-    # Quantized providers (GAP-002)
-    "QuantizedEmbeddingProvider",
+    "MockQuantizedProvider",
     "QuantizationConfig",
     "QuantizationStats",
-    "MockQuantizedProvider",
+    # Quantized providers (GAP-002)
+    "QuantizedEmbeddingProvider",
+    # Standard providers
+    "SentenceTransformersProvider",
     # Utility functions
     "create_quantized_provider",
     "detect_cpu_features",
-    "is_quantization_recommended",
-    "is_backend_available",
     "get_quantization_info",
+    "is_backend_available",
+    "is_quantization_recommended",
 ]

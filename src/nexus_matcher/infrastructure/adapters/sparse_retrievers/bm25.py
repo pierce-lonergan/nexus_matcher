@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import pickle
 import re
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
+
+import numpy as np
 
 from nexus_matcher.domain.ports.retrieval import (
     BaseSparseRetriever,
@@ -97,9 +99,8 @@ class BM25Retriever(BaseSparseRetriever):
             from rank_bm25 import BM25Okapi
         except ImportError:
             raise ImportError(
-                "rank_bm25 is required. "
-                "Install with: pip install nexus-matcher[sparse]"
-            )
+                "rank_bm25 is required. Install with: pip install nexus-matcher[sparse]"
+            ) from None
 
         if not self._tokenized_corpus:
             self._bm25 = None
@@ -176,10 +177,14 @@ class BM25Retriever(BaseSparseRetriever):
                     del self._id_to_index[doc_id]
                     removed += 1
                 else:
-                    new_idx = len(new_index_to_id)
-                    self._id_to_index[doc_id] = new_idx
+                    # Read the token list at the OLD index before reassigning the
+                    # mapping. The previous order overwrote _id_to_index first and then
+                    # used the new value to index the old corpus, so every surviving
+                    # document silently inherited another document's tokens.
+                    old_idx = self._id_to_index[doc_id]
+                    new_corpus.append(self._tokenized_corpus[old_idx])
+                    self._id_to_index[doc_id] = len(new_index_to_id)
                     new_index_to_id.append(doc_id)
-                    new_corpus.append(self._tokenized_corpus[self._id_to_index[doc_id]])
 
             self._index_to_id = new_index_to_id
             self._tokenized_corpus = new_corpus
@@ -206,29 +211,36 @@ class BM25Retriever(BaseSparseRetriever):
                 return Result.success([])
 
             # Get BM25 scores
-            scores = self._bm25.get_scores(query_tokens)
+            scores = np.asarray(self._bm25.get_scores(query_tokens))
 
-            # Sort by score descending
-            scored_indices = sorted(
-                enumerate(scores),
-                key=lambda x: x[1],
-                reverse=True,
-            )
+            # Select top-k with argpartition (O(N)) then sort only those k, rather than
+            # sorting the entire corpus (O(N log N)) to keep a handful of results.
+            k = min(top_k, len(scores))
+            if k <= 0:
+                return Result.success([])
+            if k < len(scores):
+                candidates = np.argpartition(-scores, k - 1)[:k]
+            else:
+                candidates = np.arange(len(scores))
+            order = candidates[np.argsort(-scores[candidates])]
 
             # Build results
             results: list[SparseSearchResult] = []
-            for idx, score in scored_indices[:top_k]:
+            for idx in order:
+                score = float(scores[idx])
                 if score <= 0:
                     continue
 
                 doc_id = self._index_to_id[idx]
                 doc = self._documents[doc_id]
 
-                results.append(SparseSearchResult(
-                    id=doc_id,
-                    score=float(score),
-                    metadata=doc.metadata,
-                ))
+                results.append(
+                    SparseSearchResult(
+                        id=doc_id,
+                        score=float(score),
+                        metadata=doc.metadata,
+                    )
+                )
 
             return Result.success(results)
 
@@ -247,7 +259,7 @@ class BM25Retriever(BaseSparseRetriever):
                 "tokenized_corpus": self._tokenized_corpus,
             }
 
-            with open(path, "wb") as f:
+            with Path(path).open("wb") as f:
                 pickle.dump(data, f)
 
             return Result.success(True)
@@ -261,7 +273,7 @@ class BM25Retriever(BaseSparseRetriever):
             if not Path(path).exists():
                 return Result.failure(f"File not found: {path}")
 
-            with open(path, "rb") as f:
+            with Path(path).open("rb") as f:
                 data = pickle.load(f)
 
             self._k1 = data["k1"]

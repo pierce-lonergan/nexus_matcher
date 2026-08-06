@@ -24,7 +24,6 @@ import re
 from dataclasses import dataclass, field
 from typing import ClassVar
 
-
 # =============================================================================
 # VALUE OBJECTS
 # =============================================================================
@@ -189,7 +188,6 @@ DEFAULT_ABBREVIATIONS: dict[str, str] = {
     "pct": "percent",
     "txn": "transaction",
     "xfer": "transfer",
-
     # Customer/Business
     "cust": "customer",
     "clnt": "client",
@@ -197,7 +195,6 @@ DEFAULT_ABBREVIATIONS: dict[str, str] = {
     "corp": "corporate",
     "bus": "business",
     "emp": "employee",
-
     # General Data
     "addr": "address",
     "cd": "code",
@@ -216,29 +213,27 @@ DEFAULT_ABBREVIATIONS: dict[str, str] = {
     "ts": "timestamp",
     "typ": "type",
     "val": "value",
-
     # Time
     "yr": "year",
     "mo": "month",
     "dy": "day",
     "hr": "hour",
-    "min": "minute",
+    # NOTE: "min" is deliberately absent here - it is mapped to "minimum"
+    # in the magnitude section below. Python keeps the last duplicate key, so
+    # a "min" -> "minute" entry here never took effect.
     "sec": "second",
-
     # Status/State
     "actv": "active",
     "inactv": "inactive",
     "pend": "pending",
     "appr": "approved",
     "rej": "rejected",
-
     # Geography
     "cntry": "country",
     "st": "state",
     "cty": "city",
     "zip": "zipcode",
     "rgn": "region",
-
     # Technical
     "src": "source",
     "tgt": "target",
@@ -259,14 +254,12 @@ DEFAULT_ABBREVIATIONS: dict[str, str] = {
     "lvl": "level",
     "grp": "group",
     "cat": "category",
-
     # Names/People
     "fst": "first",
     "lst": "last",
     "mid": "middle",
     "pref": "prefix",
     "suf": "suffix",
-
     # Communication
     "tel": "telephone",
     "ph": "phone",
@@ -344,7 +337,15 @@ class AbbreviationExpander:
         if not text:
             return ExpandedText(original="", expanded="", expansions=[])
 
-        # Detect separator used in original text
+        # Detect separator used in original text.
+        # Whitespace must be checked FIRST and takes precedence: the matching pipeline
+        # feeds this method natural-language text from ContextEnricher (e.g.
+        # "customer, account cust acct bal amt"). Such text has no underscores or
+        # hyphens, so without this check it fell through to the camelCase branch and
+        # was concatenated into a single out-of-vocabulary mega-token
+        # ("customer,AccountCustomerAccountBalanceAmount"), which zeroed out every BM25
+        # score and halved dense retrieval accuracy.
+        has_whitespace = any(c.isspace() for c in text)
         has_underscores = "_" in text
         has_hyphens = "-" in text
 
@@ -378,19 +379,20 @@ class AbbreviationExpander:
             else:
                 expanded_tokens.append(token)
 
-        # Reconstruct with appropriate separator
-        if has_underscores:
+        # Reconstruct with appropriate separator.
+        # Whitespace wins over the identifier separators: multi-word text stays
+        # multi-word, which is what both the tokenizer and the embedding model need.
+        if has_whitespace:
+            expanded = " ".join(expanded_tokens)
+        elif has_underscores:
             expanded = "_".join(expanded_tokens)
         elif has_hyphens:
             expanded = "-".join(expanded_tokens)
+        # camelCase - first token lowercase, rest title case
+        elif len(expanded_tokens) > 1:
+            expanded = expanded_tokens[0].lower() + "".join(t.title() for t in expanded_tokens[1:])
         else:
-            # camelCase - first token lowercase, rest title case
-            if len(expanded_tokens) > 1:
-                expanded = expanded_tokens[0].lower() + "".join(
-                    t.title() for t in expanded_tokens[1:]
-                )
-            else:
-                expanded = expanded_tokens[0] if expanded_tokens else ""
+            expanded = expanded_tokens[0] if expanded_tokens else ""
 
         return ExpandedText(
             original=text,

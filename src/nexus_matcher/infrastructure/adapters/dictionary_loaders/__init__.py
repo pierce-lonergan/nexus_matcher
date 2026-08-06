@@ -8,4 +8,4 @@ from nexus_matcher.infrastructure.adapters.dictionary_loaders.excel import (
     ExcelDictionaryLoader,
 )
 
-__all__ = ["ExcelDictionaryLoader", "CsvDictionaryLoader"]
+__all__ = ["CsvDictionaryLoader", "ExcelDictionaryLoader"]

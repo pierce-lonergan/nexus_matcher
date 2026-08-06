@@ -6,13 +6,13 @@ Shared test fixtures and configuration.
 # USED_BY → tests/* :: all test modules
 """
 
-import pytest
 from pathlib import Path
 
-from nexus_matcher.shared.types import DataType, MatchDecision, ProtectionLevel
-from nexus_matcher.domain.models import SchemaField, DictionaryEntry, Schema
-from nexus_matcher.shared.types.base import ScoreBreakdown, PerformanceMetrics
+import pytest
 
+from nexus_matcher.domain.models import DictionaryEntry, Schema, SchemaField
+from nexus_matcher.shared.types import DataType, ProtectionLevel
+from nexus_matcher.shared.types.base import PerformanceMetrics, ScoreBreakdown
 
 # =============================================================================
 # PATH FIXTURES

@@ -129,38 +129,50 @@ $(VENV_DIR):
 # TESTING
 # =============================================================================
 
-## test: Run test suite with coverage
+## test: Run test suite
 test: $(VENV_DIR)
 	@echo "$(BLUE)[INFO]$(NC) Running tests..."
 	@$(PYTEST) tests/ -v --tb=short
 	@echo "$(GREEN)[✓]$(NC) Tests complete"
 
+## test-cov: Run test suite with coverage and enforce the fail_under gate
+# Coverage is requested here rather than from pytest addopts, so that running a
+# single test file does not fail on the whole-package coverage threshold.
+test-cov: $(VENV_DIR)
+	@echo "$(BLUE)[INFO]$(NC) Running tests with coverage..."
+	@$(PYTEST) tests/ --tb=short \
+		--cov=nexus_matcher --cov-report=term-missing --cov-report=xml
+	@echo "$(GREEN)[✓]$(NC) Coverage complete"
+
 ## test-fast: Run tests without coverage
 test-fast: $(VENV_DIR)
-	@$(PYTEST) tests/ -v --tb=short --no-cov
+	@$(PYTEST) tests/ -v --tb=short
 
 ## test-unit: Run only unit tests
 test-unit: $(VENV_DIR)
-	@$(PYTEST) tests/unit/ -v --tb=short --no-cov
+	@$(PYTEST) tests/unit/ -v --tb=short
 
 ## test-integration: Run integration tests
 test-integration: $(VENV_DIR)
-	@$(PYTEST) tests/integration/ -v --tb=short --no-cov
+	@$(PYTEST) tests/integration/ -v --tb=short
 
 # =============================================================================
 # CODE QUALITY
 # =============================================================================
 
 ## lint: Run linting
+# Paths kept identical to .github/workflows/ci.yml so `make lint` and CI cannot
+# disagree. `src/` would also sweep up non-package files that live there.
 lint: $(VENV_DIR)
 	@echo "$(BLUE)[INFO]$(NC) Running ruff..."
-	@$(VENV_BIN)/ruff check src/ tests/
+	@$(VENV_BIN)/ruff check src/nexus_matcher tests
+	@$(VENV_BIN)/ruff format --check src/nexus_matcher tests
 
 ## format: Format code
 format: $(VENV_DIR)
 	@echo "$(BLUE)[INFO]$(NC) Formatting code..."
-	@$(VENV_BIN)/ruff format src/ tests/
-	@$(VENV_BIN)/ruff check --fix src/ tests/
+	@$(VENV_BIN)/ruff format src/nexus_matcher tests
+	@$(VENV_BIN)/ruff check --fix src/nexus_matcher tests
 	@echo "$(GREEN)[✓]$(NC) Formatting complete"
 
 ## typecheck: Run type checking

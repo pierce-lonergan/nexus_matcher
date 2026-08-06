@@ -5,17 +5,18 @@ Tests: CrossEncoder reranker | Target: src/infrastructure/adapters/rerankers/cro
 TDD Phase: RED → Tests written before implementation
 """
 
+from unittest.mock import MagicMock, patch
+
 import pytest
-from unittest.mock import Mock, MagicMock, patch
 
 from nexus_matcher.domain.ports.retrieval import (
     RerankCandidate,
-    RerankResult,
 )
 
 # Check if sentence-transformers is available
 try:
     from sentence_transformers import CrossEncoder
+
     SENTENCE_TRANSFORMERS_AVAILABLE = True
 except ImportError:
     SENTENCE_TRANSFORMERS_AVAILABLE = False
@@ -24,25 +25,33 @@ except ImportError:
 class TestCrossEncoderRerankerProperties:
     """Test basic reranker properties."""
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_reranker_type(self):
         """Test reranker type is 'cross_encoder'."""
         from nexus_matcher.infrastructure.adapters.rerankers.cross_encoder import (
             CrossEncoderReranker,
         )
 
-        with patch("nexus_matcher.infrastructure.adapters.rerankers.cross_encoder.CrossEncoder"):
+        with patch(
+            "nexus_matcher.infrastructure.adapters.rerankers.cross_encoder._get_cross_encoder"
+        ):
             reranker = CrossEncoderReranker(model_name="test-model")
             assert reranker.reranker_type == "cross_encoder"
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_model_name(self):
         """Test model name is stored."""
         from nexus_matcher.infrastructure.adapters.rerankers.cross_encoder import (
             CrossEncoderReranker,
         )
 
-        with patch("nexus_matcher.infrastructure.adapters.rerankers.cross_encoder.CrossEncoder"):
+        with patch(
+            "nexus_matcher.infrastructure.adapters.rerankers.cross_encoder._get_cross_encoder"
+        ):
             reranker = CrossEncoderReranker(model_name="cross-encoder/ms-marco-MiniLM-L-6-v2")
             assert reranker.model_name == "cross-encoder/ms-marco-MiniLM-L-6-v2"
 
@@ -53,7 +62,10 @@ class TestCrossEncoderRerankerRerank:
     @pytest.fixture
     def mock_model(self):
         """Create mock CrossEncoder model."""
-        with patch("nexus_matcher.infrastructure.adapters.rerankers.cross_encoder.CrossEncoder") as mock:
+        with patch(
+            "nexus_matcher.infrastructure.adapters.rerankers.cross_encoder._get_cross_encoder"
+        ) as _get_ce:
+            mock = _get_ce.return_value
             model = MagicMock()
             mock.return_value = model
             yield model
@@ -67,7 +79,9 @@ class TestCrossEncoderRerankerRerank:
 
         return CrossEncoderReranker(model_name="test-model")
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_rerank_returns_results(self, reranker, mock_model):
         """Test reranking returns results."""
         # Mock model to return scores
@@ -85,7 +99,9 @@ class TestCrossEncoderRerankerRerank:
         results = result.unwrap()
         assert len(results) == 3
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_rerank_orders_by_score(self, reranker, mock_model):
         """Test reranking orders by score descending."""
         mock_model.predict.return_value = [0.5, 0.9, 0.3]
@@ -100,13 +116,15 @@ class TestCrossEncoderRerankerRerank:
 
         assert result.is_success
         results = result.unwrap()
-        
+
         # Should be ordered: id=2 (0.9), id=1 (0.5), id=3 (0.3)
         assert results[0].id == "2"
         assert results[1].id == "1"
         assert results[2].id == "3"
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_rerank_assigns_ranks(self, reranker, mock_model):
         """Test reranking assigns correct ranks."""
         mock_model.predict.return_value = [0.5, 0.9, 0.3]
@@ -125,7 +143,9 @@ class TestCrossEncoderRerankerRerank:
         assert results[1].rank == 2
         assert results[2].rank == 3
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_rerank_preserves_original_ranks(self, reranker, mock_model):
         """Test reranking preserves original ranks."""
         mock_model.predict.return_value = [0.5, 0.9, 0.3]
@@ -144,7 +164,9 @@ class TestCrossEncoderRerankerRerank:
         # id=1 was originally rank 1, now rank 2
         assert results[1].original_rank == 1
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_rerank_with_top_k(self, reranker, mock_model):
         """Test reranking with top_k limit."""
         mock_model.predict.return_value = [0.5, 0.9, 0.3, 0.7]
@@ -165,7 +187,9 @@ class TestCrossEncoderRerankerRerank:
         assert results[0].id == "2"
         assert results[1].id == "4"
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_rerank_empty_candidates(self, reranker, mock_model):
         """Test reranking with empty candidates."""
         result = reranker.rerank("query", [])
@@ -173,16 +197,16 @@ class TestCrossEncoderRerankerRerank:
         assert result.is_success
         assert result.unwrap() == []
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_rerank_preserves_metadata(self, reranker, mock_model):
         """Test reranking preserves candidate metadata."""
         mock_model.predict.return_value = [0.9]
 
         candidates = [
             RerankCandidate(
-                id="1", 
-                text="doc one",
-                metadata={"domain": "customer", "source": "database"}
+                id="1", text="doc one", metadata={"domain": "customer", "source": "database"}
             ),
         ]
 
@@ -198,7 +222,10 @@ class TestCrossEncoderRerankerScorePair:
     @pytest.fixture
     def mock_model(self):
         """Create mock CrossEncoder model."""
-        with patch("nexus_matcher.infrastructure.adapters.rerankers.cross_encoder.CrossEncoder") as mock:
+        with patch(
+            "nexus_matcher.infrastructure.adapters.rerankers.cross_encoder._get_cross_encoder"
+        ) as _get_ce:
+            mock = _get_ce.return_value
             model = MagicMock()
             mock.return_value = model
             yield model
@@ -212,7 +239,9 @@ class TestCrossEncoderRerankerScorePair:
 
         return CrossEncoderReranker(model_name="test-model")
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_score_pair(self, reranker, mock_model):
         """Test scoring a single pair."""
         mock_model.predict.return_value = [0.85]
@@ -229,7 +258,10 @@ class TestCrossEncoderRerankerBatching:
     @pytest.fixture
     def mock_model(self):
         """Create mock CrossEncoder model."""
-        with patch("nexus_matcher.infrastructure.adapters.rerankers.cross_encoder.CrossEncoder") as mock:
+        with patch(
+            "nexus_matcher.infrastructure.adapters.rerankers.cross_encoder._get_cross_encoder"
+        ) as _get_ce:
+            mock = _get_ce.return_value
             model = MagicMock()
             mock.return_value = model
             yield model
@@ -243,7 +275,9 @@ class TestCrossEncoderRerankerBatching:
 
         return CrossEncoderReranker(model_name="test-model", batch_size=2)
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_batch_size_parameter(self, reranker):
         """Test batch size is configurable."""
         assert reranker._batch_size == 2
@@ -255,7 +289,10 @@ class TestCrossEncoderRerankerErrorHandling:
     @pytest.fixture
     def mock_model(self):
         """Create mock CrossEncoder model."""
-        with patch("nexus_matcher.infrastructure.adapters.rerankers.cross_encoder.CrossEncoder") as mock:
+        with patch(
+            "nexus_matcher.infrastructure.adapters.rerankers.cross_encoder._get_cross_encoder"
+        ) as _get_ce:
+            mock = _get_ce.return_value
             model = MagicMock()
             mock.return_value = model
             yield model
@@ -269,7 +306,9 @@ class TestCrossEncoderRerankerErrorHandling:
 
         return CrossEncoderReranker(model_name="test-model")
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_rerank_handles_model_error(self, reranker, mock_model):
         """Test reranking handles model errors gracefully."""
         mock_model.predict.side_effect = Exception("Model error")
@@ -280,7 +319,9 @@ class TestCrossEncoderRerankerErrorHandling:
         assert result.is_failure
         assert "failed" in result.error.lower()
 
-    @pytest.mark.skipif(not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed")
+    @pytest.mark.skipif(
+        not SENTENCE_TRANSFORMERS_AVAILABLE, reason="sentence-transformers not installed"
+    )
     def test_score_pair_handles_error(self, reranker, mock_model):
         """Test score_pair handles errors gracefully."""
         mock_model.predict.side_effect = Exception("Scoring failed")

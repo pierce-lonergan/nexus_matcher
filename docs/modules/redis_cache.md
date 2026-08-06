@@ -1,5 +1,9 @@
 # Module: Redis Cache Adapter
 
+> **Not wired into the matching pipeline.** `NexusMatcher` performs no cache lookups.
+> This adapter is implemented and unit-tested; its benefit to matching is unmeasured.
+
+
 ## Purpose
 
 Production-grade Redis cache adapter for L2 caching. Provides low-latency distributed caching with TTL support, serialization, and connection pooling.

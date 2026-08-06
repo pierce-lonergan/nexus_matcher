@@ -8,10 +8,6 @@ Use cases (application services) for NexusMatcher.
 # EXPORTS → MatchingConfig, BatchConfig :: configuration
 """
 
-from nexus_matcher.application.use_cases.match_schema import (
-    MatchingConfig,
-    NexusMatcher,
-)
 from nexus_matcher.application.use_cases.batch_match import (
     AsyncBatchProcessor,
     BatchConfig,
@@ -19,15 +15,19 @@ from nexus_matcher.application.use_cases.batch_match import (
     BatchProgress,
     BatchResult,
 )
+from nexus_matcher.application.use_cases.match_schema import (
+    MatchingConfig,
+    NexusMatcher,
+)
 
 __all__ = [
-    # Core matching
-    "NexusMatcher",
-    "MatchingConfig",
-    # Batch processing
-    "BatchProcessor",
     "AsyncBatchProcessor",
     "BatchConfig",
+    # Batch processing
+    "BatchProcessor",
     "BatchProgress",
     "BatchResult",
+    "MatchingConfig",
+    # Core matching
+    "NexusMatcher",
 ]

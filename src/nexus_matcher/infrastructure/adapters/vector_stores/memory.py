@@ -16,8 +16,9 @@ In-memory vector store implementation for testing and development.
 from __future__ import annotations
 
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -43,7 +44,14 @@ class InMemoryCollection:
     ids: list[DocumentId] = field(default_factory=list)
 
     def rebuild_index(self) -> None:
-        """Rebuild the embedding matrix for search."""
+        """
+        Rebuild the embedding matrix for search.
+
+        The matrix is stored L2-NORMALIZED and C-contiguous so that a cosine search is
+        a single BLAS matrix-vector product. Normalizing here (once per index build)
+        rather than per query is what makes search O(N*d) FLOPs with no allocation
+        instead of O(N*d) FLOPs plus a full-size temporary array on every call.
+        """
         if not self.documents:
             self.embeddings = None
             self.ids = []
@@ -51,7 +59,11 @@ class InMemoryCollection:
 
         self.ids = list(self.documents.keys())
         vectors = [self.documents[doc_id].embedding for doc_id in self.ids]
-        self.embeddings = np.vstack(vectors).astype(np.float32)
+        matrix = np.vstack(vectors).astype(np.float32, copy=False)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        np.maximum(norms, 1e-9, out=norms)
+        matrix /= norms
+        self.embeddings = np.ascontiguousarray(matrix, dtype=np.float32)
 
 
 class InMemoryVectorStore(BaseVectorStore):
@@ -102,13 +114,15 @@ class InMemoryVectorStore(BaseVectorStore):
 
             collection = self._create_collection_internal(config)
 
-            return Result.success(CollectionInfo(
-                name=collection.name,
-                dimension=collection.dimension,
-                count=0,
-                index_type="brute_force",
-                distance_metric=collection.distance_metric,
-            ))
+            return Result.success(
+                CollectionInfo(
+                    name=collection.name,
+                    dimension=collection.dimension,
+                    count=0,
+                    index_type="brute_force",
+                    distance_metric=collection.distance_metric,
+                )
+            )
 
     def delete_collection(self, name: str) -> Result[bool]:
         """Delete a collection."""
@@ -126,13 +140,15 @@ class InMemoryVectorStore(BaseVectorStore):
                 return Result.failure(f"Collection '{name}' not found")
 
             collection = self._collections[name]
-            return Result.success(CollectionInfo(
-                name=collection.name,
-                dimension=collection.dimension,
-                count=len(collection.documents),
-                index_type="brute_force",
-                distance_metric=collection.distance_metric,
-            ))
+            return Result.success(
+                CollectionInfo(
+                    name=collection.name,
+                    dimension=collection.dimension,
+                    count=len(collection.documents),
+                    index_type="brute_force",
+                    distance_metric=collection.distance_metric,
+                )
+            )
 
     def _upsert_internal(
         self,
@@ -191,59 +207,78 @@ class InMemoryVectorStore(BaseVectorStore):
         filter: dict[str, Any] | None,
         include_embeddings: bool,
     ) -> list[SearchResult]:
-        """Internal search implementation using cosine similarity."""
+        """
+        Internal search implementation using cosine similarity.
+
+        The lock is held only long enough to snapshot the index. `rebuild_index`
+        REPLACES `embeddings`/`ids` rather than mutating them in place, so the snapshot
+        stays internally consistent once taken and the numpy work can run outside the
+        lock. Holding an RLock across the matrix product serialized every concurrent
+        caller and made the ThreadPoolExecutor in BatchProcessor useless.
+        """
         with self._lock:
             if collection not in self._collections:
                 raise ValueError(f"Collection '{collection}' not found")
 
             coll = self._collections[collection]
+            embeddings = coll.embeddings
+            ids = coll.ids
+            documents = coll.documents
 
-            if coll.embeddings is None or len(coll.ids) == 0:
-                return []
+        if embeddings is None or len(ids) == 0:
+            return []
 
-            # Normalize query
-            query = query_embedding.astype(np.float32)
-            query_norm = query / (np.linalg.norm(query) + 1e-9)
+        # Normalize query only; the corpus matrix is already normalized.
+        query = np.asarray(query_embedding, dtype=np.float32)
+        query = query / max(float(np.linalg.norm(query)), 1e-9)
 
-            # Normalize collection embeddings
-            norms = np.linalg.norm(coll.embeddings, axis=1, keepdims=True) + 1e-9
-            normalized = coll.embeddings / norms
+        similarities = embeddings @ query
 
-            # Compute cosine similarities
-            similarities = np.dot(normalized, query_norm)
-
-            # Apply filter if provided
-            if filter:
-                mask = np.ones(len(coll.ids), dtype=bool)
-                for i, doc_id in enumerate(coll.ids):
-                    doc = coll.documents[doc_id]
-                    for key, value in filter.items():
-                        if doc.payload.get(key) != value:
-                            mask[i] = False
-                            break
-                similarities = np.where(mask, similarities, -np.inf)
-
-            # Get top-k indices
-            k = min(top_k, len(coll.ids))
-            top_indices = np.argsort(similarities)[-k:][::-1]
-
-            # Build results
-            results: list[SearchResult] = []
-            for idx in top_indices:
-                if similarities[idx] == -np.inf:
+        # Apply filter if provided
+        if filter:
+            mask = np.ones(len(ids), dtype=bool)
+            for i, doc_id in enumerate(ids):
+                doc = documents.get(doc_id)
+                if doc is None:
+                    mask[i] = False
                     continue
+                for key, value in filter.items():
+                    if doc.payload.get(key) != value:
+                        mask[i] = False
+                        break
+            similarities = np.where(mask, similarities, -np.inf)
 
-                doc_id = coll.ids[idx]
-                doc = coll.documents[doc_id]
+        # Select top-k with argpartition (O(N)) and sort only the k survivors
+        # (O(k log k)), instead of a full O(N log N) argsort of the whole corpus.
+        k = min(top_k, len(ids))
+        if k < len(ids):
+            candidates = np.argpartition(-similarities, k - 1)[:k]
+        else:
+            candidates = np.arange(len(ids))
+        top_indices = candidates[np.argsort(-similarities[candidates])]
 
-                results.append(SearchResult(
+        # Build results
+        results: list[SearchResult] = []
+        for idx in top_indices:
+            score = float(similarities[idx])
+            if score == -np.inf:
+                continue
+
+            doc_id = ids[idx]
+            doc = documents.get(doc_id)
+            if doc is None:
+                continue
+
+            results.append(
+                SearchResult(
                     id=doc_id,
-                    score=float(similarities[idx]),
+                    score=score,
                     payload=doc.payload,
                     embedding=doc.embedding if include_embeddings else None,
-                ))
+                )
+            )
 
-            return results
+        return results
 
     def _get_by_id_internal(
         self,

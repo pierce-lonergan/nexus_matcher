@@ -1,12 +1,22 @@
 # Quantized Embedding Provider Module
 
 > Gap: GAP-002 - INT8 Quantization  
-> Status: IN_PROGRESS  
+> Status: IMPLEMENTED, off by default  
 > Research Reference: README_RESEARCH_2.md, Lines 9-18; README_RESEARCH_3.md, Lines 9-11
 
 ## Overview
 
-The Quantized Embedding Provider implements INT8 quantization for 3-10x CPU inference speedup with less than 2% accuracy loss. It supports ONNX Runtime and OpenVINO backends and automatically detects CPU features (VNNI, AVX-512) for optimal performance.
+The Quantized Embedding Provider implements INT8 quantization.
+
+> **The "3-10x speedup with <2% accuracy loss" figure is from the literature, not from
+> this implementation.** Measured here
+> (`benchmarks/results/suite_002_real_20251209_162836.json`, all-MiniLM-L6-v2, AVX2 but
+> **no VNNI**): 2.93x at batch 1, 1.34x at batch 8, 1.26x at batch 16, **1.27x at batch
+> 32**, 1.61x at batch 64. The artifact records `accuracy_pass: false` and
+> `overall_pass: false`; **no accuracy figure was ever measured**, so the previously
+> published "1.68x speedup / 3.07% accuracy loss" is retracted. Speedup is strongly
+> batch-size dependent and this machine lacks the instruction set INT8 benefits most
+> from. It supports ONNX Runtime and OpenVINO backends and automatically detects CPU features (VNNI, AVX-512) for optimal performance.
 
 **Research Highlights:**
 - INT8 quantization achieves 3-10x speedup on Intel Xeon CPUs with VNNI

@@ -20,13 +20,13 @@ Port interface for loading data dictionaries from various sources.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator, Iterator, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from nexus_matcher.domain.models.entities import DictionaryEntry
 from nexus_matcher.shared.types.base import DataType, ProtectionLevel, Result
-
 
 # =============================================================================
 # COLUMN MAPPING - Configuration for parsing dictionaries
@@ -402,6 +402,7 @@ class DictionaryLoaderRegistry:
                     self.register(loader)
                 except Exception as e:
                     import logging
+
                     logging.warning(f"Failed to load dictionary loader {ep.name}: {e}")
         except ImportError:
             pass

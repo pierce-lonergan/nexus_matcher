@@ -16,12 +16,12 @@ Excel dictionary loader implementation.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from nexus_matcher.domain.ports.dictionary_loader import (
     BaseDictionaryLoader,
-    ColumnMapping,
 )
 
 
@@ -83,7 +83,7 @@ class ExcelDictionaryLoader(BaseDictionaryLoader):
             raise ImportError(
                 "pandas and openpyxl are required for Excel loading. "
                 "Install with: pip install nexus-matcher[loaders]"
-            )
+            ) from None
 
         path = Path(source)
         if not path.exists():
@@ -92,7 +92,7 @@ class ExcelDictionaryLoader(BaseDictionaryLoader):
         # Parse options
         sheet_name = options.get("sheet_name", 0)
         header_row = options.get("header_row", 0)
-        skip_rows = options.get("skip_rows", None)
+        skip_rows = options.get("skip_rows")
 
         # Read Excel file
         df = pd.read_excel(
@@ -167,7 +167,7 @@ class CsvDictionaryLoader(BaseDictionaryLoader):
             raise ImportError(
                 "pandas is required for CSV loading. "
                 "Install with: pip install nexus-matcher[loaders]"
-            )
+            ) from None
 
         path = Path(source)
         if not path.exists():
@@ -176,14 +176,11 @@ class CsvDictionaryLoader(BaseDictionaryLoader):
         # Parse options
         delimiter = options.get("delimiter")
         encoding = options.get("encoding", "utf-8")
-        skip_rows = options.get("skip_rows", None)
+        skip_rows = options.get("skip_rows")
 
         # Auto-detect delimiter
         if delimiter is None:
-            if path.suffix == ".tsv":
-                delimiter = "\t"
-            else:
-                delimiter = ","
+            delimiter = "\t" if path.suffix == ".tsv" else ","
 
         # Read CSV file
         df = pd.read_csv(

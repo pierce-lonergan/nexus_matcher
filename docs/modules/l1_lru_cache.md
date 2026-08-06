@@ -4,7 +4,14 @@
 
 In-memory LRU (Least Recently Used) cache for sub-millisecond access latency. First tier in the hierarchical caching system.
 
-## Status: RESOLVED (GAP-003)
+## Status: IMPLEMENTED, NOT VALIDATED
+
+> **Status correction.** This component is implemented and unit-tested, but it is
+> **not wired into the matching pipeline** — `NexusMatcher` performs no cache lookups
+> and hardcodes `PerformanceMetrics.cache_hit = False`. Its benchmark script writes no
+> artifact, so the performance figures previously published for it are unverifiable.
+> See [BENCHMARK_REGISTRY.md](../BENCHMARK_REGISTRY.md#d--claims-with-no-artifact).
+
 
 ## Research Reference
 

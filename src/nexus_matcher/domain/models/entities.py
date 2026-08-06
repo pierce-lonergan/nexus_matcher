@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any
 
 from nexus_matcher.shared.types.base import (
     DataType,
@@ -31,7 +31,6 @@ from nexus_matcher.shared.types.base import (
     Score,
     ScoreBreakdown,
 )
-
 
 # =============================================================================
 # SCHEMA FIELD - Represents a field from any schema format
@@ -168,7 +167,9 @@ class DictionaryEntry:
     @property
     def content_hash(self) -> str:
         """Generate content hash for change detection."""
-        content = f"{self.business_name}|{self.logical_name}|{self.definition}|{self.data_type.value}"
+        content = (
+            f"{self.business_name}|{self.logical_name}|{self.definition}|{self.data_type.value}"
+        )
         return hashlib.blake2b(content.encode(), digest_size=16).hexdigest()
 
     def to_searchable_text(self) -> str:
@@ -200,7 +201,13 @@ class DictionaryEntry:
             return 0.0
 
         # Define compatible type groups
-        numeric_types = {DataType.INTEGER, DataType.LONG, DataType.FLOAT, DataType.DOUBLE, DataType.DECIMAL}
+        numeric_types = {
+            DataType.INTEGER,
+            DataType.LONG,
+            DataType.FLOAT,
+            DataType.DOUBLE,
+            DataType.DECIMAL,
+        }
         string_types = {DataType.STRING, DataType.UUID, DataType.JSON}
         temporal_types = {DataType.DATE, DataType.TIMESTAMP}
 
@@ -215,7 +222,7 @@ class DictionaryEntry:
             return 0.9
 
         # String can represent most types
-        if self.data_type == DataType.STRING or other_type == DataType.STRING:
+        if DataType.STRING in (self.data_type, other_type):
             return 0.5
 
         return 0.0
@@ -360,18 +367,13 @@ class MatchingSession:
             return 0.0
 
         auto_approved = sum(
-            1 for matches in self.results.values()
-            if matches and matches[0].is_auto_approved
+            1 for matches in self.results.values() if matches and matches[0].is_auto_approved
         )
         return auto_approved / len(self.results)
 
     def get_top_matches(self) -> dict[str, MatchResult]:
         """Get top match for each field."""
-        return {
-            path: matches[0]
-            for path, matches in self.results.items()
-            if matches
-        }
+        return {path: matches[0] for path, matches in self.results.items() if matches}
 
     def get_low_confidence_fields(self, threshold: float = 0.6) -> list[str]:
         """Get fields with low confidence top matches."""

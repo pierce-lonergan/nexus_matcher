@@ -5,9 +5,10 @@ Tests: SQL DDL parser | Target: src/infrastructure/adapters/schema_parsers/sql_d
 TDD Phase: RED → Tests written before implementation
 """
 
-import pytest
 from pathlib import Path
 from tempfile import NamedTemporaryFile
+
+import pytest
 
 from nexus_matcher.shared.types.base import DataType
 

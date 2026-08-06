@@ -20,17 +20,17 @@ from nexus_matcher.shared.types.base import (
 )
 
 __all__ = [
-    "DataType",
-    "MatchDecision",
-    "ProtectionLevel",
     "ChangeType",
-    "EmbeddingVector",
+    "DataType",
     "DocumentId",
-    "Score",
+    "EmbeddingVector",
     "EntityId",
+    "MatchDecision",
     "Metadata",
-    "ScoreBreakdown",
-    "PerformanceMetrics",
-    "Result",
     "PagedResult",
+    "PerformanceMetrics",
+    "ProtectionLevel",
+    "Result",
+    "Score",
+    "ScoreBreakdown",
 ]

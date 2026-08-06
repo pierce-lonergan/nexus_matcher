@@ -7,14 +7,15 @@ Unit tests for domain models.
 """
 
 import pytest
-from nexus_matcher.shared.types import DataType, MatchDecision, ProtectionLevel
+
 from nexus_matcher.domain.models import (
-    SchemaField,
     DictionaryEntry,
     MatchResult,
     Schema,
+    SchemaField,
 )
-from nexus_matcher.shared.types.base import ScoreBreakdown, PerformanceMetrics
+from nexus_matcher.shared.types import DataType, MatchDecision, ProtectionLevel
+from nexus_matcher.shared.types.base import PerformanceMetrics, ScoreBreakdown
 
 
 class TestDataType:
@@ -276,9 +277,7 @@ class TestSchema:
 
     def test_get_field(self):
         """Test field retrieval by path."""
-        fields = (
-            SchemaField(name="email", data_type=DataType.STRING, full_path="contact.email"),
-        )
+        fields = (SchemaField(name="email", data_type=DataType.STRING, full_path="contact.email"),)
         schema = Schema(name="Test", fields=fields)
 
         field = schema.get_field("contact.email")

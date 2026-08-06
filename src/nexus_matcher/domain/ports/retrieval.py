@@ -17,11 +17,11 @@ Port interfaces for sparse retrieval (BM25) and reranking.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, Sequence, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from nexus_matcher.shared.types.base import DocumentId, Result, Score
-
 
 # =============================================================================
 # SPARSE RETRIEVAL TYPES
@@ -310,14 +310,16 @@ class BaseReranker(ABC):
 
             # Create results with original ranks
             results = []
-            for i, (candidate, score) in enumerate(zip(candidates, scores)):
-                results.append(RerankResult(
-                    id=candidate.id,
-                    score=score,
-                    rank=0,  # Will be set after sorting
-                    original_rank=i + 1,
-                    metadata=candidate.metadata,
-                ))
+            for i, (candidate, score) in enumerate(zip(candidates, scores, strict=False)):
+                results.append(
+                    RerankResult(
+                        id=candidate.id,
+                        score=score,
+                        rank=0,  # Will be set after sorting
+                        original_rank=i + 1,
+                        metadata=candidate.metadata,
+                    )
+                )
 
             # Sort by score descending
             results.sort(key=lambda x: x.score, reverse=True)
@@ -325,13 +327,15 @@ class BaseReranker(ABC):
             # Assign new ranks
             final_results = []
             for i, r in enumerate(results):
-                final_results.append(RerankResult(
-                    id=r.id,
-                    score=r.score,
-                    rank=i + 1,
-                    original_rank=r.original_rank,
-                    metadata=r.metadata,
-                ))
+                final_results.append(
+                    RerankResult(
+                        id=r.id,
+                        score=r.score,
+                        rank=i + 1,
+                        original_rank=r.original_rank,
+                        metadata=r.metadata,
+                    )
+                )
 
             # Apply top_k
             if top_k is not None:

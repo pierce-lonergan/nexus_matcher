@@ -20,8 +20,6 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import Any, Generic, Protocol, TypeVar, runtime_checkable
 
-from nexus_matcher.shared.types.base import Result
-
 # Type variable for cached values
 T = TypeVar("T")
 

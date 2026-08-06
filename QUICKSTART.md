@@ -1,332 +1,247 @@
-# NexusMatcher Quick Start Guide
+# NexusMatcher Quick Start
 
-> Get up and running with NexusMatcher in 5 minutes
+Every command and code block on this page was executed against this repository and the
+outputs shown are the real ones.
 
 ---
 
-## Installation
-
-### Option 1: Full Installation (Recommended)
+## 1. Install
 
 ```bash
-# Clone repository
-git clone https://github.com/your-org/nexus_matcher.git
+git clone https://github.com/pierce-lonergan/nexus_matcher.git
 cd nexus_matcher
-
-# Create virtual environment
-python -m venv venv
-source venv/bin/activate  # Windows: venv\Scripts\activate
-
-# Install with all features
-pip install -e ".[full]"
+python -m venv .venv
+. .venv/bin/activate          # Windows: .venv\Scripts\activate
+pip install -e ".[embeddings,parsers,loaders,sparse,cli]"
 ```
 
-### Option 2: Minimal Installation
-
-```bash
-pip install -e .
-```
-
-### Option 3: Docker
-
-```bash
-docker compose up -d
-```
+The first run downloads a sentence-transformers model (~130 MB for the default
+`BAAI/bge-base-en-v1.5`) from HuggingFace. Everything runs on CPU.
 
 ---
 
-## 5-Minute Tutorial
+## 2. Two input files
 
-### Step 1: Prepare Your Data Dictionary
-
-Create a CSV file with your data dictionary entries:
+**`dictionary.csv`** — these column headers are the CSV loader's defaults. If yours
+differ, pass a `ColumnMapping` to `load_dictionary()`.
 
 ```csv
-id,business_name,technical_name,data_type,description,domain
-DE001,Customer Identifier,cust_id,bigint,Unique customer identifier,customer
-DE002,Customer Email,cust_email,varchar,Primary email address,customer
-DE003,First Name,first_name,varchar,Customer first name,customer
-DE004,Last Name,last_name,varchar,Customer last name,customer
-DE005,Order Amount,order_amount,decimal,Total order value,order
+ID,Business Name,Logical Name,Definition,Data Type,Domain
+DICT-001,Customer Identifier,cust_id,Unique identifier assigned to a customer account,integer,customer
+DICT-002,Customer Full Name,cust_nm,Full legal name of the customer,string,customer
+DICT-003,Email Address,email_addr,Primary contact email address for the customer,string,customer
+DICT-004,Account Balance,acct_bal,Current monetary balance of the account,float,finance
+DICT-005,Date of Birth,dob,Calendar date on which the customer was born,date,customer
 ```
 
-Save as `data/dictionary.csv`.
-
-### Step 2: Create a Schema to Match
-
-Create an Avro schema file:
+**`customer.avsc`**:
 
 ```json
 {
   "type": "record",
   "name": "Customer",
-  "namespace": "com.example",
   "fields": [
-    {"name": "id", "type": "long", "doc": "Customer ID"},
-    {"name": "email", "type": "string", "doc": "Email address"},
-    {"name": "firstName", "type": "string"},
-    {"name": "lastName", "type": "string"}
+    {"name": "cid", "type": "int"},
+    {"name": "full_nm", "type": "string"},
+    {"name": "email", "type": "string"},
+    {"name": "bal", "type": "double"},
+    {"name": "birth_dt", "type": "string"}
   ]
 }
 ```
 
-Save as `schemas/customer.avsc`.
+---
 
-### Step 3: Match Schema with Python
+## 3. Match, from Python
 
 ```python
 from nexus_matcher import NexusMatcher
 
-# Initialize
-matcher = NexusMatcher()
+matcher = NexusMatcher.from_config()
+matcher.load_dictionary("dictionary.csv")
 
-# Load dictionary
-matcher.load_dictionary("data/dictionary.csv")
-
-# Match schema
-results = matcher.match_schema("schemas/customer.avsc")
-
-# Print results
-for field_path, matches in results.items():
-    top_match = matches[0]
-    print(f"\n{field_path}")
-    print(f"  → {top_match.dictionary_entry.business_name}")
-    print(f"  Confidence: {top_match.final_confidence:.0%}")
-    print(f"  Decision: {top_match.decision}")
-```
-
-**Expected Output:**
-```
-Customer.id
-  → Customer Identifier
-  Confidence: 94%
-  Decision: AUTO_APPROVE
-
-Customer.email
-  → Customer Email
-  Confidence: 98%
-  Decision: AUTO_APPROVE
-
-Customer.firstName
-  → First Name
-  Confidence: 92%
-  Decision: AUTO_APPROVE
-
-Customer.lastName
-  → Last Name
-  Confidence: 95%
-  Decision: AUTO_APPROVE
-```
-
-### Step 4: Match with CLI
-
-```bash
-# Table output
-nexus-matcher match schemas/customer.avsc -d data/dictionary.csv
-
-# JSON output
-nexus-matcher match schemas/customer.avsc -d data/dictionary.csv -f json -o results.json
-```
-
-### Step 5: Start API Server
-
-```bash
-# Start server
-nexus-matcher api
-
-# In another terminal, test it:
-curl -X POST http://localhost:8000/match \
-  -H "Content-Type: application/json" \
-  -d '{
-    "schema": {
-      "type": "record",
-      "name": "Customer",
-      "fields": [
-        {"name": "id", "type": "long"},
-        {"name": "email", "type": "string"}
-      ]
-    }
-  }'
-```
-
----
-
-## Common Use Cases
-
-### Batch Processing
-
-```python
-from nexus_matcher.application.use_cases import BatchMatchUseCase
-
-batch = BatchMatchUseCase(matcher, max_workers=4)
-
-results = batch.execute([
-    "schemas/customer.avsc",
-    "schemas/order.avsc",
-    "schemas/product.avsc",
-])
-
-for schema, schema_results in results.items():
-    auto_approved = sum(
-        1 for matches in schema_results.values()
-        if matches[0].decision == "AUTO_APPROVE"
-    )
-    print(f"{schema}: {auto_approved}/{len(schema_results)} auto-approved")
-```
-
-### With Type-Aware Matching
-
-```python
-from nexus_matcher.core.type_projections import (
-    TypeProjectionManager,
-    TrainingDataGenerator,
-)
-
-# Generate and train type projections
-generator = TrainingDataGenerator()
-pairs = generator.generate_pairs(1000, 1000)
-
-type_manager = TypeProjectionManager()
-type_manager.train(pairs, matcher.embedder.encode)
-
-# Use in matching
-matcher.set_type_projection_manager(type_manager)
-results = matcher.match_schema("schemas/customer.avsc")
-```
-
-### Export Results to Excel
-
-```python
-import pandas as pd
-
-# Convert results to DataFrame
-rows = []
+results = matcher.match_schema("customer.avsc")
 for field_path, matches in results.items():
     top = matches[0]
-    rows.append({
-        "Source Field": field_path,
-        "Matched Entry": top.dictionary_entry.business_name,
-        "Technical Name": top.dictionary_entry.technical_name,
-        "Confidence": f"{top.final_confidence:.0%}",
-        "Decision": top.decision,
-    })
-
-df = pd.DataFrame(rows)
-df.to_excel("matching_results.xlsx", index=False)
+    print(f"{field_path:10s} -> {top.dictionary_entry.business_name:22s} "
+          f"{top.final_confidence:.2f}  {top.decision.name}")
 ```
+
+Real output:
+
+```
+cid        -> Customer Identifier      0.78  REVIEW
+full_nm    -> Customer Full Name       0.83  REVIEW
+email      -> Email Address            0.83  REVIEW
+bal        -> Account Balance          0.86  AUTO_APPROVE
+birth_dt   -> Date of Birth            0.76  REVIEW
+```
+
+All five top-1 matches are right; one clears the auto-approve bar. That is the design:
+the default `auto_approve_threshold` of 0.85 is calibrated for ~95% precision on the
+fields it approves, not for coverage. See the calibration table in the
+[README](README.md#decision-policy).
+
+### Two things that are easy to get wrong
+
+**`NexusMatcher()` does not work.** The constructor requires at minimum an
+`embedding_provider` and a `vector_store`. Use `NexusMatcher.from_config()` for the
+wired-up defaults, or pass components explicitly (below).
+
+**`from_config()` ignores its `config_path` argument.** It hardcodes the default
+component set. There is currently no YAML or environment-variable path that changes how
+matching behaves — the `NEXUS_*` settings in
+`nexus_matcher.infrastructure.config.settings` are only consumed by the logging setup.
+To change matching behaviour, construct the matcher yourself and pass a `MatchingConfig`.
 
 ---
 
-## Configuration Options
-
-### Environment Variables
+## 4. Match, from the CLI
 
 ```bash
-# Enable INT8 quantization (1.68x faster)
-export NEXUS_EMBEDDING_USE_INT8=true
-
-# Use in-memory vector store (no Qdrant needed)
-export NEXUS_VECTOR_BACKEND=memory
-
-# Adjust confidence thresholds
-export NEXUS_SCORING_AUTO_APPROVE_THRESHOLD=0.80
-export NEXUS_SCORING_REVIEW_THRESHOLD=0.60
+nexus-matcher match customer.avsc -d dictionary.csv
+nexus-matcher match customer.avsc -d dictionary.csv -f json -o results.json
+nexus-matcher match customer.avsc -d dictionary.csv -k 3 -t 0.5
 ```
 
-### Configuration File
+Available commands: `match`, `sync`, `api`, `info`. Run `nexus-matcher --help`.
 
-```yaml
-# config.yaml
-embedding:
-  model_name: sentence-transformers/all-MiniLM-L6-v2
-  use_int8: true
-
-vector_store:
-  backend: memory  # or qdrant
-
-scoring:
-  thresholds:
-    auto_approve: 0.75
-    review: 0.50
-```
-
-```python
-matcher = NexusMatcher(config_path="config.yaml")
-```
+On Windows, the CLI writes box-drawing characters and a spinner. In a console using the
+legacy code page this raises `'charmap' codec can't encode character`. Set
+`PYTHONIOENCODING=utf-8` (or use Windows Terminal) before running.
 
 ---
 
-## Performance Tips
+## 5. Explicit component wiring
 
-1. **Enable INT8 Quantization** - 1.68x faster embedding generation
-   ```python
-   matcher = NexusMatcher(use_int8=True)
-   ```
+Use this when you want a specific model, extra schema parsers, or non-default thresholds.
 
-2. **Use Caching** - 56.99% hit rate for repeated queries
-   ```python
-   matcher = NexusMatcher(enable_cache=True)
-   ```
+```python
+from nexus_matcher import NexusMatcher
+from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+from nexus_matcher.domain.ports.vector_store import VectorStoreConfig
+from nexus_matcher.infrastructure.adapters.embedding_providers.sentence_transformers import (
+    SentenceTransformersProvider,
+)
+from nexus_matcher.infrastructure.adapters.vector_stores.memory import InMemoryVectorStore
+from nexus_matcher.infrastructure.adapters.sparse_retrievers.bm25 import BM25Retriever
+from nexus_matcher.infrastructure.adapters.schema_parsers.avro import AvroSchemaParser
+from nexus_matcher.infrastructure.adapters.schema_parsers.json_schema import JsonSchemaParser
+from nexus_matcher.infrastructure.adapters.schema_parsers.sql_ddl import SqlDdlParser
+from nexus_matcher.infrastructure.adapters.dictionary_loaders.excel import (
+    CsvDictionaryLoader,
+    ExcelDictionaryLoader,
+)
 
-3. **Pre-compute MaxSim Embeddings** - 93.7x faster reranking
-   ```python
-   matcher.precompute_embeddings()
-   ```
+provider = SentenceTransformersProvider(model_name="BAAI/bge-small-en-v1.5")
 
-4. **Batch Processing** - Process multiple schemas in parallel
-   ```python
-   batch = BatchMatchUseCase(matcher, max_workers=8)
-   ```
+matcher = NexusMatcher(
+    embedding_provider=provider,
+    vector_store=InMemoryVectorStore(
+        VectorStoreConfig(collection_name="dictionary", dimension=provider.dimension)
+    ),
+    sparse_retriever=BM25Retriever(),
+    schema_parser_registry={
+        "avro": AvroSchemaParser(),
+        "json_schema": JsonSchemaParser(),
+        "sql_ddl": SqlDdlParser(),
+    },
+    dictionary_loader_registry={
+        "csv": CsvDictionaryLoader(),
+        "excel": ExcelDictionaryLoader(),
+    },
+    config=MatchingConfig(auto_approve_threshold=0.85, results_per_field=5),
+)
+
+matcher.load_dictionary("dictionary.csv")
+results = matcher.match_schema("customer.schema.json", schema_format="json_schema")
+```
+
+`from_config()` registers the Avro parser only, so registering JSON Schema and SQL DDL
+is the reason to wire things by hand.
+
+Real output of the above against the same dictionary and an equivalent JSON Schema:
+
+```
+cid          -> Customer Full Name     0.74
+full_nm      -> Customer Full Name     0.83
+email        -> Email Address          0.83
+bal          -> Account Balance        0.86
+birth_dt     -> Date of Birth          0.78
+```
+
+Note `cid` is now **wrong** — `bge-small-en-v1.5` (the model used for the published
+benchmark) misses it where the larger default `bge-base-en-v1.5` gets it. Small models
+are cheaper and measurably weaker on short abbreviations. Pick deliberately.
+
+---
+
+## 6. Batch processing
+
+```python
+from nexus_matcher import NexusMatcher
+from nexus_matcher.application.use_cases.batch_match import BatchProcessor, BatchConfig
+
+matcher = NexusMatcher.from_config()
+matcher.load_dictionary("dictionary.csv")
+
+processor = BatchProcessor(matcher, BatchConfig(max_workers=4))
+result = processor.process_schemas(["customer.avsc", "order.avsc"])
+
+print(f"{result.successful}/{result.total_schemas} schemas processed, {result.failed} failed")
+for session in result.sessions:
+    print(" ", session.schema.name, len(session.results), "fields")
+```
+
+Real output:
+
+```
+2/2 schemas processed, 0 failed
+  Customer 5 fields
+  Customer 5 fields
+```
+
+`BatchProcessor` also exposes `process_directory()` and `process_manifest()`.
+
+---
+
+## 7. The API server
+
+```bash
+nexus-matcher api
+```
+
+The server exposes **health and introspection endpoints only**: `/`, `/health`,
+`/health/live`, `/health/ready`, `/health/startup`, plus `/docs`, `/redoc` and
+`/openapi.json`.
+
+**There is no HTTP matching endpoint.** Matching over HTTP is not implemented. Use the
+Python API or the CLI. See [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
 
 ---
 
 ## Troubleshooting
 
-### "No module named 'sentence_transformers'"
+**`No module named 'sentence_transformers'`** — `pip install -e ".[embeddings]"`.
 
-```bash
-pip install sentence-transformers
-# or
-pip install -e ".[embeddings]"
-```
+**`RuntimeError: Dictionary not loaded. Call load_dictionary() first.`** — `match_schema()`
+requires an indexed dictionary; `load_dictionary()` both loads and indexes.
 
-### "Connection refused to Qdrant"
+**`ValueError: No loader found for extension .xyz`** — the loader registry is keyed by
+file extension. `from_config()` registers `.csv`/`.tsv`/`.txt` and Excel formats only.
 
-Use in-memory backend:
-```bash
-export NEXUS_VECTOR_BACKEND=memory
-```
+**`'charmap' codec can't encode character`** on Windows — set `PYTHONIOENCODING=utf-8`.
 
-Or start Qdrant:
-```bash
-docker run -p 6333:6333 qdrant/qdrant
-```
-
-### Low Confidence Scores
-
-1. Check if dictionary has relevant entries
-2. Verify field descriptions are meaningful
-3. Try adding aliases to dictionary entries
-4. Enable type-aware matching
+**Low confidence across the board** — confidence is dominated by the semantic score
+(weight 0.70) plus a domain score (0.15). Dictionary entries with an empty `Definition`
+give the embedding model very little to work with; filling in definitions is the single
+highest-leverage fix. Field names alone score materially worse — see the query
+representation ablation in the [README](README.md#where-the-accuracy-comes-from).
 
 ---
 
-## Next Steps
+## Next
 
-- 📖 [Full README](README.md) - Complete documentation
-- 🏗️ [Architecture Guide](docs/ARCHITECTURE.md) - System design
-- 🚀 [Deployment Guide](docs/DEPLOYMENT.md) - Production deployment
-- 📚 [API Reference](docs/API_REFERENCE.md) - All API endpoints
-- 🔬 [Enhancement Journey](docs/ENHANCEMENT_JOURNEY.md) - How we built it
-
----
-
-## Getting Help
-
-- **Issues**: [GitHub Issues](https://github.com/pierce-lonergan/nexus_matcher/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/pierce-lonergan/nexus_matcher/discussions)
-- **Documentation**: [docs/](docs/)
-
----
-
-*Happy Matching! 🎯*
+- [README.md](README.md) — measured accuracy, limitations, how to reproduce the benchmark
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — the real Python, CLI and REST surface
+- [docs/BENCHMARK_REGISTRY.md](docs/BENCHMARK_REGISTRY.md) — every benchmark run and its artifact

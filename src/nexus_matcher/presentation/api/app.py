@@ -18,31 +18,28 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, AsyncIterator, Callable
+from typing import Any
 
-from fastapi import FastAPI, Request, Response, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from nexus_matcher.shared.exceptions import (
-    NexusMatcherError,
     APIError,
-    AuthenticationError,
-    RateLimitError,
+    NexusMatcherError,
 )
 from nexus_matcher.shared.logging import (
+    add_request_context,
+    clear_request_context,
     configure_logging,
     get_logger,
-    set_correlation_id,
-    clear_request_context,
-    add_request_context,
     log_performance,
-    LogContext,
+    set_correlation_id,
 )
-
 
 # =============================================================================
 # RESPONSE MODELS
@@ -141,17 +138,12 @@ async def request_id_middleware(request: Request, call_next: Callable) -> Respon
 # =============================================================================
 
 
-async def nexus_exception_handler(
-    request: Request, exc: NexusMatcherError
-) -> JSONResponse:
+async def nexus_exception_handler(request: Request, exc: NexusMatcherError) -> JSONResponse:
     """Handle NexusMatcher exceptions."""
     logger = get_logger("api.error")
 
     # Determine status code
-    if isinstance(exc, APIError):
-        status_code = exc.status_code
-    else:
-        status_code = 500
+    status_code = exc.status_code if isinstance(exc, APIError) else 500
 
     logger.error(
         "request_failed",
@@ -166,9 +158,7 @@ async def nexus_exception_handler(
     )
 
 
-async def generic_exception_handler(
-    request: Request, exc: Exception
-) -> JSONResponse:
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handle unexpected exceptions."""
     logger = get_logger("api.error")
 

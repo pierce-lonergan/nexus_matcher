@@ -204,18 +204,20 @@ class TestAbbreviationExpander:
             AbbreviationExpander,
         )
 
-        dictionary = AbbreviationDictionary.from_dict({
-            "acct": "account",
-            "cust": "customer",
-            "bal": "balance",
-            "amt": "amount",
-            "dt": "date",
-            "id": "identifier",
-            "nm": "name",
-            "no": "number",
-            "num": "number",
-            "txn": "transaction",
-        })
+        dictionary = AbbreviationDictionary.from_dict(
+            {
+                "acct": "account",
+                "cust": "customer",
+                "bal": "balance",
+                "amt": "amount",
+                "dt": "date",
+                "id": "identifier",
+                "nm": "name",
+                "no": "number",
+                "num": "number",
+                "txn": "transaction",
+            }
+        )
         return AbbreviationExpander(dictionary)
 
     def test_expand_single_abbreviation(self, expander):
@@ -329,11 +331,13 @@ class TestAbbreviationExpanderEdgeCases:
             AbbreviationExpander,
         )
 
-        dictionary = AbbreviationDictionary.from_dict({
-            "id": "identifier",
-            "no": "number",
-            "dt": "date",
-        })
+        dictionary = AbbreviationDictionary.from_dict(
+            {
+                "id": "identifier",
+                "no": "number",
+                "dt": "date",
+            }
+        )
         return AbbreviationExpander(dictionary)
 
     def test_single_character_abbreviations(self, expander):

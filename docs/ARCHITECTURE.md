@@ -1,9 +1,21 @@
-# NexusMatcher Architecture Deep Dive
+# NexusMatcher Architecture
 
-> Complete Technical Architecture Reference
-> 
-> **Version**: 1.0.0  
-> **Last Updated**: December 2025
+Structural reference for the layering, ports, adapters and wiring.
+
+> **Scope note.** This document describes structure, not measured performance. Latency
+> figures embedded in the diagrams below are illustrative shapes of the pipeline, not
+> results — several of them were carried over from claims that have since been
+> retracted. For numbers, use [BENCHMARK_REGISTRY.md](BENCHMARK_REGISTRY.md); for the
+> interfaces that actually exist, use [API_REFERENCE.md](API_REFERENCE.md).
+>
+> Two specific corrections to keep in mind while reading:
+>
+> - **There is no `POST /match` endpoint.** The REST app serves health and
+>   introspection routes only. The "request flow" in §4.1 describes the in-process
+>   library call path; the client/API columns are aspirational.
+> - **The multi-layer cache is not wired into the matching pipeline.** L1/L2/L3 cache
+>   adapters exist and are unit-tested, but `NexusMatcher` does not consult them. §6.1
+>   is a design sketch.
 
 ---
 
@@ -128,22 +140,34 @@ def create_app() -> FastAPI:
     return app
 ```
 
-**Endpoints**:
+> The factory sketch above is **not** the shipped `create_app()`. The real one registers
+> a health router only, adds request-ID middleware, CORS and exception handlers, and does
+> not use the DI container.
 
-| Endpoint | Method | Handler | Use Case |
-|----------|--------|---------|----------|
-| `/health` | GET | `health_handler` | System health check |
-| `/match` | POST | `match_handler` | Single schema matching |
-| `/batch` | POST | `batch_handler` | Batch schema matching |
-| `/dictionary` | GET | `list_dictionary` | List entries |
-| `/dictionary` | POST | `add_entry` | Add entry |
-| `/dictionary/{id}` | PUT | `update_entry` | Update entry |
-| `/dictionary/{id}` | DELETE | `delete_entry` | Delete entry |
+**Endpoints that exist** (enumerated from a live `create_app()`):
+
+| Endpoint | Method | Purpose |
+|----------|--------|---------|
+| `/` | GET | Service identity |
+| `/health` | GET | Health check |
+| `/health/live` | GET | Kubernetes liveness probe |
+| `/health/ready` | GET | Readiness probe (503 if not ready) |
+| `/health/startup` | GET | Startup probe (503 while starting) |
+| `/docs`, `/redoc`, `/openapi.json` | GET | Generated OpenAPI docs |
+
+**Endpoints that do NOT exist**, despite appearing in earlier revisions of this table:
+`POST /match`, `POST /batch`, and all `/dictionary` CRUD routes. Matching over HTTP is
+not implemented — the planned request flow is kept in §4.1 as a design target.
 
 #### 2.1.2 CLI (`presentation/cli/`)
 
+> The shipped CLI uses **Typer**, not Click, and lives in `presentation/cli/main.py`.
+> Its commands are `match`, `sync`, `api` and `info`. The Click sketch below is
+> illustrative of the shape only; see [API_REFERENCE.md](API_REFERENCE.md#cli) for the
+> real flags.
+
 ```python
-# commands.py - Click command definitions
+# ILLUSTRATIVE ONLY - the real CLI is Typer-based
 import click
 from nexus_matcher.shared.container import Container
 
@@ -607,16 +631,16 @@ class ConfidenceScorer:
 
 Implements ports with concrete external systems.
 
-#### 2.4.1 Embeddings (`infrastructure/adapters/embeddings/`)
+#### 2.4.1 Embeddings (`infrastructure/adapters/embedding_providers/`)
 
 ```python
-# sentence_transformer.py
-class SentenceTransformerEmbeddingProvider(EmbeddingProvider):
+# sentence_transformers.py
+class SentenceTransformersProvider(BaseEmbeddingProvider):
     """Sentence-Transformers embedding provider."""
     
     def __init__(
         self,
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        model_name: str = "BAAI/bge-base-en-v1.5",   # actual shipped default
         device: str = "cpu",
     ):
         self._model = SentenceTransformer(model_name, device=device)
@@ -919,7 +943,7 @@ class ColBERTMaxSimReranker:
 
 ## 4. Data Flow
 
-### 4.1 Match Request Flow
+### 4.1 Match Request Flow (DESIGN TARGET — no HTTP matching endpoint exists today)
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
@@ -1024,7 +1048,7 @@ class Container(containers.DeclarativeContainer):
     
     # Infrastructure - Embeddings
     embedding_provider = providers.Singleton(
-        SentenceTransformerEmbeddingProvider,
+        SentenceTransformersProvider,
         model_name=config.embedding.model_name,
         device=config.embedding.device,
     )
@@ -1107,32 +1131,37 @@ results = use_case.execute("schema.avsc")
 
 ## 6. Performance Architecture
 
-### 6.1 Caching Strategy
+### 6.1 Caching Strategy — DESIGN ONLY, NOT WIRED
+
+The three cache adapters exist and are unit-tested, but `NexusMatcher` never consults
+them: there is no cache lookup anywhere in the matching path, and `PerformanceMetrics.cache_hit`
+is hardcoded to `False`. The tiering below is the intended design, not current behaviour.
+No latency figures are given because none have been measured through this path.
 
 ```
                     Request
                        │
                        ▼
                 ┌─────────────┐
-                │  L1 Cache   │ ◀─── In-memory, 0.0008ms
+                │  L1 Cache   │ ◀─── In-process LRU
                 │   (LRU)     │
                 └──────┬──────┘
                        │ Miss
                        ▼
                 ┌─────────────┐
-                │  L2 Cache   │ ◀─── Redis, ~1ms
+                │  L2 Cache   │ ◀─── Redis, shared across processes
                 │   (Redis)   │
                 └──────┬──────┘
                        │ Miss
                        ▼
                 ┌─────────────┐
-                │  L3 Cache   │ ◀─── Semantic, ~5ms
+                │  L3 Cache   │ ◀─── Content-addressed (semantic)
                 │  (Content)  │
                 └──────┬──────┘
                        │ Miss
                        ▼
                 ┌─────────────┐
-                │   Compute   │ ◀─── Full pipeline, ~25ms
+                │   Compute   │ ◀─── Full pipeline
                 │             │
                 └─────────────┘
 ```
@@ -1171,7 +1200,7 @@ results = use_case.execute("schema.avsc")
                  │     ▼                                            │
                  │   ┌─────────────┐                               │
                  │   │   Embed     │ ◀─── O(1) embedding call      │
-                 │   │   Query     │      (9.85ms with INT8)        │
+                 │   │   Query     │      (batched across fields)   │
                  │   └──────┬──────┘                               │
                  │          │                                       │
                  │          ▼                                       │
@@ -1183,7 +1212,7 @@ results = use_case.execute("schema.avsc")
                  │          ▼                                       │
                  │   ┌─────────────┐                               │
                  │   │   MaxSim    │ ◀─── O(k) lookups             │
-                 │   │   Rerank    │      (3.17ms for 100)          │
+                 │   │   Rerank    │      (optional, off by default)│
                  │   └──────┬──────┘                               │
                  │          │                                       │
                  │          ▼                                       │

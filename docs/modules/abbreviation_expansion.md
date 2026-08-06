@@ -4,6 +4,20 @@
 
 Expand common abbreviations in field names and dictionary entries to improve semantic matching quality. Maps abbreviated tokens like "acct" → "account", "cust" → "customer", enabling better alignment between terse schema field names and verbose business dictionary terms.
 
+> **Measured contribution is small — and this component once did real damage.**
+>
+> On the 793-pair combined benchmark, abbreviation expansion is worth **+0.8 points of
+> P@1** on its own (0.488 → 0.496, `benchmarks/results/exp_query_repr_combined.json`).
+> Parent-path context, by comparison, is worth +20.1 points. Expansion is worth keeping,
+> but it is not where the accuracy comes from.
+>
+> More importantly: this expander runs on the **already-enriched, multi-word** query
+> string, and it used to collapse that whole string into a single camelCase mega-token.
+> While that was true the production pipeline measured **dense P@1 0.309 and BM25 P@1
+> 0.005, with 787 of 793 queries returning zero BM25 hits.** Any change to tokenisation
+> here must be validated against `benchmarks/eval_pipeline.py`, not just unit tests —
+> the entire unit suite passed throughout.
+
 ## Domain Model
 
 ### Entities

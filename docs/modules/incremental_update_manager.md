@@ -2,12 +2,23 @@
 
 > **Layer:** Infrastructure / Adapters
 > **Gap:** GAP-005 (BLAKE3 Incremental Updates)
-> **Status:** VALIDATED ✓
+> **Status:** IMPLEMENTED — throughput measured, "savings" claim withdrawn
 > **Research:** README_RESEARCH_3.md, Lines 33-35
 
 ## Overview
 
-The Incremental Update Manager provides efficient change detection for dictionary entries using BLAKE3 content hashing. Instead of recomputing embeddings for all entries during updates, it identifies only the added, modified, and deleted entries, achieving 90-99% computation savings.
+The Incremental Update Manager provides efficient change detection for dictionary entries using BLAKE3 content hashing. Instead of recomputing embeddings for all entries during updates, it identifies only the
+added, modified, and deleted entries.
+
+> **On the "90-99% computation savings" figure:** it is `100 - change_rate` by
+> construction (99.9% at a 0.1% change rate, 90% at 10%). That is the *definition* of
+> incremental updating restated, not an empirical result. The genuine measurements in
+> `benchmarks/results/suite_005_run_20251209_133428.json` are BLAKE3 hashing throughput
+> (~699K hashes/sec) and change detection throughput (447K-476K entries/sec over 50,000
+> synthetic entries).
+>
+> This manager is also **not invoked by `NexusMatcher`**; `load_dictionary()` performs a
+> full re-index.
 
 ## Research Alignment
 

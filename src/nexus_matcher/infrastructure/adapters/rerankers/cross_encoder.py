@@ -16,15 +16,13 @@ CrossEncoder reranker implementation using sentence-transformers.
 from __future__ import annotations
 
 import logging
-from typing import Any, Sequence
+from collections.abc import Sequence
 
 from nexus_matcher.domain.ports.retrieval import (
     RerankCandidate,
     RerankResult,
-    Reranker,
 )
 from nexus_matcher.shared.types.base import Result, Score
-
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +32,7 @@ def _get_cross_encoder():
     """Get CrossEncoder class with lazy import."""
     try:
         from sentence_transformers import CrossEncoder
+
         return CrossEncoder
     except ImportError as e:
         raise ImportError(
@@ -57,12 +56,12 @@ class CrossEncoderReranker:
 
     Example:
         reranker = CrossEncoderReranker("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        
+
         candidates = [
             RerankCandidate(id="1", text="customer email address"),
             RerankCandidate(id="2", text="account balance"),
         ]
-        
+
         result = reranker.rerank("find email field", candidates)
         for r in result.unwrap():
             print(f"{r.rank}. {r.id}: {r.score}")
@@ -143,7 +142,7 @@ class CrossEncoderReranker:
             # Combine with candidates and track original ranks
             scored = [
                 (c, float(s), idx + 1)  # original_rank is 1-indexed
-                for idx, (c, s) in enumerate(zip(candidates, scores))
+                for idx, (c, s) in enumerate(zip(candidates, scores, strict=False))
             ]
 
             # Sort by score descending
@@ -218,7 +217,7 @@ class CrossEncoderReranker:
             return Result.failure("Number of queries must match number of candidate lists")
 
         results = []
-        for query, candidates in zip(queries, candidates_per_query):
+        for query, candidates in zip(queries, candidates_per_query, strict=False):
             result = self.rerank(query, candidates, top_k)
             if result.is_failure:
                 return Result.failure(result.error)

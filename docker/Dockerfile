@@ -5,7 +5,7 @@
 # =============================================================================
 # BUILD STAGE
 # =============================================================================
-FROM python:3.11-slim as builder
+FROM python:3.11-slim AS builder
 
 WORKDIR /app
 
@@ -15,18 +15,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
-COPY pyproject.toml README.md ./
+# LICENSE is required at BUILD time, not just at runtime: pyproject.toml declares
+# `license = {file = "LICENSE"}`, and hatchling resolves that while generating
+# metadata. Without it `python -m build` dies with
+#   OSError: License file does not exist: LICENSE
+# which is exactly how this image was failing.
+COPY pyproject.toml README.md LICENSE ./
 COPY src/ ./src/
 
 RUN pip install --no-cache-dir build && \
-    python -m build --wheel && \
-    pip wheel --no-cache-dir --wheel-dir=/app/wheels -e ".[full]"
+    python -m build --wheel
 
 # =============================================================================
 # RUNTIME STAGE
 # =============================================================================
-FROM python:3.11-slim as runtime
+FROM python:3.11-slim AS runtime
 
 # Create non-root user
 RUN groupadd --gid 1000 nexus && \
@@ -39,12 +42,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy wheels and install
-COPY --from=builder /app/wheels /wheels
+# Copy the built wheel and install it WITH the extras this image actually runs.
+# The previous version installed the bare wheel, which pulls only the five core
+# dependencies - so `uvicorn` (the CMD below) and the qdrant/redis clients that
+# docker-compose.yml configures were never present and the container could not
+# start. Extras must be requested explicitly; they are not implied by the wheel.
 COPY --from=builder /app/dist /dist
 
-RUN pip install --no-cache-dir /dist/*.whl && \
-    rm -rf /wheels /dist
+RUN WHEEL="$(ls /dist/*.whl)" && \
+    pip install --no-cache-dir "${WHEEL}[full]" && \
+    rm -rf /dist
 
 # Create directories
 RUN mkdir -p /app/data /app/models /app/logs && \

@@ -19,13 +19,11 @@ Port interface for vector storage and similarity search.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass, field
-from typing import Any, Protocol, Sequence, runtime_checkable
-
-import numpy as np
+from typing import Any, Protocol, runtime_checkable
 
 from nexus_matcher.shared.types.base import DocumentId, EmbeddingVector, Result, Score
-
 
 # =============================================================================
 # VECTOR STORE TYPES
@@ -405,6 +403,7 @@ class VectorStoreRegistry:
                     self.register(ep.name, store_class)
                 except Exception as e:
                     import logging
+
                     logging.warning(f"Failed to load vector store {ep.name}: {e}")
         except ImportError:
             pass

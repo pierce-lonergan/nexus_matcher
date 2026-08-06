@@ -1,192 +1,214 @@
 # Changelog
 
-All notable changes to NexusMatcher will be documented in this file.
+All notable changes to NexusMatcher are documented here.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Format based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
+This project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Every performance or accuracy number below names the artifact in `benchmarks/results/`
+that it came from. Numbers without an artifact are not stated.
+
+---
 
 ## [Unreleased]
 
+### Added — measurement
+
+- **A real, labelled benchmark.** `benchmarks/datasets/build_benchmarks.py` builds 793
+  query→entry pairs from BIRD-SQL dev `database_descriptions` (361) and the OHDSI OMOP
+  CDM v5.4 field-level spec (432). Dictionary entries are indexed on **business name and
+  definition only** — the source system's technical column name is deliberately excluded,
+  so nothing can be solved by string identity.
+- **`benchmarks/eval_pipeline.py`** — end-to-end evaluation that drives the real
+  `NexusMatcher` orchestrator, not a hand-rolled cosine loop. Artifact:
+  `eval_pipeline_combined.json`.
+
+  | Metric | combined | bird | omop |
+  |---|---|---|---|
+  | P@1 | 0.700 | 0.490 | 0.819 |
+
+  Also: P@5 0.888, MRR@10 0.781, Recall@10 0.919, 652 fields/sec, 1.76 s index build
+  for 793 entries, on CPU.
+- **Ablation and calibration experiments**, each writing its own artifact:
+  `exp_query_repr.py`, `exp_fusion.py`, `exp_calibration.py`, `exp_rerank.py`.
+- **`tests/unit/test_regression_guards.py`** — tests that fail when accuracy-destroying
+  changes are made, rather than only when APIs break.
+
+### Fixed — accuracy defects found by the new benchmark
+
+- **`AbbreviationExpander` destroyed enriched queries.** It collapsed multi-word
+  natural-language queries into a single camelCase mega-token. The production path was
+  measuring dense P@1 0.309 and BM25 P@1 0.005, with **787 of 793 queries returning zero
+  BM25 hits** — the sparse arm was contributing essentially nothing. After the fix:
+  dense P@1 0.636, BM25 P@1 0.531, zero zero-hit queries.
+- **Missing BGE query-instruction prefix.** BGE retrieval models are trained with an
+  instruction on the query side only. Adding it asymmetrically (queries prefixed,
+  documents not) was worth +5.3 points of P@1.
+- **Loading a second dictionary left the first one's vectors searchable.**
+  `_dictionary_entries` was replaced but the vector store was only ever upserted into,
+  producing silent misses and matches against unresolvable entries. The store is now
+  cleared of previously indexed ids first.
+- **Failed sparse index builds were silent.** `SparseRetriever.index()` returned a
+  `Result` that was discarded, so a failure left the matcher running dense-only with no
+  indication. It now raises.
+- **`match_schema_session()` parsed the source twice**, doubling parse cost and risking
+  a mismatch between the returned schema and the results computed from it.
+
+### Changed — defaults, all measurement-driven
+
+- **Query text now includes the parent path.** `satscores sname` instead of `sname`.
+  Worth **+20.1 points of P@1** (0.491 → 0.691) — the largest single accuracy factor in
+  the pipeline. Artifact: `exp_query_repr_combined.json`.
+- **Scalar type words are no longer appended to queries.** Adding "text field" to the
+  query *cost* 2.1 points of P@1. Now off by default.
+- **Fusion is linear min-max with `fusion_alpha = 0.90`,** not RRF. Measured on the
+  combined benchmark: linear dense=0.9 → 0.7024, dense-only → 0.6910, RRF k=60 → 0.6103.
+  **RRF was the worst method measured and worse than not fusing at all.** Artifact:
+  `exp_fusion_combined.json`.
+- **`auto_approve_threshold` raised from 0.75 to 0.85.** At 0.75 the auto-approved slice
+  was only 86.3% precise. At 0.85 it is 94.7% precise over 42.7% coverage. Auto-approving
+  a wrong mapping costs more than sending a field to review. Artifact:
+  `exp_calibration_combined.json`.
+
+### Changed — performance
+
+- `InMemoryVectorStore` no longer re-normalises the entire corpus matrix on every query
+  (this also removed a large per-query allocation).
+- Edit distance now uses `rapidfuzz` instead of a pure-Python DP loop; results are
+  bit-identical.
+- `_match_fields` embeds all query strings in one batched call rather than one per field.
+
+  These three are micro-benchmarks without committed artifacts — see the "unarchived"
+  section of [docs/BENCHMARK_REGISTRY.md](docs/BENCHMARK_REGISTRY.md).
+
+### Removed
+
+- **The duplicate `nexus_matcher_src/` tree** (127 files). `src/nexus_matcher/` is
+  canonical.
+- **The stray second readme** (`README (1).md`). There is one `README.md`.
+- **Broken plugin entry points.** `pyproject.toml` declared entry points for
+  `csv_headers`, `database`, `faiss` and `openai` modules that do not exist; a broken
+  entry point makes plugin discovery raise at import time for every consumer of the
+  package. Remaining entry points were each verified importable.
+
+### Documentation — retractions
+
+The following claims appeared in the README, this changelog, the package docstring and
+`docs/ENHANCEMENT_JOURNEY.md`. They were false and have been removed.
+
+| Retracted claim | What is actually true |
+|---|---|
+| **"100% Precision@1"** | Came from `benchmarks/suite_008_combined.py`, which **never calls `NexusMatcher`** — it computes raw cosine similarity over 17 hand-written source fields against a 20-entry hand-written target set, and got 17/17. Measured end-to-end P@1 is **0.700**. |
+| **"1.68× INT8 speedup"** | Not in any artifact. `suite_002_real_20251209_162836.json` measures 1.27× at batch 32 (the batch size the claim cited), ranging 1.26×–2.93× across batch sizes, on a machine without VNNI. |
+| **"3.07% accuracy loss" from INT8** | No accuracy figure was ever recorded. The artifact carries `accuracy_pass: false` and `overall_pass: false`. |
+| **"56.99% cache hit rate", "99.3% cost reduction"** cited as VALIDATED | `benchmarks/suite_004_cache_performance.py` and `suite_004b_semantic_cache.py` write **no artifact at all**. One cited run ID, `run_20251209_062xxx`, is a literal placeholder. Also: a cache's hit rate is a property of the workload, which in this case was a synthetic 60%-repetition query pattern. |
+| **"86x faster reranking" / "93.7x"** | The same measurement compared two ways — cold 274.0 ms avg vs warm 2.93 ms avg (93.6×) or vs warm 3.17 ms p95 (86×), at 100 candidates. It is a **latency** result for pre-computing document token embeddings, and the same artifact shows MaxSim did not change the top-5 ranking at all on its sample. It is not evidence of an accuracy gain. |
+| **10 documented REST endpoints** | The FastAPI app implements health and introspection endpoints only. There is no matching endpoint, no dictionary CRUD, no cache endpoints, no `/metrics`, no API-key auth and no rate limiting. See [docs/API_REFERENCE.md](docs/API_REFERENCE.md). |
+| **"Prometheus metrics endpoint"** listed under Added in 2.0.0 | A `PrometheusMetrics` backend class exists; no route exposes it. |
+| **Default model `all-MiniLM-L6-v2`** | The shipped default in `SentenceTransformersProvider` is `BAAI/bge-base-en-v1.5`. The published benchmark uses `BAAI/bge-small-en-v1.5`. |
+| **YAML / environment configuration of matching** | `NexusMatcher.from_config()` ignores its `config_path` argument, and the `NEXUS_*` settings classes are consumed only by the logging setup. Matching behaviour is configured by passing a `MatchingConfig` to the constructor. |
+| **Test count "433 tests"** | Current measured state: 551 passed, 0 failed, 35 skipped (skips are uninstalled optional dependencies). Line coverage 60% against a configured gate of 80%. |
+
 ### Planned
-- GPU support for ModernBERT embeddings
-- Multi-language schema matching
-- Active learning from user feedback
-- Streaming/real-time matching API
+
+- GPU measurement. Every number in this repository is CPU-only, single machine.
+- Accuracy measurement at catalogue scale; the benchmark corpus is ~1,200 entries.
+- Non-English schema matching. All measurement to date is English.
+- An HTTP matching endpoint.
 
 ---
 
 ## [2.0.0] - 2025-12-09
 
-### 🎉 Major Release - Complete Rewrite
+Complete rewrite from a procedural single-file implementation to a hexagonal
+(ports and adapters) architecture.
 
-This release represents a complete architectural redesign achieving **100% Precision@1** 
-with **86x faster reranking** through systematic research-driven enhancements.
+> **The performance table originally published with this release was not valid.** See
+> the retractions above. The entries below have had unsupported numbers removed.
 
 ### Added
 
-#### Core Features
-- **ColBERT MaxSim Reranking** (GAP-001): Token-level late interaction with 93.7x speedup via pre-computed embeddings
-- **INT8 Quantization** (GAP-002): ONNX-based quantization with 1.68x speedup and 75% model size reduction
-- **L1 LRU Cache** (GAP-003): Sub-millisecond embedding cache with 56.99% hit rate
-- **Semantic Content Cache** (GAP-004): BLAKE3-based content-addressed caching with 99.3% cost reduction
-- **Incremental Updates** (GAP-005): Change detection with 99.9% computation savings for small updates
-- **Context Enrichment** (GAP-006): Hierarchical field context injection for improved semantic understanding
-- **Type Projections** (GAP-008): Learned type embeddings via contrastive learning (MRR 0.9706)
-- **Graph Matching** (GAP-009): Structural schema matching for hybrid scoring
-
-#### Architecture
-- Hexagonal (ports & adapters) architecture
-- Dependency injection container
-- Plugin system via entry points
-- Multi-layer caching (L1 → L2 → L3)
-- Three-stage matching pipeline (Retrieval → Reranking → Scoring)
-
-#### API
-- REST API with FastAPI
-- CLI with Typer
-- Python library API
-- Prometheus metrics endpoint
-- Health and readiness probes
-
-#### Parsers
-- Avro schema parser
-- JSON Schema parser  
-- SQL DDL parser
-- CSV header parser
-
-#### Vector Stores
-- Qdrant adapter with HNSW
-- In-memory vector store
-- FAISS adapter (optional)
-
-#### Caching
-- L1 LRU in-memory cache
-- L2 Redis distributed cache
-- L3 Semantic content cache
+- Hexagonal architecture: domain / application / infrastructure / presentation layers,
+  dependency-injection container, plugin system via entry points.
+- Three-stage matching pipeline: retrieval → optional reranking → multi-signal scoring
+  with a decision policy (`AUTO_APPROVE` / `REVIEW` / `REJECT`).
+- Schema parsers: Avro, JSON Schema, SQL DDL.
+- Dictionary loaders: Excel, CSV.
+- Vector stores: in-memory, Qdrant, HNSW.
+- Sparse retrieval: BM25.
+- Rerankers: cross-encoder and ColBERT MaxSim. Both optional, off by default.
+- Caches: L1 LRU in-memory, Redis, content-addressed semantic cache. Implemented and
+  unit-tested; not exercised by the accuracy benchmark.
+- Incremental update manager with BLAKE3 content hashing.
+- Learned type projections and a graph matcher. Experimental.
+- INT8 quantized embedding provider via ONNX Runtime.
+- REST API with health and readiness probes; CLI with Typer; Python library API.
 
 ### Changed
-- Complete rewrite from procedural to hexagonal architecture
-- Embedding model default changed to `all-MiniLM-L6-v2` (from `all-mpnet-base-v2`)
-- Configuration system now uses YAML with environment variable overrides
-- Test suite expanded from ~50 to 433 tests
 
-### Performance Improvements
-| Metric | Before | After | Improvement |
-|--------|--------|-------|-------------|
-| Precision@1 | ~85% | 100% | +15% |
-| MaxSim Latency | 274ms | 3.17ms | **86x faster** |
-| Embedding Latency | 12.5ms | 9.85ms | **1.68x faster** |
-| Model Size | 86.8MB | 22.0MB | **75% smaller** |
-| Cache Hit Rate | 0% | 56.99% | New capability |
-
-### Deprecated
-- Direct `schema_matcher.py` usage (use `NexusMatcher` class instead)
-- Environment-only configuration (use YAML config files)
+- Configuration moved to YAML with environment-variable overrides — **note that this
+  affects logging only; the matching pipeline does not read it.**
+- Test suite expanded substantially.
 
 ### Removed
-- Legacy single-file implementation
-- OpenAI embedding provider (temporarily, will be re-added)
 
-### Fixed
-- Memory leak in long-running embedding sessions
-- Thread safety issues in concurrent matching
-- ONNX API compatibility across versions
+- Legacy single-file implementation.
+- OpenAI embedding provider.
 
 ### Security
-- Input validation on all API endpoints
-- Rate limiting support
-- Non-root Docker container
 
-### Documentation
-- Comprehensive README with architecture diagrams
-- API reference documentation
-- Deployment guide (Docker, Kubernetes, Cloud)
-- Module-level documentation
-- Enhancement journey narrative
+- Non-root Docker container.
+- CORS is currently configured with `allow_origins=["*"]`; narrow it before exposing the
+  service.
 
 ---
 
 ## [1.0.0] - 2025-10-15
 
-### Added
-- Initial release
-- Basic semantic schema matching
-- Excel dictionary loader
-- Avro schema parser
-- Sentence-Transformers embeddings
-- Simple cosine similarity scoring
-
-### Known Issues
-- Single-threaded processing
-- No caching
-- Limited to ~85% accuracy
+- Initial release: basic semantic schema matching, Excel dictionary loader, Avro parser,
+  sentence-transformers embeddings, cosine similarity scoring.
+- Single-threaded, no caching. No labelled benchmark existed at this point, so the
+  accuracy of this release is unknown; earlier claims of "~85%" are unsupported.
 
 ---
 
-## Version History
+## Upgrade guide: 1.x → 2.x
 
-| Version | Date | Highlights |
-|---------|------|------------|
-| 2.0.0 | 2025-12-09 | Complete rewrite, 100% Precision@1, 86x speedup |
-| 1.0.0 | 2025-10-15 | Initial release |
+**Import paths changed.**
 
----
+```python
+# Old
+from schema_matcher import match_schema
 
-## Upgrade Guide
+# New
+from nexus_matcher import NexusMatcher
+matcher = NexusMatcher.from_config()      # NOT NexusMatcher()
+matcher.load_dictionary("dictionary.csv")
+results = matcher.match_schema("schema.avsc")
+```
 
-### From 1.x to 2.x
+`NexusMatcher()` with no arguments raises `TypeError` — `embedding_provider` and
+`vector_store` are required. `from_config()` supplies the defaults.
 
-#### Breaking Changes
+**Result structure changed.**
 
-1. **Import paths changed**:
-   ```python
-   # Old
-   from schema_matcher import match_schema
-   
-   # New
-   from nexus_matcher import NexusMatcher
-   matcher = NexusMatcher()
-   results = matcher.match_schema("schema.avsc")
-   ```
+```python
+# Old
+result = {"field": "matched_entry", "score": 0.95}
 
-2. **Configuration format changed**:
-   ```yaml
-   # Old: Environment variables only
-   SCHEMA_MATCHER_MODEL=all-mpnet-base-v2
-   
-   # New: YAML configuration
-   embedding:
-     model_name: sentence-transformers/all-MiniLM-L6-v2
-     use_int8: true
-   ```
-
-3. **Result structure changed**:
-   ```python
-   # Old
-   result = {"field": "matched_entry", "score": 0.95}
-   
-   # New
-   result.dictionary_entry.business_name
-   result.final_confidence  # 0.95
-   result.decision  # "AUTO_APPROVE"
-   ```
-
-#### Migration Steps
-
-1. Update imports to use `nexus_matcher` package
-2. Convert environment variables to YAML config
-3. Update result handling code
-4. Run tests to verify behavior
+# New
+results: dict[str, tuple[MatchResult, ...]]     # keyed by SchemaField.full_path
+top = results["Customer.email"][0]
+top.dictionary_entry.business_name
+top.final_confidence          # float in [0, 1]
+top.decision                  # MatchDecision enum (str-backed)
+top.score_breakdown           # per-signal components
+```
 
 ---
-
-## Contributors
-
-- Pierce Lonergan - Lead Developer
 
 ## Links
 
-- [GitHub Repository](https://github.com/pierce-lonergan/nexus_matcher)
-- [Documentation](https://nexus-matcher.readthedocs.io)
-- [PyPI Package](https://pypi.org/project/nexus-matcher/)
-- [Issue Tracker](https://github.com/pierce-lonergan/nexus_matcher/issues)
+- [Repository](https://github.com/pierce-lonergan/nexus_matcher)
+- [Issues](https://github.com/pierce-lonergan/nexus_matcher/issues)
+- [Benchmark registry](docs/BENCHMARK_REGISTRY.md)

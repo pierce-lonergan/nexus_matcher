@@ -15,6 +15,7 @@ try:
     from nexus_matcher.infrastructure.adapters.rerankers.cross_encoder import (
         CrossEncoderReranker,
     )
+
     __all__.append("CrossEncoderReranker")
 except ImportError:
     pass  # sentence-transformers not installed
@@ -22,13 +23,16 @@ except ImportError:
 # ColBERT MaxSim support (GAP-001)
 from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
     ColBERTMaxSimReranker,
-    MockColBERTReranker,
-    MaxSimConfig,
     ColBERTStatistics,
+    MaxSimConfig,
+    MockColBERTReranker,
 )
-__all__.extend([
-    "ColBERTMaxSimReranker",
-    "MockColBERTReranker",
-    "MaxSimConfig",
-    "ColBERTStatistics",
-])
+
+__all__.extend(
+    [
+        "ColBERTMaxSimReranker",
+        "ColBERTStatistics",
+        "MaxSimConfig",
+        "MockColBERTReranker",
+    ]
+)

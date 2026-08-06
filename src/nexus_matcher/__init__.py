@@ -72,7 +72,12 @@ Links
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+# This is the single source of truth for the package version:
+# [tool.hatch.version] in pyproject.toml reads it from here. It said 1.0.0 while
+# CHANGELOG's latest release, the built wheel, the API and the log envelope all
+# said 2.0.0, so `python -m build` would have produced a 1.0.0 artifact and the
+# publish workflow would have tried to release it over the existing 2.0.0.
+__version__ = "2.0.0"
 __author__ = "Pierce Lonergan"
 __email__ = "lonerganpierce@gmail.com"
 __license__ = "Apache-2.0"
@@ -91,13 +96,6 @@ __pkg_info__ = {
 # =============================================================================
 
 # Core types (always available)
-from nexus_matcher.shared.types import (
-    DataType,
-    MatchDecision,
-    ProtectionLevel,
-    Score,
-)
-
 # Domain models (always available)
 from nexus_matcher.domain.models import (
     DictionaryEntry,
@@ -112,40 +110,46 @@ from nexus_matcher.shared import (
     ContainerBuilder,
     Lifecycle,
 )
+from nexus_matcher.shared.types import (
+    DataType,
+    MatchDecision,
+    ProtectionLevel,
+    Score,
+)
 
 __all__ = [
-    # Version info
-    "__version__",
-    "__author__",
-    "__email__",
-    "__license__",
-    "__copyright__",
-    "__pkg_info__",
-    # Types
-    "DataType",
-    "MatchDecision",
-    "ProtectionLevel",
-    "Score",
-    # Models
-    "SchemaField",
-    "DictionaryEntry",
-    "MatchResult",
-    "Schema",
+    "Cache",
+    "Config",
     # DI Container
     "Container",
     "ContainerBuilder",
-    "Lifecycle",
-    # Lazy imports (documented for IDE completion)
-    "NexusMatcher",
-    "Config",
-    "create_app",
-    "SchemaParser",
+    # Types
+    "DataType",
+    "DictionaryEntry",
     "DictionaryLoader",
     "EmbeddingProvider",
-    "VectorStore",
-    "SparseRetriever",
+    "Lifecycle",
+    "MatchDecision",
+    "MatchResult",
+    # Lazy imports (documented for IDE completion)
+    "NexusMatcher",
+    "ProtectionLevel",
     "Reranker",
-    "Cache",
+    "Schema",
+    # Models
+    "SchemaField",
+    "SchemaParser",
+    "Score",
+    "SparseRetriever",
+    "VectorStore",
+    "__author__",
+    "__copyright__",
+    "__email__",
+    "__license__",
+    "__pkg_info__",
+    # Version info
+    "__version__",
+    "create_app",
 ]
 
 
@@ -153,28 +157,40 @@ __all__ = [
 # LAZY IMPORTS FOR OPTIONAL FEATURES
 # =============================================================================
 
+
 def __getattr__(name: str):
     """Lazy import for optional components."""
 
     # Config (requires pydantic-settings)
     if name == "Config":
         from nexus_matcher.infrastructure.config.settings import Config
+
         return Config
 
     # Main matcher class (requires full installation)
     if name == "NexusMatcher":
         from nexus_matcher.application.use_cases.match_schema import NexusMatcher
+
         return NexusMatcher
 
     # API app factory (requires fastapi)
     if name == "create_app":
         from nexus_matcher.presentation.api.app import create_app
+
         return create_app
 
     # Port interfaces
-    if name in ("SchemaParser", "DictionaryLoader", "EmbeddingProvider",
-                "VectorStore", "SparseRetriever", "Reranker", "Cache"):
+    if name in (
+        "SchemaParser",
+        "DictionaryLoader",
+        "EmbeddingProvider",
+        "VectorStore",
+        "SparseRetriever",
+        "Reranker",
+        "Cache",
+    ):
         from nexus_matcher.domain import ports
+
         return getattr(ports, name)
 
     raise AttributeError(f"module 'nexus_matcher' has no attribute '{name}'")

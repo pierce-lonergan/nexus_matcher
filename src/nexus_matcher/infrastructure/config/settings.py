@@ -16,7 +16,6 @@ Configuration system with environment profiles and validation.
 
 from __future__ import annotations
 
-import os
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
@@ -24,7 +23,6 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
 
 # =============================================================================
 # ENVIRONMENT ENUM

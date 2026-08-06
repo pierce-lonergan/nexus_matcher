@@ -1,0 +1,30 @@
+{
+  "benchmark": "combined",
+  "model": "BAAI/bge-small-en-v1.5",
+  "runs": [
+    {
+      "n_entries": 100000,
+      "backend": "memory",
+      "p_at_1": 0.5889029003783102,
+      "mrr_at_10": 0.6561780660141315,
+      "recall_at_10": 0.7831021437578815,
+      "encode_seconds": 197.74902079999447,
+      "index_seconds": 0.1625818999891635,
+      "search_seconds": 1.9575404000061098,
+      "queries_per_sec": 405.1001961428356,
+      "ms_per_query": 2.4685250945852584
+    },
+    {
+      "n_entries": 100000,
+      "backend": "hnsw",
+      "p_at_1": 0.5914249684741488,
+      "mrr_at_10": 0.6549170319662122,
+      "recall_at_10": 0.776796973518285,
+      "encode_seconds": 196.62204469999415,
+      "index_seconds": 10.944915000000037,
+      "search_seconds": 1.1844286000123248,
+      "queries_per_sec": 669.5211513735385,
+      "ms_per_query": 1.493604791944924
+    }
+  ]
+}

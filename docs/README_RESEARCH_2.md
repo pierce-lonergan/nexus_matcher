@@ -1,5 +1,14 @@
 # Optimizing semantic schema matching systems: 2024-2025 state-of-the-art techniques
 
+
+> **Third-party literature survey — not a measurement of this system.**
+> Every figure below (INT8 "10x speed", ColBERT "+3-8% precision", "97-99% precision@5"
+> projections, PLAID speedups, and so on) comes from published papers or vendor
+> benchmarks on other corpora. None of it has been reproduced here. Where this repo has
+> measured the same technique, the result was frequently different — for example RRF,
+> widely recommended as a fusion default, measured **worse than not fusing at all** on
+> this corpus. See [BENCHMARK_REGISTRY.md](BENCHMARK_REGISTRY.md).
+
 **Your current baseline can be beaten by 15-40x on speed and improved by 5-15% on accuracy** using 2024-2025 techniques. ModernBERT-base with INT8 quantization delivers 10x faster CPU inference than BGE-base while improving quality. Replacing RRF with learned Convex Combination fusion adds 2-5% precision. Multi-vector ColBERT reranking captures field semantics that single-vector embeddings miss, pushing precision@5 from 92-96% toward 97-99%. Graph neural networks like SiMa run 600x faster than traditional schema matchers while achieving 78-85% F1 scores.
 
 The breakthrough is **combining multiple complementary advances** rather than relying on any single improvement. INT8 quantization gives you speed. Domain-specific fine-tuning with contrastive learning gives you accuracy. Multi-vector representations give you semantic richness. Graph-based approaches give you structural awareness. Production optimizations like semantic caching and dynamic batching reduce operational costs by 50-90%. All techniques are open-source, CPU-deployable, and production-ready with available code.

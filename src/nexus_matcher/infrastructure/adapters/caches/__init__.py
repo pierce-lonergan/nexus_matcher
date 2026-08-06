@@ -10,25 +10,26 @@ Cache implementations.
 # EXPORTS → RedisCache :: Redis L2 cache (optional)
 """
 
-from nexus_matcher.infrastructure.adapters.caches.memory import (
-    L1LRUCache,
-    InMemoryCache,
-)
 from nexus_matcher.infrastructure.adapters.caches.content import (
-    SemanticContentCache,
     ContentHasher,
+    SemanticContentCache,
+)
+from nexus_matcher.infrastructure.adapters.caches.memory import (
+    InMemoryCache,
+    L1LRUCache,
 )
 
 __all__: list[str] = [
-    "L1LRUCache",
-    "InMemoryCache",
-    "SemanticContentCache",
     "ContentHasher",
+    "InMemoryCache",
+    "L1LRUCache",
+    "SemanticContentCache",
 ]
 
 # Optional Redis support
 try:
     from nexus_matcher.infrastructure.adapters.caches.redis import RedisCache
+
     __all__.append("RedisCache")
 except ImportError:
     pass  # redis not installed

@@ -1,9 +1,26 @@
 # NexusMatcher Deployment Guide
 
-> Complete Guide to Production Deployment
-> 
-> **Version**: 1.0.0  
-> **Last Updated**: December 2025
+Docker, Kubernetes and cloud deployment patterns for the service.
+
+> **Read this before following the rest of the guide.** Several things this document
+> assumes are not implemented today:
+>
+> - **The deployed HTTP service does not match schemas.** The FastAPI app serves `/`,
+>   `/health`, `/health/live`, `/health/ready`, `/health/startup`, `/docs`, `/redoc` and
+>   `/openapi.json` — nothing else. Deploying it gives you health probes, not a matching
+>   service. Matching runs in-process via the Python API or the CLI. See
+>   [API_REFERENCE.md](API_REFERENCE.md).
+> - **YAML config files shown below do not configure matching.** `NexusMatcher.from_config()`
+>   ignores its `config_path`, and the `NEXUS_*` settings classes are read only by the
+>   logging setup. Treat the config examples here as a target design.
+> - **`/metrics` is not routed.** A `PrometheusMetrics` backend class exists in
+>   `nexus_matcher.shared.metrics`, but no endpoint exposes it, so the Prometheus scrape
+>   config and Grafana dashboard below have nothing to read yet.
+> - **`/health/ready` does not probe dependencies.** It reports hardcoded `True` for
+>   `vector_store` and `cache`. It tells you the process started, not that Qdrant or
+>   Redis are reachable — do not use it as a dependency gate.
+> - **The multi-layer cache is not consulted by the matching pipeline.** Cache tuning
+>   parameters below have no effect on matching today.
 
 ---
 
@@ -825,7 +842,9 @@ spec:
 # config/performance.yaml
 embedding:
   batch_size: 64          # Larger batches for throughput
-  use_int8: true          # 1.68x speedup
+  use_int8: true          # measured 1.26x-2.93x depending on batch size, on a
+                          # machine without VNNI; 1.27x at batch 32. See
+                          # docs/BENCHMARK_REGISTRY.md#suite-002-real
   max_seq_length: 128     # Shorter for speed
 
 retrieval:
@@ -881,10 +900,15 @@ tcp-backlog 511
 
 ## 8. Monitoring & Observability
 
-### Prometheus Metrics
+### Prometheus Metrics — NOT YET EXPOSED
+
+No route serves `/metrics`. The metric names below are those defined by
+`nexus_matcher.shared.metrics`; wiring an endpoint that exposes them is outstanding
+work. The scrape configuration and dashboard in this section will collect nothing until
+that exists.
 
 ```python
-# Application exposes metrics at /metrics
+# PLANNED: application would expose metrics at /metrics
 # Key metrics:
 # - nexus_requests_total
 # - nexus_request_duration_seconds

@@ -15,9 +15,9 @@ from nexus_matcher.domain.models.entities import (
 )
 
 __all__ = [
-    "SchemaField",
     "DictionaryEntry",
     "MatchResult",
-    "Schema",
     "MatchingSession",
+    "Schema",
+    "SchemaField",
 ]

@@ -13,16 +13,12 @@ Research Context:
 - Impact: +10-20% accuracy improvement
 
 Key Insight:
-"The correct approach uses token-level embeddings where each query and 
-document becomes multiple 128-dimensional vectors, then computes the 
+"The correct approach uses token-level embeddings where each query and
+document becomes multiple 128-dimensional vectors, then computes the
 sum of maximum similarities across query tokens."
 """
 
-import pytest
 import time
-from dataclasses import dataclass
-from typing import Any
-
 
 # =============================================================================
 # BASIC FUNCTIONALITY TESTS
@@ -37,7 +33,7 @@ class TestColBERTMaxSimRerankerBasics:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             ColBERTMaxSimReranker,
         )
-        
+
         assert ColBERTMaxSimReranker is not None
 
     def test_mock_reranker_class_exists(self):
@@ -45,7 +41,7 @@ class TestColBERTMaxSimRerankerBasics:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        
+
         reranker = MockColBERTReranker()
         assert reranker is not None
 
@@ -54,7 +50,7 @@ class TestColBERTMaxSimRerankerBasics:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        
+
         reranker = MockColBERTReranker()
         assert reranker.reranker_type == "colbert_maxsim"
 
@@ -63,7 +59,7 @@ class TestColBERTMaxSimRerankerBasics:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        
+
         reranker = MockColBERTReranker()
         assert "colbert" in reranker.model_name.lower() or "mock" in reranker.model_name.lower()
 
@@ -73,19 +69,19 @@ class TestColBERTReranking:
 
     def test_rerank_returns_result(self):
         """Test rerank returns a Result object."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
         candidates = [
             RerankCandidate(id="1", text="customer email address"),
             RerankCandidate(id="2", text="account balance"),
         ]
-        
+
         result = reranker.rerank("find email field", candidates)
-        
+
         assert result.is_success
         assert isinstance(result.unwrap(), list)
 
@@ -94,93 +90,86 @@ class TestColBERTReranking:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        
+
         reranker = MockColBERTReranker()
         result = reranker.rerank("query", [])
-        
+
         assert result.is_success
         assert result.unwrap() == []
 
     def test_rerank_returns_scores(self):
         """Test rerank returns scored results."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
         candidates = [
             RerankCandidate(id="1", text="customer email address"),
             RerankCandidate(id="2", text="account balance"),
             RerankCandidate(id="3", text="transaction date"),
         ]
-        
+
         result = reranker.rerank("email", candidates)
         results = result.unwrap()
-        
+
         assert len(results) == 3
         for r in results:
-            assert hasattr(r, 'score')
-            assert hasattr(r, 'rank')
-            assert hasattr(r, 'id')
+            assert hasattr(r, "score")
+            assert hasattr(r, "rank")
+            assert hasattr(r, "id")
 
     def test_rerank_orders_by_score(self):
         """Test results are ordered by score descending."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
         candidates = [
             RerankCandidate(id="1", text="some text"),
             RerankCandidate(id="2", text="other text"),
             RerankCandidate(id="3", text="more text"),
         ]
-        
+
         result = reranker.rerank("query", candidates)
         results = result.unwrap()
-        
+
         scores = [r.score for r in results]
         assert scores == sorted(scores, reverse=True)
 
     def test_rerank_top_k(self):
         """Test top_k parameter limits results."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
-        candidates = [
-            RerankCandidate(id=str(i), text=f"text {i}")
-            for i in range(10)
-        ]
-        
+        candidates = [RerankCandidate(id=str(i), text=f"text {i}") for i in range(10)]
+
         result = reranker.rerank("query", candidates, top_k=5)
         results = result.unwrap()
-        
+
         assert len(results) == 5
 
     def test_rerank_preserves_metadata(self):
         """Test rerank preserves candidate metadata."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
         candidates = [
-            RerankCandidate(
-                id="1", 
-                text="test", 
-                metadata={"source": "test_source"}
-            ),
+            RerankCandidate(id="1", text="test", metadata={"source": "test_source"}),
         ]
-        
+
         result = reranker.rerank("query", candidates)
         results = result.unwrap()
-        
+
         assert results[0].metadata.get("source") == "test_source"
 
 
@@ -197,7 +186,7 @@ class TestMaxSimComputation:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MaxSimConfig,
         )
-        
+
         config = MaxSimConfig()
         assert config is not None
 
@@ -206,9 +195,9 @@ class TestMaxSimComputation:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MaxSimConfig,
         )
-        
+
         config = MaxSimConfig()
-        
+
         # 128-dimensional vectors per research
         assert config.embedding_dim == 128
         # CPU optimized
@@ -216,23 +205,20 @@ class TestMaxSimComputation:
 
     def test_maxsim_statistics_tracking(self):
         """Test MaxSim statistics are tracked."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
-        candidates = [
-            RerankCandidate(id=str(i), text=f"text {i}")
-            for i in range(10)
-        ]
-        
+        candidates = [RerankCandidate(id=str(i), text=f"text {i}") for i in range(10)]
+
         # Perform some reranking
         reranker.rerank("query 1", candidates)
         reranker.rerank("query 2", candidates)
-        
+
         stats = reranker.get_statistics()
-        
+
         assert stats.total_reranks >= 2
         assert stats.total_candidates >= 20
 
@@ -241,9 +227,9 @@ class TestMaxSimComputation:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        
+
         reranker = MockColBERTReranker()
-        
+
         # The mock should indicate it's using token-level embeddings
         assert reranker.uses_token_embeddings is True
         # NOT bi-encoder (single pooled vector)
@@ -258,10 +244,10 @@ class TestMaxSimScoring:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        
+
         reranker = MockColBERTReranker()
         result = reranker.score_pair("customer email", "email address field")
-        
+
         assert result.is_success
         score = result.unwrap()
         assert isinstance(score, float)
@@ -272,13 +258,13 @@ class TestMaxSimScoring:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        
+
         reranker = MockColBERTReranker()
-        
+
         # More similar should score higher
         similar_result = reranker.score_pair("customer email", "email address")
         dissimilar_result = reranker.score_pair("customer email", "transaction amount")
-        
+
         # Mock may not perfectly model this, but should at least work
         assert similar_result.is_success
         assert dissimilar_result.is_success
@@ -294,47 +280,46 @@ class TestColBERTPerformance:
 
     def test_rerank_100_candidates_under_target_latency(self):
         """Test reranking 100 candidates meets latency target."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
         candidates = [
             RerankCandidate(id=str(i), text=f"dictionary entry description {i} with some text")
             for i in range(100)
         ]
-        
+
         # Warmup
         reranker.rerank("warmup query", candidates[:10])
-        
+
         # Measure
         start = time.perf_counter()
         result = reranker.rerank("find customer email address", candidates)
         elapsed_ms = (time.perf_counter() - start) * 1000
-        
+
         assert result.is_success
         # Target: 60ms for top-100 (mock should be much faster)
         assert elapsed_ms < 100, f"Reranking took {elapsed_ms:.2f}ms (target: <100ms for mock)"
 
     def test_batch_reranking_efficiency(self):
         """Test batch reranking is more efficient than sequential."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
-        
+
         queries = [f"query {i}" for i in range(5)]
         candidates_per_query = [
-            [RerankCandidate(id=f"{i}_{j}", text=f"text {j}") for j in range(20)]
-            for i in range(5)
+            [RerankCandidate(id=f"{i}_{j}", text=f"text {j}") for j in range(20)] for i in range(5)
         ]
-        
+
         # Batch should work
         result = reranker.rerank_batch(queries, candidates_per_query)
-        
+
         assert result.is_success
         results = result.unwrap()
         assert len(results) == 5
@@ -353,35 +338,34 @@ class TestColBERTIntegration:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import Reranker
-        
+
         reranker = MockColBERTReranker()
-        
+
         # Should have required attributes
-        assert hasattr(reranker, 'reranker_type')
-        assert hasattr(reranker, 'model_name')
-        assert hasattr(reranker, 'rerank')
+        assert hasattr(reranker, "reranker_type")
+        assert hasattr(reranker, "model_name")
+        assert hasattr(reranker, "rerank")
 
     def test_result_has_original_rank(self):
         """Test results track original rank for analysis."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
         candidates = [
             RerankCandidate(id="a", text="first"),
             RerankCandidate(id="b", text="second"),
             RerankCandidate(id="c", text="third"),
         ]
-        
+
         result = reranker.rerank("query", candidates)
         results = result.unwrap()
-        
+
         # All results should have original_rank
         for r in results:
-            assert hasattr(r, 'original_rank')
+            assert hasattr(r, "original_rank")
             assert r.original_rank >= 1
 
 
@@ -398,7 +382,7 @@ class TestColBERTConfiguration:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MaxSimConfig,
         )
-        
+
         config = MaxSimConfig(model_name="custom-colbert-model")
         assert config.model_name == "custom-colbert-model"
 
@@ -407,7 +391,7 @@ class TestColBERTConfiguration:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MaxSimConfig,
         )
-        
+
         config = MaxSimConfig()
         # Should have a reasonable default for top-k reranking
         assert config.default_top_k is None or config.default_top_k >= 10
@@ -426,7 +410,7 @@ class TestColBERTStatistics:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             ColBERTStatistics,
         )
-        
+
         stats = ColBERTStatistics()
         assert stats is not None
 
@@ -435,31 +419,31 @@ class TestColBERTStatistics:
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             ColBERTStatistics,
         )
-        
+
         stats = ColBERTStatistics(
             total_reranks=10,
             total_candidates=1000,
             avg_latency_ms=15.5,
         )
-        
+
         assert stats.avg_latency_ms == 15.5
 
     def test_statistics_reset(self):
         """Test statistics can be reset."""
+        from nexus_matcher.domain.ports.retrieval import RerankCandidate
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             MockColBERTReranker,
         )
-        from nexus_matcher.domain.ports.retrieval import RerankCandidate
-        
+
         reranker = MockColBERTReranker()
         candidates = [RerankCandidate(id="1", text="test")]
-        
+
         reranker.rerank("query", candidates)
-        stats_before = reranker.get_statistics()
-        
+        reranker.get_statistics()
+
         reranker.reset_statistics()
         stats_after = reranker.get_statistics()
-        
+
         assert stats_after.total_reranks == 0
 
 
@@ -475,11 +459,11 @@ class TestColBERTExports:
         """Test classes are exported from colbert module."""
         from nexus_matcher.infrastructure.adapters.rerankers.colbert import (
             ColBERTMaxSimReranker,
-            MockColBERTReranker,
-            MaxSimConfig,
             ColBERTStatistics,
+            MaxSimConfig,
+            MockColBERTReranker,
         )
-        
+
         assert ColBERTMaxSimReranker is not None
         assert MockColBERTReranker is not None
         assert MaxSimConfig is not None
@@ -491,6 +475,6 @@ class TestColBERTExports:
             ColBERTMaxSimReranker,
             MockColBERTReranker,
         )
-        
+
         assert ColBERTMaxSimReranker is not None
         assert MockColBERTReranker is not None

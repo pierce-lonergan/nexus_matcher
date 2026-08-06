@@ -6,7 +6,6 @@ Unit tests for CLI commands.
 # TESTS → presentation/cli/main :: CLI commands
 """
 
-import pytest
 from typer.testing import CliRunner
 
 from nexus_matcher.presentation.cli.main import app
@@ -55,10 +54,15 @@ class TestMatchCommand:
 
     def test_match_nonexistent_schema(self):
         """Test match with nonexistent schema."""
-        result = runner.invoke(app, [
-            "match", "nonexistent.avsc",
-            "-d", "dictionary.xlsx",
-        ])
+        result = runner.invoke(
+            app,
+            [
+                "match",
+                "nonexistent.avsc",
+                "-d",
+                "dictionary.xlsx",
+            ],
+        )
         assert result.exit_code != 0
 
 

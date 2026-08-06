@@ -131,7 +131,10 @@ class TestPluginRegistry:
 
     def test_register_hook(self, registry):
         """Test hook registration."""
-        handler = lambda ctx: HookResult.passthrough()
+
+        def handler(ctx):
+            return HookResult.passthrough()
+
         registry.register_hook(
             HookPoint.SCHEMA_PARSED,
             handler,
@@ -189,7 +192,10 @@ class TestPluginRegistry:
 
     def test_unregister_hook(self, registry):
         """Test hook unregistration."""
-        handler = lambda ctx: HookResult.passthrough()
+
+        def handler(ctx):
+            return HookResult.passthrough()
+
         registry.register_hook(HookPoint.SCHEMA_PARSED, handler)
 
         assert registry.has_hooks(HookPoint.SCHEMA_PARSED)

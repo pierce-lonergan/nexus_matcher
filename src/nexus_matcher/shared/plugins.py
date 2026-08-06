@@ -20,14 +20,14 @@ import importlib
 import importlib.metadata
 import logging
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, TypeVar
 
 from nexus_matcher.domain.models.entities import (
-    DictionaryEntry,
-    MatchResult,
     MatchingSession,
+    MatchResult,
     Schema,
     SchemaField,
 )
@@ -234,9 +234,7 @@ class PluginRegistry:
 
     def __init__(self) -> None:
         self._plugins: dict[str, Plugin] = {}
-        self._hooks: dict[HookPoint, list[RegisteredHook]] = {
-            hp: [] for hp in HookPoint
-        }
+        self._hooks: dict[HookPoint, list[RegisteredHook]] = {hp: [] for hp in HookPoint}
         self._adapters: dict[str, dict[str, Any]] = {
             "schema_parsers": {},
             "dictionary_loaders": {},
@@ -289,10 +287,7 @@ class PluginRegistry:
 
     def list_plugins(self) -> list[tuple[str, str, str]]:
         """List all registered plugins (name, version, description)."""
-        return [
-            (p.name, p.version, p.description)
-            for p in self._plugins.values()
-        ]
+        return [(p.name, p.version, p.description) for p in self._plugins.values()]
 
     def discover_plugins(self, entry_point: str = "nexus_matcher.plugins") -> int:
         """
@@ -353,10 +348,7 @@ class PluginRegistry:
         # Sort by priority
         self._hooks[hook_point].sort(key=lambda h: h.priority)
 
-        logger.debug(
-            f"Registered hook: {plugin_name} -> {hook_point.name} "
-            f"(priority={priority})"
-        )
+        logger.debug(f"Registered hook: {plugin_name} -> {hook_point.name} (priority={priority})")
 
     def unregister_hook(
         self,
@@ -394,9 +386,7 @@ class PluginRegistry:
                 result = registered.handler(context)
 
                 if result.error:
-                    logger.warning(
-                        f"Hook error ({registered.plugin_name}): {result.error}"
-                    )
+                    logger.warning(f"Hook error ({registered.plugin_name}): {result.error}")
                     continue
 
                 if result.modified_data:
@@ -407,8 +397,7 @@ class PluginRegistry:
 
             except Exception as e:
                 logger.error(
-                    f"Hook exception ({registered.plugin_name} -> "
-                    f"{context.hook_point.name}): {e}"
+                    f"Hook exception ({registered.plugin_name} -> {context.hook_point.name}): {e}"
                 )
 
         return context

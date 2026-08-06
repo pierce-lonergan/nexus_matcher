@@ -29,18 +29,18 @@ from nexus_matcher.domain.ports import (
 )
 
 __all__ = [
-    # Models
-    "SchemaField",
+    "Cache",
     "DictionaryEntry",
-    "MatchResult",
-    "Schema",
-    "MatchingSession",
-    # Ports
-    "SchemaParser",
     "DictionaryLoader",
     "EmbeddingProvider",
-    "VectorStore",
-    "SparseRetriever",
+    "MatchResult",
+    "MatchingSession",
     "Reranker",
-    "Cache",
+    "Schema",
+    # Models
+    "SchemaField",
+    # Ports
+    "SchemaParser",
+    "SparseRetriever",
+    "VectorStore",
 ]

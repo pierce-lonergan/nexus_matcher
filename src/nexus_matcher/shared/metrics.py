@@ -17,13 +17,12 @@ Metrics and observability infrastructure for monitoring NexusMatcher.
 from __future__ import annotations
 
 import time
-from abc import ABC, abstractmethod
 from collections import defaultdict
+from collections.abc import Callable, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Callable, Generator, Protocol, runtime_checkable
-
+from typing import Any, Protocol, runtime_checkable
 
 # =============================================================================
 # METRIC TYPES
@@ -33,10 +32,10 @@ from typing import Any, Callable, Generator, Protocol, runtime_checkable
 class MetricType(Enum):
     """Types of metrics."""
 
-    COUNTER = auto()      # Monotonically increasing value
-    GAUGE = auto()        # Value that can go up or down
-    HISTOGRAM = auto()    # Distribution of values
-    SUMMARY = auto()      # Similar to histogram with quantiles
+    COUNTER = auto()  # Monotonically increasing value
+    GAUGE = auto()  # Value that can go up or down
+    HISTOGRAM = auto()  # Distribution of values
+    SUMMARY = auto()  # Similar to histogram with quantiles
 
 
 @dataclass
@@ -176,7 +175,7 @@ class InMemoryMetrics:
 
         # Trim if too many values
         if len(values) > self._max_history:
-            self._histograms[name][key] = values[-self._max_history:]
+            self._histograms[name][key] = values[-self._max_history :]
 
     def flush(self) -> None:
         """No-op for in-memory backend."""
@@ -246,21 +245,25 @@ class InMemoryMetrics:
 
         for name, label_values in self._counters.items():
             for key, value in label_values.items():
-                result.append(MetricValue(
-                    name=name,
-                    value=value,
-                    labels=self._key_to_labels(key),
-                    metric_type=MetricType.COUNTER,
-                ))
+                result.append(
+                    MetricValue(
+                        name=name,
+                        value=value,
+                        labels=self._key_to_labels(key),
+                        metric_type=MetricType.COUNTER,
+                    )
+                )
 
         for name, label_values in self._gauges.items():
             for key, value in label_values.items():
-                result.append(MetricValue(
-                    name=name,
-                    value=value,
-                    labels=self._key_to_labels(key),
-                    metric_type=MetricType.GAUGE,
-                ))
+                result.append(
+                    MetricValue(
+                        name=name,
+                        value=value,
+                        labels=self._key_to_labels(key),
+                        metric_type=MetricType.GAUGE,
+                    )
+                )
 
         return result
 
@@ -300,9 +303,8 @@ class PrometheusMetrics:
             from prometheus_client import Counter, Gauge, Histogram
         except ImportError:
             raise ImportError(
-                "prometheus-client is required. "
-                "Install with: pip install prometheus-client"
-            )
+                "prometheus-client is required. Install with: pip install prometheus-client"
+            ) from None
 
         self._prefix = prefix
         self._counters: dict[str, Any] = {}
@@ -311,7 +313,19 @@ class PrometheusMetrics:
 
         # Default buckets for latency histograms
         self._default_buckets = (
-            0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 10.0
+            0.005,
+            0.01,
+            0.025,
+            0.05,
+            0.075,
+            0.1,
+            0.25,
+            0.5,
+            0.75,
+            1.0,
+            2.5,
+            5.0,
+            10.0,
         )
 
     def counter(
@@ -553,11 +567,14 @@ class MetricsCollector:
             def match_field(field):
                 ...
         """
+
         def decorator(func: Callable) -> Callable:
             def wrapper(*args: Any, **kwargs: Any) -> Any:
                 with self.time_operation(operation):
                     return func(*args, **kwargs)
+
             return wrapper
+
         return decorator
 
 
@@ -618,7 +635,7 @@ def create_opentelemetry_backend(
         raise ImportError(
             "OpenTelemetry is required. Install with: "
             "pip install opentelemetry-api opentelemetry-sdk"
-        )
+        ) from None
 
     # This is a simplified implementation
     # Full implementation would include OTLP exporter configuration

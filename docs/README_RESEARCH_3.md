@@ -1,5 +1,12 @@
 # Production Schema Matching System: State-of-the-Art Optimizations for CPU-Only Kubernetes Infrastructure
 
+
+> **Third-party literature survey — not a measurement of this system.**
+> Figures below are from published research and vendor documentation, not from
+> NexusMatcher. This document also describes infrastructure (microservices, MLflow
+> registry, canary deploys, Prometheus dashboards) that this project does not have. See
+> [PROJECT_STATE.md](PROJECT_STATE.md) for what actually exists.
+
 Your schema matching system can achieve **120-180ms end-to-end latency** (well within your 100-230ms target) while reaching **97-99% precision@5** through five critical fixes: correcting the ColBERT bi-encoder mistake (+10-20% accuracy), implementing learned type projections (+12-30% accuracy), applying INT8 quantization (2-4× speedup), deploying hierarchical semantic caching (60-75% latency reduction), and establishing proper error handling with automated testing. This research covers production-ready solutions proven at enterprise scale in 2024-2025.
 
 ## The immediate impact: Fix ColBERT and achieve 10-20% accuracy gains with 60ms reranking latency

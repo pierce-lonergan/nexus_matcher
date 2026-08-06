@@ -6,8 +6,6 @@ Unit tests for batch processing use case.
 # TESTS → application/use_cases/batch_match :: BatchProcessor, BatchConfig
 """
 
-import pytest
-
 from nexus_matcher.application.use_cases.batch_match import (
     BatchConfig,
     BatchProgress,
@@ -32,7 +30,9 @@ class TestBatchConfig:
 
     def test_custom_values(self):
         """Test custom configuration."""
-        callback = lambda p: None
+
+        def callback(p):
+            return None
 
         config = BatchConfig(
             max_workers=8,

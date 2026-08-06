@@ -179,3 +179,20 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+# LibreOffice/OpenOffice lock files (seen stray in src/ during development)
+.~lock.*#
+
+# ---------------------------------------------------------------------------
+# Benchmark corpora — third-party, large, and reproducible from source.
+# data/raw/ holds ~1.7 GB of downloaded BIRD-SQL and OMOP CDM data; data/benchmarks/
+# holds what build_benchmarks.py derives from it. Neither is vendored: see the
+# "Reproducing the benchmark" section of README.md for how to fetch and rebuild.
+# ---------------------------------------------------------------------------
+data/
+
+# Session scratch from analysis tooling
+.cadence/
+
+# Build/scratch cruft that is not part of the package
+nexus_matcher.zip
+*.docx

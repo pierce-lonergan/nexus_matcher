@@ -20,13 +20,13 @@ Port interface for embedding generation providers.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
 from nexus_matcher.shared.types.base import EmbeddingVector, Result
-
 
 # =============================================================================
 # EMBEDDING CONFIG
@@ -320,6 +320,7 @@ class EmbeddingProviderRegistry:
                     self.register(ep.name, provider_class)
                 except Exception as e:
                     import logging
+
                     logging.warning(f"Failed to load embedding provider {ep.name}: {e}")
         except ImportError:
             pass

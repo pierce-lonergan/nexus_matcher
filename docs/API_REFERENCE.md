@@ -1,950 +1,280 @@
 # NexusMatcher API Reference
 
-> Complete API Documentation for REST, Python, and CLI Interfaces
-> 
-> **Version**: 1.0.0  
-> **Base URL**: `http://localhost:8000` (default)
-
----
-
-## Table of Contents
-
-1. [REST API](#rest-api)
-2. [Python API](#python-api)
-3. [CLI Reference](#cli-reference)
-4. [Error Handling](#error-handling)
-5. [Rate Limiting](#rate-limiting)
-
----
-
-## REST API
-
-### Authentication
-
-Authentication is optional by default. Enable via configuration:
-
-```yaml
-# config.yaml
-api:
-  auth:
-    enabled: true
-    type: api_key  # or jwt
-```
-
-When enabled, include header:
-```
-Authorization: Bearer <api-key>
-```
-
----
-
-### Health Endpoints
-
-#### GET /health
-
-Check system health status.
-
-**Response**
-```json
-{
-  "status": "healthy",
-  "version": "1.0.0",
-  "components": {
-    "vector_store": "healthy",
-    "cache_l1": "healthy",
-    "cache_l2": "healthy",
-    "embedding_model": "healthy"
-  },
-  "uptime_seconds": 3600
-}
-```
-
-**Status Codes**
-| Code | Description |
-|------|-------------|
-| 200 | All systems healthy |
-| 503 | One or more components unhealthy |
-
----
-
-#### GET /ready
-
-Kubernetes readiness probe.
-
-**Response**
-```json
-{
-  "ready": true
-}
-```
-
----
-
-### Matching Endpoints
-
-#### POST /match
-
-Match a single schema to dictionary entries.
-
-**Request Body**
-```json
-{
-  "schema": {
-    "type": "record",
-    "name": "Customer",
-    "namespace": "com.example",
-    "fields": [
-      {
-        "name": "id",
-        "type": "long",
-        "doc": "Customer identifier"
-      },
-      {
-        "name": "email",
-        "type": "string",
-        "doc": "Customer email address"
-      },
-      {
-        "name": "addresses",
-        "type": {
-          "type": "array",
-          "items": {
-            "type": "record",
-            "name": "Address",
-            "fields": [
-              {"name": "city", "type": "string"},
-              {"name": "zip", "type": "string"}
-            ]
-          }
-        }
-      }
-    ]
-  },
-  "options": {
-    "format": "avro",
-    "top_k": 5,
-    "min_confidence": 0.5,
-    "include_scores": true,
-    "include_alternatives": true
-  }
-}
-```
-
-**Request Parameters**
-
-| Parameter | Type | Required | Default | Description |
-|-----------|------|----------|---------|-------------|
-| schema | object | Yes | - | Schema to match (Avro, JSON Schema, etc.) |
-| options.format | string | No | auto | Schema format: avro, json_schema, sql_ddl |
-| options.top_k | integer | No | 5 | Max matches per field (1-100) |
-| options.min_confidence | float | No | 0.0 | Minimum confidence threshold (0.0-1.0) |
-| options.include_scores | boolean | No | false | Include component scores |
-| options.include_alternatives | boolean | No | false | Include alternative matches |
-
-**Response**
-```json
-{
-  "matches": {
-    "Customer.id": [
-      {
-        "dictionary_entry": {
-          "id": "DE001",
-          "business_name": "Customer Identifier",
-          "technical_name": "cust_id",
-          "data_type": "bigint",
-          "description": "Unique customer identifier",
-          "domain": "customer",
-          "sensitivity": "internal"
-        },
-        "confidence": 0.94,
-        "decision": "AUTO_APPROVE",
-        "rank": 1,
-        "scores": {
-          "semantic": 0.96,
-          "lexical": 0.88,
-          "type": 1.0,
-          "pattern": 0.85
-        }
-      },
-      {
-        "dictionary_entry": {
-          "id": "DE015",
-          "business_name": "Customer Key",
-          "technical_name": "customer_key",
-          "data_type": "integer",
-          "description": "Alternative customer reference"
-        },
-        "confidence": 0.72,
-        "decision": "REVIEW",
-        "rank": 2
-      }
-    ],
-    "Customer.email": [
-      {
-        "dictionary_entry": {
-          "id": "DE002",
-          "business_name": "Customer Email",
-          "technical_name": "cust_email",
-          "data_type": "varchar",
-          "description": "Primary email address"
-        },
-        "confidence": 0.98,
-        "decision": "AUTO_APPROVE",
-        "rank": 1
-      }
-    ],
-    "Customer.addresses.city": [
-      {
-        "dictionary_entry": {
-          "id": "DE050",
-          "business_name": "City Name",
-          "technical_name": "city",
-          "data_type": "varchar",
-          "description": "City or municipality name"
-        },
-        "confidence": 0.89,
-        "decision": "AUTO_APPROVE",
-        "rank": 1
-      }
-    ]
-  },
-  "metadata": {
-    "schema_name": "Customer",
-    "fields_total": 4,
-    "fields_matched": 4,
-    "auto_approved": 3,
-    "needs_review": 1,
-    "rejected": 0,
-    "processing_time_ms": 45,
-    "cache_hits": 1,
-    "model_version": "1.0.0"
-  }
-}
-```
-
-**Decision Values**
-
-| Decision | Confidence Range | Description |
-|----------|------------------|-------------|
-| AUTO_APPROVE | ≥0.75 | High confidence, no review needed |
-| REVIEW | 0.50-0.74 | Medium confidence, human review suggested |
-| REJECT | <0.50 | Low confidence, likely no good match |
-
-**Status Codes**
-| Code | Description |
-|------|-------------|
-| 200 | Success |
-| 400 | Invalid schema format |
-| 422 | Validation error |
-| 500 | Internal server error |
-
----
-
-#### POST /batch
-
-Match multiple schemas in parallel.
-
-**Request Body**
-```json
-{
-  "schemas": [
-    {
-      "name": "customer",
-      "schema": {...},
-      "format": "avro"
-    },
-    {
-      "name": "order",
-      "schema": {...},
-      "format": "json_schema"
-    }
-  ],
-  "options": {
-    "top_k": 3,
-    "min_confidence": 0.5,
-    "max_parallel": 4
-  }
-}
-```
-
-**Response**
-```json
-{
-  "results": {
-    "customer": {
-      "matches": {...},
-      "metadata": {...}
-    },
-    "order": {
-      "matches": {...},
-      "metadata": {...}
-    }
-  },
-  "summary": {
-    "schemas_processed": 2,
-    "total_fields": 25,
-    "auto_approved": 20,
-    "needs_review": 4,
-    "rejected": 1,
-    "total_processing_time_ms": 120
-  }
-}
-```
-
----
-
-### Dictionary Endpoints
-
-#### GET /dictionary
-
-List dictionary entries with pagination and filtering.
-
-**Query Parameters**
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| page | integer | 1 | Page number |
-| per_page | integer | 50 | Items per page (max 100) |
-| search | string | - | Search in name/description |
-| domain | string | - | Filter by domain |
-| data_type | string | - | Filter by data type |
-
-**Request**
-```
-GET /dictionary?page=1&per_page=20&domain=customer
-```
-
-**Response**
-```json
-{
-  "entries": [
-    {
-      "id": "DE001",
-      "business_name": "Customer Identifier",
-      "technical_name": "cust_id",
-      "data_type": "bigint",
-      "description": "Unique customer identifier",
-      "domain": "customer",
-      "owner": "data-team",
-      "sensitivity": "internal",
-      "created_at": "2025-01-01T00:00:00Z",
-      "updated_at": "2025-12-01T00:00:00Z"
-    }
-  ],
-  "pagination": {
-    "page": 1,
-    "per_page": 20,
-    "total_items": 150,
-    "total_pages": 8
-  }
-}
-```
-
----
-
-#### GET /dictionary/{id}
-
-Get a single dictionary entry.
-
-**Response**
-```json
-{
-  "id": "DE001",
-  "business_name": "Customer Identifier",
-  "technical_name": "cust_id",
-  "data_type": "bigint",
-  "description": "Unique customer identifier",
-  "domain": "customer",
-  "owner": "data-team",
-  "sensitivity": "internal",
-  "aliases": ["customer_id", "cust_identifier"],
-  "metadata": {
-    "source_system": "CRM",
-    "data_quality": "high"
-  },
-  "created_at": "2025-01-01T00:00:00Z",
-  "updated_at": "2025-12-01T00:00:00Z"
-}
-```
-
----
-
-#### POST /dictionary
-
-Add a new dictionary entry.
-
-**Request Body**
-```json
-{
-  "business_name": "Customer Identifier",
-  "technical_name": "cust_id",
-  "data_type": "bigint",
-  "description": "Unique customer identifier",
-  "domain": "customer",
-  "owner": "data-team",
-  "sensitivity": "internal",
-  "aliases": ["customer_id"]
-}
-```
-
-**Response**
-```json
-{
-  "id": "DE001",
-  "business_name": "Customer Identifier",
-  "status": "created",
-  "indexed": true
-}
-```
-
----
-
-#### PUT /dictionary/{id}
-
-Update an existing dictionary entry.
-
-**Request Body**
-```json
-{
-  "description": "Updated description",
-  "aliases": ["customer_id", "cust_identifier"]
-}
-```
-
-**Response**
-```json
-{
-  "id": "DE001",
-  "status": "updated",
-  "reindexed": true
-}
-```
-
----
-
-#### DELETE /dictionary/{id}
-
-Delete a dictionary entry.
-
-**Response**
-```json
-{
-  "id": "DE001",
-  "status": "deleted"
-}
-```
-
----
-
-### Cache Endpoints
-
-#### POST /cache/clear
-
-Clear all caches.
-
-**Request Body**
-```json
-{
-  "layers": ["l1", "l2", "l3"],  // Optional, defaults to all
-  "pattern": "customer.*"         // Optional key pattern
-}
-```
-
-**Response**
-```json
-{
-  "cleared": {
-    "l1": 1500,
-    "l2": 3000,
-    "l3": 500
-  }
-}
-```
-
----
-
-#### GET /cache/stats
-
-Get cache statistics.
-
-**Response**
-```json
-{
-  "l1": {
-    "size": 4500,
-    "max_size": 5000,
-    "hit_rate": 0.5699,
-    "hits": 15000,
-    "misses": 11305,
-    "evictions": 2500
-  },
-  "l2": {
-    "size": 12000,
-    "hit_rate": 0.42,
-    "memory_mb": 256
-  },
-  "l3": {
-    "size": 8000,
-    "max_size": 10000,
-    "cost_reduction": 0.993
-  }
-}
-```
-
----
-
-### Metrics Endpoint
-
-#### GET /metrics
-
-Prometheus-compatible metrics.
-
-**Response** (text/plain)
-```
-# HELP nexus_requests_total Total HTTP requests
-# TYPE nexus_requests_total counter
-nexus_requests_total{method="POST",endpoint="/match",status="200"} 15234
-
-# HELP nexus_request_duration_seconds Request latency
-# TYPE nexus_request_duration_seconds histogram
-nexus_request_duration_seconds_bucket{le="0.01"} 5000
-nexus_request_duration_seconds_bucket{le="0.05"} 12000
-nexus_request_duration_seconds_bucket{le="0.1"} 14500
-nexus_request_duration_seconds_bucket{le="0.5"} 15200
-nexus_request_duration_seconds_bucket{le="+Inf"} 15234
-
-# HELP nexus_cache_hit_rate Cache hit rate
-# TYPE nexus_cache_hit_rate gauge
-nexus_cache_hit_rate{layer="l1"} 0.5699
-nexus_cache_hit_rate{layer="l2"} 0.42
-
-# HELP nexus_embedding_latency_seconds Embedding generation latency
-# TYPE nexus_embedding_latency_seconds histogram
-nexus_embedding_latency_seconds_bucket{le="0.005"} 8000
-nexus_embedding_latency_seconds_bucket{le="0.01"} 14000
-nexus_embedding_latency_seconds_bucket{le="0.02"} 15000
-```
+This document describes the interfaces that **exist in the code**. Every endpoint,
+method and CLI flag below was verified against `src/nexus_matcher/` by enumerating the
+live FastAPI route table and the Typer command table.
+
+Contents:
+
+1. [Python API](#python-api) — the primary and only benchmarked interface
+2. [CLI](#cli)
+3. [REST API](#rest-api) — health and introspection only
+4. [Domain types](#domain-types)
+5. [Not implemented](#not-implemented)
 
 ---
 
 ## Python API
 
-### NexusMatcher Class
+### `NexusMatcher`
 
-Main entry point for schema matching.
+`nexus_matcher.application.use_cases.match_schema.NexusMatcher`, re-exported lazily as
+`nexus_matcher.NexusMatcher`.
+
+#### Construction
 
 ```python
-from nexus_matcher import NexusMatcher
-
-# Initialize with defaults
-matcher = NexusMatcher()
-
-# Initialize with config file
-matcher = NexusMatcher(config_path="config.yaml")
-
-# Initialize with explicit configuration
-matcher = NexusMatcher(
-    embedding_model="sentence-transformers/all-MiniLM-L6-v2",
-    vector_backend="qdrant",
-    qdrant_host="localhost",
-    qdrant_port=6333,
-    use_int8=True,
-    enable_cache=True,
+NexusMatcher(
+    embedding_provider,                    # required
+    vector_store,                          # required
+    sparse_retriever=None,
+    reranker=None,
+    schema_parser_registry=None,           # dict[str, SchemaParser]
+    dictionary_loader_registry=None,       # dict[str, DictionaryLoader]
+    abbreviation_expander=None,
+    context_enricher=None,
+    domain_matcher=None,
+    config=None,                           # MatchingConfig
 )
 ```
+
+`embedding_provider` and `vector_store` are positional-or-keyword and **required**.
+`NexusMatcher()` with no arguments raises `TypeError`.
+
+```python
+NexusMatcher.from_config(config_path=None) -> NexusMatcher
+```
+
+Returns a matcher wired with `SentenceTransformersProvider()`, `InMemoryVectorStore`,
+`BM25Retriever`, the Avro parser, and the Excel + CSV dictionary loaders.
+
+> **`config_path` is currently ignored.** The method body constructs the default
+> components unconditionally and never reads the path. There is no file-based or
+> environment-variable configuration of the matching pipeline; the `NEXUS_*` settings
+> classes in `nexus_matcher.infrastructure.config.settings` are consumed only by
+> `nexus_matcher.shared.logging`. To change matching behaviour, construct
+> `NexusMatcher` directly and pass a `MatchingConfig`.
 
 #### Methods
 
-##### load_dictionary(path)
+| Method | Returns | Notes |
+|---|---|---|
+| `load_dictionary(source, column_mapping=None, source_type=None)` | `LoadStatistics` | Loads **and indexes**. Loader auto-detected from the file extension against the registry. Raises `ValueError` if no loader matches. Re-loading replaces the previous index. |
+| `match_schema(schema_source, schema_format=None)` | `dict[str, tuple[MatchResult, ...]]` | Keyed by `SchemaField.full_path`. Raises `RuntimeError` if no dictionary is loaded. |
+| `match_schema_session(schema_source, schema_format=None)` | `MatchingSession` | Same matching, plus the parsed `Schema` and timing metadata. |
 
-Load data dictionary from file.
+| Property | Returns |
+|---|---|
+| `dictionary_size` | `int` |
+| `is_ready` | `bool` |
 
-```python
-# From Excel
-matcher.load_dictionary("data/dictionary.xlsx")
+There is no public method to register a parser or loader on an existing matcher; pass
+`schema_parser_registry` / `dictionary_loader_registry` at construction time.
 
-# From CSV
-matcher.load_dictionary("data/dictionary.csv")
+#### `MatchingConfig`
 
-# From JSON
-matcher.load_dictionary("data/dictionary.json")
-```
+Frozen dataclass, `nexus_matcher.application.use_cases.match_schema.MatchingConfig`.
 
-**Parameters**
-| Name | Type | Description |
-|------|------|-------------|
-| path | str \| Path | Path to dictionary file |
+| Field | Default | Meaning |
+|---|---|---|
+| `dense_top_k` | 100 | Dense candidates retrieved |
+| `sparse_top_k` | 100 | BM25 candidates retrieved |
+| `fusion_alpha` | 0.90 | Dense weight in linear min-max fusion. Measured optimum — see `benchmarks/results/exp_fusion_combined.json` |
+| `colbert_top_k` | 50 | Candidates passed to a ColBERT reranker, if one is supplied |
+| `cross_encoder_top_k` | 20 | Candidates passed to a cross-encoder reranker, if one is supplied |
+| `semantic_weight` | 0.70 | Confidence weights; sum to 1.0 |
+| `lexical_weight` | 0.05 | |
+| `edit_distance_weight` | 0.05 | |
+| `type_weight` | 0.05 | |
+| `domain_weight` | 0.15 | |
+| `auto_approve_threshold` | 0.85 | Calibrated — `benchmarks/results/exp_calibration_combined.json` |
+| `review_threshold` | 0.50 | Below this, `REJECT` |
+| `min_confidence_gap` | 0.10 | Minimum margin over the runner-up required to auto-approve |
+| `results_per_field` | 5 | Matches returned per field |
 
-**Raises**
-- `FileNotFoundError`: If file doesn't exist
-- `ValueError`: If file format not supported
+#### `BatchProcessor`
 
----
-
-##### match_schema(path, **options)
-
-Match all fields in a schema file.
-
-```python
-results = matcher.match_schema(
-    "schemas/customer.avsc",
-    top_k=5,
-    min_confidence=0.5,
-)
-
-for field_path, matches in results.items():
-    print(f"\n{field_path}:")
-    for match in matches:
-        print(f"  {match.dictionary_entry.business_name}")
-        print(f"  Confidence: {match.final_confidence:.2%}")
-        print(f"  Decision: {match.decision}")
-```
-
-**Parameters**
-| Name | Type | Default | Description |
-|------|------|---------|-------------|
-| path | str \| Path | - | Path to schema file |
-| top_k | int | 5 | Max matches per field |
-| min_confidence | float | 0.0 | Minimum confidence |
-| include_scores | bool | False | Include component scores |
-
-**Returns**
-- `dict[str, list[Match]]`: Matches keyed by field path
-
----
-
-##### match_field(field, **options)
-
-Match a single field.
+`nexus_matcher.application.use_cases.batch_match.BatchProcessor`
 
 ```python
-from nexus_matcher.domain.models import Field
+BatchProcessor(matcher, config=None)   # config: BatchConfig
 
-field = Field(
-    path="customer.email",
-    name="email",
-    data_type="string",
-    description="Customer email address",
-)
-
-matches = matcher.match_field(field, top_k=5)
+processor.process_schemas(schema_paths, **options) -> BatchResult
+processor.process_directory(...)       -> BatchResult
+processor.process_manifest(...)        -> BatchResult
 ```
 
-**Parameters**
-| Name | Type | Default | Description |
-|------|------|---------|-------------|
-| field | Field | - | Field to match |
-| top_k | int | 5 | Max matches |
+`BatchConfig` fields: `max_workers` (4), `chunk_size` (10), `fail_fast` (False),
+`max_errors` (100), `progress_callback`, plus checkpoint options.
+`BatchResult` exposes `sessions`, `errors`, `total_schemas`, `successful`, `failed`,
+`total_duration_ms`, `avg_duration_ms`, `success_rate`.
 
-**Returns**
-- `list[Match]`: Sorted by confidence
+Parallelism uses a `ThreadPoolExecutor`, so it parallelises I/O and parsing; the
+embedding model itself is shared.
 
 ---
 
-##### parse_schema(path)
+## CLI
 
-Parse a schema file into Schema object.
+Entry point `nexus-matcher` → `nexus_matcher.presentation.cli.main:app` (Typer).
 
-```python
-schema = matcher.parse_schema("schemas/customer.avsc")
+Global options: `--version` / `-v`, `--install-completion`, `--show-completion`, `--help`.
 
-print(f"Name: {schema.name}")
-print(f"Fields: {len(schema.fields)}")
+### `match`
 
-for field in schema.fields:
-    print(f"  {field.path}: {field.data_type}")
 ```
+nexus-matcher match SCHEMA -d DICTIONARY [options]
+```
+
+| Option | Default | Meaning |
+|---|---|---|
+| `SCHEMA` (arg, required) | — | Schema file path |
+| `--dictionary` / `-d` (required) | — | Dictionary file (Excel, CSV) |
+| `--output` / `-o` | — | Write results to a file |
+| `--format` / `-f` | `table` | `json`, `csv`, or `table` |
+| `--top-k` / `-k` | 5 | Matches per field, 1–20 |
+| `--threshold` / `-t` | 0.0 | Minimum confidence to display, 0.0–1.0 |
+| `--verbose` / `-V` | off | Detailed output and full tracebacks |
+
+### `sync`
+
+Sync a dictionary to a vector store.
+
+### `api`
+
+Start the REST API server (see below for what it serves).
+
+### `info`
+
+Print system information and configuration.
+
+> **Windows note.** Table output and the progress spinner use Unicode box-drawing and
+> Braille characters. In a console using the legacy code page this raises
+> `'charmap' codec can't encode character`. Set `PYTHONIOENCODING=utf-8`.
 
 ---
 
-##### set_type_projection_manager(manager)
+## REST API
 
-Enable type-aware matching.
+Factory: `nexus_matcher.presentation.api.app.create_app()`. A module-level `app` instance
+is also created for `uvicorn nexus_matcher.presentation.api.app:app`.
 
-```python
-from nexus_matcher.core.type_projections import TypeProjectionManager
+**The complete route table**, enumerated from a live `create_app()`:
 
-type_manager = TypeProjectionManager()
-type_manager.load("models/type_projections.pt")
+| Method | Path | Response |
+|---|---|---|
+| GET | `/` | `{"service": "nexus-matcher", "version": "2.0.0", "docs": "/docs"}` |
+| GET | `/health` | `HealthResponse` — `status`, `timestamp`, `version`, `checks.uptime_seconds`. `status` is `healthy` unless a registered component is unhealthy, then `degraded`. |
+| GET | `/health/live` | `{"status": "alive"}` — Kubernetes liveness probe |
+| GET | `/health/ready` | `ReadinessResponse` — `ready`, `timestamp`, `components`. Returns **503** if any registered component is not ready. |
+| GET | `/health/startup` | `{"status": "started", "startup_time": ...}`. Returns **503** while starting. |
+| GET | `/docs`, `/redoc`, `/openapi.json` | Generated OpenAPI documentation |
 
-matcher.set_type_projection_manager(type_manager)
-```
+Middleware and behaviour that does exist:
 
----
+- Request-ID middleware. Reads `X-Request-ID` or generates one; echoes `X-Request-ID`
+  and `X-Response-Time-Ms` on every response.
+- CORS, currently `allow_origins=["*"]` — narrow this before exposing the service.
+- Exception handlers mapping `NexusMatcherError` to its status code and everything else
+  to a 500 with error code `NEXUS-1000`.
 
-### Match Class
-
-Represents a matching result.
-
-```python
-@dataclass
-class Match:
-    dictionary_entry: DictionaryEntry
-    final_confidence: float      # 0.0 - 1.0
-    decision: str                # AUTO_APPROVE, REVIEW, REJECT
-    scores: dict[str, float]     # Component scores
-    rank: int                    # Position in results
-```
-
-**Properties**
-
-| Property | Type | Description |
-|----------|------|-------------|
-| dictionary_entry | DictionaryEntry | Matched dictionary entry |
-| final_confidence | float | Combined confidence score |
-| decision | str | AUTO_APPROVE, REVIEW, or REJECT |
-| scores | dict | Component scores (semantic, lexical, type, pattern) |
-| rank | int | Position in results (1-based) |
+The `components` map reported by `/health/ready` is populated in the lifespan handler
+with hardcoded `True` values for `api`, `config`, `vector_store` and `cache`. It does
+**not** currently probe a real vector store or cache connection — the code paths that
+would do so are empty `try` blocks. Treat readiness as "the process started", not "the
+dependencies are reachable".
 
 ---
 
-### Field Class
+## Domain types
 
-Represents a schema field.
+### `SchemaField`
 
-```python
-@dataclass(frozen=True)
-class Field:
-    path: str           # Full path (e.g., "customer.addresses.city")
-    name: str           # Field name (e.g., "city")
-    data_type: str      # Data type (e.g., "string")
-    description: str    # Optional description
-    nullable: bool      # Whether field is nullable
-    default: Any        # Default value
-    metadata: dict      # Additional metadata
-```
+`name`, `data_type`, `full_path`, `parent_path`, `description`, `is_nullable`,
+`is_array`, `array_item_type`, `default_value`, `constraints`, `metadata`.
 
-**Properties**
+`parent_path` matters: it is the hierarchical context injected into the retrieval query,
+and it is the single largest accuracy factor measured on the benchmark
+(+20 points of P@1 — `benchmarks/results/exp_query_repr_combined.json`).
 
-| Property | Type | Description |
-|----------|------|-------------|
-| path | str | Full dot-separated path |
-| name | str | Field name only |
-| data_type | str | Data type string |
-| description | str | Human-readable description |
-| nullable | bool | True if field can be null |
-| depth | int | Nesting level (computed) |
-| parent_path | str \| None | Parent field path (computed) |
+### `DictionaryEntry`
 
----
+`id`, `business_name`, `logical_name`, `definition`, `data_type`, `protection_level`,
+`domain`, `parent_table`, `sample_values`, `synonyms`, `is_enum`, `enum_values`,
+`source_metadata`.
 
-### DictionaryEntry Class
+`id` and `business_name` must be non-empty. `to_searchable_text()` concatenates
+business name, logical name (underscores replaced), definition, and synonyms — that
+string is what gets embedded and BM25-indexed.
 
-Represents a data dictionary entry.
+There is no `technical_name` attribute; the field is called `logical_name`.
 
-```python
-@dataclass(frozen=True)
-class DictionaryEntry:
-    id: str
-    business_name: str
-    technical_name: str
-    data_type: str
-    description: str
-    domain: str
-    owner: str
-    sensitivity: str
-    metadata: dict
-```
+### `MatchResult`
 
----
+| Attribute | Type |
+|---|---|
+| `schema_field` | `SchemaField` |
+| `dictionary_entry` | `DictionaryEntry` |
+| `rank` | `int`, 1-based |
+| `final_confidence` | `float` in [0, 1] |
+| `score_breakdown` | `ScoreBreakdown` |
+| `decision` | `MatchDecision` enum |
+| `performance` | `PerformanceMetrics` |
 
-## CLI Reference
+Convenience properties: `is_auto_approved`, `needs_review`, `is_rejected`.
 
-### Global Options
+`MatchDecision` is a `str`-backed enum, so `result.decision == "AUTO_APPROVE"`,
+`result.decision.value` and `result.decision.name` all work. Prefer comparing against
+`MatchDecision.AUTO_APPROVE`.
 
-```bash
-nexus-matcher [OPTIONS] COMMAND [ARGS]
+### `ScoreBreakdown`
 
-Options:
-  --config PATH     Configuration file path
-  --log-level TEXT  Logging level (DEBUG, INFO, WARNING, ERROR)
-  --help            Show this message and exit
-```
+`semantic_score`, `lexical_score`, `edit_distance_score`, `type_compatibility_score`,
+`domain_score`, `graph_boost`, plus optional `colbert_score` and `cross_encoder_score`
+(both `None` when no reranker is configured). Property `has_reranking`.
 
-### Commands
+### `PerformanceMetrics`
 
-#### match
-
-Match a schema file to dictionary entries.
-
-```bash
-nexus-matcher match SCHEMA_PATH [OPTIONS]
-
-Arguments:
-  SCHEMA_PATH  Path to schema file
-
-Options:
-  -d, --dictionary PATH  Dictionary file path [required]
-  -o, --output PATH      Output file path (default: stdout)
-  -f, --format TEXT      Output format (json, csv, table) [default: table]
-  -k, --top-k INTEGER    Max matches per field [default: 5]
-  -c, --confidence FLOAT Minimum confidence [default: 0.0]
-  --include-scores       Include component scores
-```
-
-**Examples**
-
-```bash
-# Basic usage
-nexus-matcher match schema.avsc -d dictionary.xlsx
-
-# JSON output to file
-nexus-matcher match schema.avsc -d dictionary.xlsx -o results.json -f json
-
-# Only high confidence
-nexus-matcher match schema.avsc -d dictionary.xlsx -c 0.75
-
-# With scores
-nexus-matcher match schema.avsc -d dictionary.xlsx --include-scores
-```
+`latency_ms`, `cache_hit`, `retrieval_stage`, `candidates_evaluated`,
+`reranking_applied`.
 
 ---
 
-#### batch-match
+## Plugin entry points
 
-Match multiple schemas in parallel.
+Declared in `pyproject.toml`. Each target module was verified importable:
 
-```bash
-nexus-matcher batch-match SCHEMA_DIR [OPTIONS]
+| Group | Names |
+|---|---|
+| `nexus_matcher.schema_parsers` | `avro`, `json_schema`, `sql_ddl` |
+| `nexus_matcher.dictionary_loaders` | `excel`, `csv` (both from `…dictionary_loaders.excel`) |
+| `nexus_matcher.vector_stores` | `qdrant`, `memory` |
+| `nexus_matcher.embedding_providers` | `sentence_transformers` |
 
-Arguments:
-  SCHEMA_DIR  Directory containing schema files
-
-Options:
-  -d, --dictionary PATH  Dictionary file path [required]
-  -o, --output PATH      Output directory [default: ./results]
-  -w, --workers INTEGER  Parallel workers [default: 4]
-  -p, --pattern TEXT     File pattern [default: *.avsc]
-```
-
-**Examples**
-
-```bash
-# All Avro schemas
-nexus-matcher batch-match schemas/ -d dictionary.xlsx
-
-# JSON schemas with 8 workers
-nexus-matcher batch-match schemas/ -d dictionary.xlsx -p "*.json" -w 8
-```
+Earlier revisions of `pyproject.toml` also declared `csv_headers`, `database`, `faiss`
+and `openai` entry points pointing at modules that do not exist. Those have been removed.
+If you installed the package before that cleanup, the stale entry points survive in the
+installed `.dist-info` metadata and will raise `ModuleNotFoundError` during plugin
+discovery — reinstall (`pip install -e .`) to regenerate it.
 
 ---
 
-#### sync
+## Not implemented
 
-Sync dictionary to vector store.
+Previous revisions of this document described the following. **None of it exists.**
+It is listed here so that nobody re-derives it from an old copy.
 
-```bash
-nexus-matcher sync DICTIONARY_PATH [OPTIONS]
-
-Arguments:
-  DICTIONARY_PATH  Path to dictionary file
-
-Options:
-  --backend TEXT   Vector store backend (qdrant, memory) [default: qdrant]
-  --host TEXT      Qdrant host [default: localhost]
-  --port INTEGER   Qdrant port [default: 6333]
-  --incremental    Only update changed entries
-```
-
-**Examples**
-
-```bash
-# Full sync
-nexus-matcher sync dictionary.xlsx
-
-# Incremental update
-nexus-matcher sync dictionary.xlsx --incremental
-```
-
----
-
-#### api
-
-Start the REST API server.
-
-```bash
-nexus-matcher api [OPTIONS]
-
-Options:
-  --host TEXT       Host to bind [default: 0.0.0.0]
-  --port INTEGER    Port to bind [default: 8000]
-  --workers INTEGER Number of workers [default: 4]
-  --reload          Enable auto-reload (dev only)
-```
-
-**Examples**
-
-```bash
-# Production
-nexus-matcher api --host 0.0.0.0 --port 8000 --workers 8
-
-# Development
-nexus-matcher api --reload
-```
-
----
-
-## Error Handling
-
-### Error Response Format
-
-```json
-{
-  "error": {
-    "code": "VALIDATION_ERROR",
-    "message": "Invalid schema format",
-    "details": {
-      "field": "schema.fields[0].type",
-      "reason": "Unknown type 'custom_type'"
-    }
-  },
-  "request_id": "abc123"
-}
-```
-
-### Error Codes
-
-| Code | HTTP Status | Description |
-|------|-------------|-------------|
-| VALIDATION_ERROR | 400 | Invalid request format |
-| SCHEMA_PARSE_ERROR | 400 | Failed to parse schema |
-| NOT_FOUND | 404 | Resource not found |
-| RATE_LIMIT_EXCEEDED | 429 | Too many requests |
-| INTERNAL_ERROR | 500 | Internal server error |
-| SERVICE_UNAVAILABLE | 503 | Service temporarily unavailable |
-
----
-
-## Rate Limiting
-
-When enabled, rate limiting applies per-IP:
-
-| Tier | Requests | Window |
-|------|----------|--------|
-| Default | 100 | 1 minute |
-| Authenticated | 1000 | 1 minute |
-
-**Rate Limit Headers**
-
-```
-X-RateLimit-Limit: 100
-X-RateLimit-Remaining: 95
-X-RateLimit-Reset: 1640995200
-```
-
-**Rate Limited Response**
-
-```json
-{
-  "error": {
-    "code": "RATE_LIMIT_EXCEEDED",
-    "message": "Too many requests",
-    "retry_after": 30
-  }
-}
-```
-
----
-
-*API Reference Version 1.0.0*
-*Last Updated: December 2025*
+| Documented previously | Reality |
+|---|---|
+| `POST /match` | No matching endpoint exists. Matching over HTTP is not implemented. |
+| `POST /batch` | Not implemented. Use `BatchProcessor` in-process. |
+| `GET/POST/PUT/DELETE /dictionary`, `GET /dictionary/{id}` | No dictionary CRUD endpoints. |
+| `POST /cache/clear`, `GET /cache/stats` | No cache endpoints. |
+| `GET /metrics` (Prometheus) | Not routed. A `PrometheusMetrics` backend class exists in `nexus_matcher.shared.metrics`, but no endpoint exposes it. |
+| `GET /ready` | The path is `/health/ready`. |
+| API key auth via `NEXUS_API_KEY` / `X-API-Key` | No authentication dependency is attached to any route. The OpenAPI description text mentions it; the code does not implement it. |
+| Rate limiting | No rate-limiting middleware is installed. |
+| `nexus-matcher batch-match` | Not a CLI command. The commands are `match`, `sync`, `api`, `info`. |
+| `NexusMatcher(config_path="config.yaml")` | Not a valid constructor call. |
+| `matcher.match_field(...)`, `matcher.precompute_embeddings()`, `matcher.set_type_projection_manager(...)` | Not methods on `NexusMatcher`. |
+| Loading a dictionary from a `postgresql://` URL or a JSON file | Only Excel and CSV loaders are registered. |

@@ -9,19 +9,23 @@ SQL DDL (CREATE TABLE) parser implementation.
 
 ## Attributes
 # Security: Validates DDL structure to prevent malformed input
-# Performance: O(n) parsing where n = number of columns
-# Reliability: Handles common SQL dialects (PostgreSQL, MySQL, SQL Server)
+# Performance: O(n) parsing where n = length of the DDL
+# Reliability: Handles common SQL dialects (PostgreSQL, MySQL, SQL Server),
+#              multiple statements per file, and all four identifier quoting
+#              styles
 """
 
 from __future__ import annotations
 
+import logging
 import re
-from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 from nexus_matcher.domain.models.entities import Schema, SchemaField
 from nexus_matcher.domain.ports.schema_parser import BaseSchemaParser
 from nexus_matcher.shared.types.base import DataType, Result
+
+logger = logging.getLogger(__name__)
 
 
 class SqlDdlParser(BaseSchemaParser):
@@ -32,7 +36,26 @@ class SqlDdlParser(BaseSchemaParser):
     - Common SQL types (VARCHAR, INT, TIMESTAMP, etc.)
     - Column constraints (NOT NULL, DEFAULT)
     - Multiple SQL dialects (standard, PostgreSQL, MySQL, SQL Server)
-    - Inline comments (-- style)
+    - Quoted identifiers in all four styles: "ansi", `mysql`, [sqlserver],
+      including names containing spaces and dots
+    - Multiple CREATE TABLE statements in one input (see parse_all)
+    - Line (--) and block (/* */) comments
+
+    Two defects this parser used to have:
+
+    1. Statement boundaries. The table body was located with
+       `CREATE\\s+TABLE\\s+([^\\s(]+)\\s*\\((.*)\\)` under re.DOTALL. `.*` is
+       greedy, so on a file with several CREATE TABLE statements it captured
+       from the first table's opening paren all the way to the LAST closing
+       paren in the file. The result was one Schema named after the first table
+       whose column list was a blend of every table in the file -- silently
+       wrong rather than an error. Statement bodies are now found by scanning
+       for the balanced closing parenthesis, skipping over quoted strings.
+
+    2. SQL Server bracket identifiers. `[dbo].[Customers]` was kept verbatim as
+       the table name (brackets and all), and a column written
+       `[Customer Name] NVARCHAR(100)` failed the `(["`]?)(\\w+)\\1` name
+       pattern entirely and was dropped from the output. Both now parse.
 
     Example:
         parser = SqlDdlParser()
@@ -47,60 +70,77 @@ class SqlDdlParser(BaseSchemaParser):
             schema = result.unwrap()
             for field in schema.fields:
                 print(f"{field.name}: {field.data_type}")
+
+        # Several tables in one file:
+        all_schemas = parser.parse_all(ddl_text).unwrap()
     """
 
     # SQL type to DataType mapping (case-insensitive patterns)
-    TYPE_PATTERNS: list[tuple[str, DataType]] = [
+    TYPE_PATTERNS: ClassVar[list[tuple[str, DataType]]] = [
         # String types
         (r"(?:VAR)?CHAR", DataType.STRING),
         (r"N?VARCHAR", DataType.STRING),
         (r"TEXT", DataType.STRING),
         (r"CLOB", DataType.STRING),
-
         # Integer types
         (r"BIGINT", DataType.LONG),  # Must be before INT
         (r"(?:SMALL|TINY)?INT(?:EGER)?", DataType.INTEGER),
         (r"SERIAL", DataType.INTEGER),
         (r"BIGSERIAL", DataType.LONG),
-
         # Floating point types
         (r"DOUBLE\s+PRECISION", DataType.DOUBLE),
         (r"DOUBLE", DataType.DOUBLE),
         (r"FLOAT", DataType.FLOAT),
         (r"REAL", DataType.FLOAT),
-
         # Decimal types
         (r"(?:DECIMAL|NUMERIC|NUMBER)", DataType.DECIMAL),
-
         # Boolean types
         (r"BOOL(?:EAN)?", DataType.BOOLEAN),
         (r"BIT", DataType.BOOLEAN),
-
         # Temporal types
         (r"TIMESTAMP(?:\s+WITH(?:OUT)?\s+TIME\s+ZONE)?", DataType.TIMESTAMP),
         (r"DATETIME2?", DataType.TIMESTAMP),
         (r"TIME", DataType.TIMESTAMP),
         (r"DATE", DataType.DATE),
-
         # Binary types
         (r"BYTEA", DataType.BYTES),
         (r"BLOB", DataType.BYTES),
         (r"(?:VAR)?BINARY", DataType.BYTES),
         (r"IMAGE", DataType.BYTES),
-
         # JSON types
         (r"JSONB?", DataType.JSON),
-
         # UUID types
         (r"UUID", DataType.UUID),
         (r"UNIQUEIDENTIFIER", DataType.UUID),
-
         # Array types
         (r"ARRAY", DataType.ARRAY),
     ]
 
     # Compile patterns for efficiency
-    _compiled_patterns: list[tuple[re.Pattern, DataType]] = []
+    _compiled_patterns: ClassVar[list[tuple[re.Pattern, DataType]]] = []
+
+    # Locates the header of a CREATE TABLE statement up to its opening paren.
+    _CREATE_TABLE_RE = re.compile(
+        r"CREATE\s+(?:(?:GLOBAL|LOCAL)\s+)?(?:TEMP(?:ORARY)?\s+)?"
+        r"(?:UNLOGGED\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?",
+        re.IGNORECASE,
+    )
+
+    # Table-level constraint keywords that are not column definitions.
+    _CONSTRAINT_PREFIXES = (
+        "PRIMARY KEY",
+        "FOREIGN KEY",
+        "UNIQUE",
+        "CHECK",
+        "CONSTRAINT",
+        "INDEX",
+        "KEY ",
+        "EXCLUDE",
+        "PERIOD FOR",
+    )
+
+    # Matching close for each opening quote character.
+    _QUOTE_PAIRS: ClassVar[dict[str, str]] = {'"': '"', "'": "'", "`": "`", "[": "]"}
 
     def __init__(self):
         """Initialize parser with compiled regex patterns."""
@@ -120,11 +160,20 @@ class SqlDdlParser(BaseSchemaParser):
         """Supported file extensions."""
         return frozenset({".sql", ".ddl"})
 
+    # =========================================================================
+    # PUBLIC API
+    # =========================================================================
+
     def parse(self, content: str | dict[str, Any]) -> Result[Schema]:
         """
-        Parse SQL DDL from string.
+        Parse SQL DDL from string, returning the FIRST table.
 
         Note: Does not support dict input (SQL is always text).
+
+        When the input holds several CREATE TABLE statements, the first is
+        returned and `source_metadata["additional_tables"]` names the rest, so a
+        caller can tell that more was present. Use `parse_all()` to get every
+        table.
 
         Args:
             content: DDL string
@@ -136,103 +185,333 @@ class SqlDdlParser(BaseSchemaParser):
             return Result.failure("SQL DDL must be string, not dict", "INVALID_INPUT")
 
         try:
-            schema = self._parse_ddl(content)
-            return Result.success(schema)
+            schemas = self._parse_ddl_all(content)
         except ValueError as e:
             return Result.failure(str(e), "VALIDATION_ERROR")
         except Exception as e:
             return Result.failure(f"Unexpected error: {e}", "UNKNOWN_ERROR")
 
+        if not schemas:
+            return Result.failure(
+                "Invalid DDL: No CREATE TABLE statement found", "VALIDATION_ERROR"
+            )
+
+        first = schemas[0]
+        if len(schemas) > 1:
+            others = [s.name for s in schemas[1:]]
+            logger.info(
+                "DDL contained %d tables; parse() returns %r. Use parse_all() "
+                "for all of them. Remaining: %s",
+                len(schemas),
+                first.name,
+                others,
+            )
+            first = Schema(
+                name=first.name,
+                fields=first.fields,
+                namespace=first.namespace,
+                source_format=first.source_format,
+                source_metadata={
+                    **first.source_metadata,
+                    "table_count": len(schemas),
+                    "additional_tables": others,
+                },
+            )
+
+        return Result.success(first)
+
+    def parse_all(self, content: str | dict[str, Any]) -> Result[list[Schema]]:
+        """
+        Parse every CREATE TABLE statement in the input.
+
+        Args:
+            content: DDL string
+
+        Returns:
+            Result containing one Schema per table, in source order
+        """
+        if isinstance(content, dict):
+            return Result.failure("SQL DDL must be string, not dict", "INVALID_INPUT")
+
+        try:
+            schemas = self._parse_ddl_all(content)
+        except ValueError as e:
+            return Result.failure(str(e), "VALIDATION_ERROR")
+        except Exception as e:
+            return Result.failure(f"Unexpected error: {e}", "UNKNOWN_ERROR")
+
+        if not schemas:
+            return Result.failure(
+                "Invalid DDL: No CREATE TABLE statement found", "VALIDATION_ERROR"
+            )
+
+        return Result.success(schemas)
+
     def _parse_content(self, content: dict[str, Any]) -> Schema:
         """Not used for SQL DDL (string-only format)."""
         raise NotImplementedError("SQL DDL parser uses string input only")
 
-    def _parse_ddl(self, ddl: str) -> Schema:
-        """
-        Parse DDL string into Schema.
+    # =========================================================================
+    # STATEMENT SCANNING
+    # =========================================================================
 
-        Args:
-            ddl: CREATE TABLE statement
-
-        Returns:
-            Schema domain model
-
-        Raises:
-            ValueError: If DDL is invalid
-        """
-        # Remove inline comments
+    def _parse_ddl_all(self, ddl: str) -> list[Schema]:
+        """Parse every CREATE TABLE statement into a Schema."""
         ddl = self._remove_comments(ddl)
 
-        # Extract table name and columns
-        match = re.search(
-            r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([^\s(]+)\s*\((.*)\)",
-            ddl,
-            re.IGNORECASE | re.DOTALL,
-        )
+        schemas: list[Schema] = []
+        for table_ref, columns_str in self._iter_create_tables(ddl):
+            namespace, table_name = self._split_qualified_name(table_ref)
+            fields = self._parse_columns(columns_str)
 
-        if not match:
-            raise ValueError("Invalid DDL: No CREATE TABLE statement found")
+            schemas.append(
+                Schema(
+                    name=table_name,
+                    fields=tuple(fields),
+                    namespace=namespace,
+                    source_format="sql_ddl",
+                    source_metadata={},
+                )
+            )
 
-        table_ref = match.group(1).strip()
-        columns_str = match.group(2).strip()
+        return schemas
 
-        # Parse table name (may include schema)
-        namespace = ""
-        table_name = table_ref
+    def _iter_create_tables(self, ddl: str):
+        """
+        Yield (table_ref, columns_str) for each CREATE TABLE in the input.
 
-        if "." in table_ref:
-            parts = table_ref.split(".")
-            namespace = parts[0].strip('"').strip("'").strip("`")
-            table_name = parts[-1].strip('"').strip("'").strip("`")
-        else:
-            table_name = table_ref.strip('"').strip("'").strip("`")
+        The column body is delimited by scanning for the parenthesis that
+        balances the opening one, skipping anything inside quotes. That is what
+        makes several statements per file work, and it also keeps a
+        `DEFAULT '(pending)'` literal from ending the body early.
+        """
+        for header in self._CREATE_TABLE_RE.finditer(ddl):
+            cursor = header.end()
 
-        # Parse columns
-        fields = self._parse_columns(columns_str)
+            table_ref, cursor = self._read_identifier(ddl, cursor)
+            if not table_ref:
+                continue
 
-        return Schema(
-            name=table_name,
-            fields=tuple(fields),
-            namespace=namespace,
-            source_format="sql_ddl",
-            source_metadata={},
-        )
+            # Skip whitespace to the opening parenthesis.
+            while cursor < len(ddl) and ddl[cursor].isspace():
+                cursor += 1
 
-    def _remove_comments(self, ddl: str) -> str:
-        """Remove SQL comments from DDL."""
-        # Remove -- style comments
-        lines = []
-        for line in ddl.split("\n"):
-            # Find -- that's not inside a string
-            comment_pos = self._find_comment_position(line)
-            if comment_pos >= 0:
-                line = line[:comment_pos]
-            lines.append(line)
-        return "\n".join(lines)
+            if cursor >= len(ddl) or ddl[cursor] != "(":
+                # e.g. CREATE TABLE x AS SELECT ... -- no column list to read.
+                continue
 
-    def _find_comment_position(self, line: str) -> int:
-        """Find position of -- comment, ignoring those in strings."""
-        in_string = False
-        string_char = None
-        i = 0
+            body_end = self._find_matching_paren(ddl, cursor)
+            if body_end < 0:
+                raise ValueError(
+                    f"Invalid DDL: unbalanced parentheses in CREATE TABLE {table_ref!r}"
+                )
 
-        while i < len(line):
-            char = line[i]
+            yield table_ref, ddl[cursor + 1 : body_end]
 
-            if not in_string:
-                if char in ("'", '"'):
-                    in_string = True
-                    string_char = char
-                elif char == "-" and i + 1 < len(line) and line[i + 1] == "-":
-                    return i
-            else:
-                if char == string_char:
-                    in_string = False
-                    string_char = None
+    def _read_identifier(self, text: str, start: int) -> tuple[str, int]:
+        """
+        Read a possibly-qualified, possibly-quoted identifier.
 
-            i += 1
+        Handles `customers`, `public.customers`, `"My Schema"."My Table"`,
+        `` `db`.`tbl` `` and `[dbo].[Customer Orders]`.
+
+        Returns:
+            (raw_identifier_text, index_after_it)
+        """
+        cursor = start
+        while cursor < len(text) and text[cursor].isspace():
+            cursor += 1
+
+        begin = cursor
+        while cursor < len(text):
+            char = text[cursor]
+
+            if char in self._QUOTE_PAIRS:
+                closer = self._QUOTE_PAIRS[char]
+                cursor += 1
+                while cursor < len(text) and text[cursor] != closer:
+                    cursor += 1
+                cursor += 1  # consume the closer
+                continue
+
+            if char.isspace() or char == "(":
+                break
+
+            cursor += 1
+
+        return text[begin:cursor].strip(), cursor
+
+    def _find_matching_paren(self, text: str, open_index: int) -> int:
+        """
+        Index of the ')' matching the '(' at open_index, or -1.
+
+        Quoted regions are skipped so parentheses inside string literals and
+        bracket identifiers do not affect the depth count.
+        """
+        depth = 0
+        cursor = open_index
+
+        while cursor < len(text):
+            char = text[cursor]
+
+            if char in ("'", '"', "`"):
+                closer = char
+                cursor += 1
+                while cursor < len(text):
+                    if text[cursor] == closer:
+                        # Doubled quote is an escaped quote, not a terminator.
+                        if cursor + 1 < len(text) and text[cursor + 1] == closer:
+                            cursor += 2
+                            continue
+                        break
+                    cursor += 1
+                cursor += 1
+                continue
+
+            if char == "[":
+                while cursor < len(text) and text[cursor] != "]":
+                    cursor += 1
+                cursor += 1
+                continue
+
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0:
+                    return cursor
+
+            cursor += 1
 
         return -1
+
+    def _remove_comments(self, ddl: str) -> str:
+        """
+        Remove -- line comments and /* */ block comments.
+
+        Comment markers inside string literals and quoted identifiers are left
+        alone; stripping those would corrupt DEFAULT values and column names.
+        """
+        out: list[str] = []
+        cursor = 0
+        length = len(ddl)
+
+        while cursor < length:
+            char = ddl[cursor]
+
+            if char in ("'", '"', "`"):
+                closer = char
+                out.append(char)
+                cursor += 1
+                while cursor < length:
+                    out.append(ddl[cursor])
+                    if ddl[cursor] == closer:
+                        cursor += 1
+                        break
+                    cursor += 1
+                continue
+
+            if char == "[":
+                while cursor < length:
+                    out.append(ddl[cursor])
+                    if ddl[cursor] == "]":
+                        cursor += 1
+                        break
+                    cursor += 1
+                continue
+
+            if char == "-" and cursor + 1 < length and ddl[cursor + 1] == "-":
+                while cursor < length and ddl[cursor] != "\n":
+                    cursor += 1
+                continue
+
+            if char == "/" and cursor + 1 < length and ddl[cursor + 1] == "*":
+                cursor += 2
+                while cursor + 1 < length and not (ddl[cursor] == "*" and ddl[cursor + 1] == "/"):
+                    cursor += 1
+                cursor += 2
+                out.append(" ")
+                continue
+
+            out.append(char)
+            cursor += 1
+
+        return "".join(out)
+
+    # =========================================================================
+    # IDENTIFIERS
+    # =========================================================================
+
+    @classmethod
+    def _unquote_identifier(cls, raw: str) -> str:
+        """Strip one layer of ANSI, MySQL or SQL Server quoting."""
+        value = raw.strip()
+        if len(value) >= 2:
+            first, last = value[0], value[-1]
+            if first in cls._QUOTE_PAIRS and last == cls._QUOTE_PAIRS[first]:
+                return value[1:-1]
+        return value
+
+    @classmethod
+    def _split_identifier_parts(cls, raw: str) -> list[str]:
+        """
+        Split a qualified name on dots that sit OUTSIDE quotes.
+
+        `[my.db].[dbo].[Customers]` must split into three parts, not five: the
+        dot inside `[my.db]` belongs to the identifier.
+        """
+        parts: list[str] = []
+        current: list[str] = []
+        cursor = 0
+
+        while cursor < len(raw):
+            char = raw[cursor]
+
+            if char in cls._QUOTE_PAIRS:
+                closer = cls._QUOTE_PAIRS[char]
+                current.append(char)
+                cursor += 1
+                while cursor < len(raw) and raw[cursor] != closer:
+                    current.append(raw[cursor])
+                    cursor += 1
+                if cursor < len(raw):
+                    current.append(closer)
+                    cursor += 1
+                continue
+
+            if char == ".":
+                parts.append("".join(current))
+                current = []
+                cursor += 1
+                continue
+
+            current.append(char)
+            cursor += 1
+
+        parts.append("".join(current))
+        return [p for p in parts if p != ""]
+
+    @classmethod
+    def _split_qualified_name(cls, table_ref: str) -> tuple[str, str]:
+        """
+        Split a table reference into (namespace, table_name), unquoting both.
+
+        For a three-part name (database.schema.table) the schema is used as the
+        namespace, which is what `[db].[dbo].[Customers]` means in SQL Server.
+        """
+        parts = cls._split_identifier_parts(table_ref.strip())
+
+        if not parts:
+            return "", ""
+
+        table_name = cls._unquote_identifier(parts[-1])
+        namespace = cls._unquote_identifier(parts[-2]) if len(parts) >= 2 else ""
+
+        return namespace, table_name
+
+    # =========================================================================
+    # COLUMNS
+    # =========================================================================
 
     def _parse_columns(self, columns_str: str) -> list[SchemaField]:
         """
@@ -246,18 +525,20 @@ class SqlDdlParser(BaseSchemaParser):
         """
         fields = []
 
-        # Split by comma, but respect parentheses (for types like DECIMAL(10,2))
         column_defs = self._split_column_definitions(columns_str)
 
-        for col_def in column_defs:
-            col_def = col_def.strip()
+        for raw_col_def in column_defs:
+            col_def = raw_col_def.strip()
             if not col_def:
                 continue
 
-            # Skip table-level constraints
-            upper_def = col_def.upper()
-            if upper_def.startswith(("PRIMARY KEY", "FOREIGN KEY", "UNIQUE", "CHECK", "CONSTRAINT", "INDEX")):
-                continue
+            # Skip table-level constraints. A bracket/quote-opened definition is
+            # always a column, so check the prefix only on bare identifiers --
+            # otherwise a column legitimately named [Key] or "Check" is dropped.
+            if col_def[0] not in self._QUOTE_PAIRS:
+                upper_def = " ".join(col_def.upper().split())
+                if upper_def.startswith(self._CONSTRAINT_PREFIXES):
+                    continue
 
             field = self._parse_column(col_def)
             if field:
@@ -266,12 +547,41 @@ class SqlDdlParser(BaseSchemaParser):
         return fields
 
     def _split_column_definitions(self, columns_str: str) -> list[str]:
-        """Split column definitions by comma, respecting parentheses."""
-        result = []
-        current = []
-        paren_depth = 0
+        """
+        Split column definitions by comma, respecting parentheses and quotes.
 
-        for char in columns_str:
+        DECIMAL(10,2) must not split, and neither must DEFAULT 'a,b'.
+        """
+        result = []
+        current: list[str] = []
+        paren_depth = 0
+        cursor = 0
+        length = len(columns_str)
+
+        while cursor < length:
+            char = columns_str[cursor]
+
+            if char in ("'", '"', "`"):
+                closer = char
+                current.append(char)
+                cursor += 1
+                while cursor < length:
+                    current.append(columns_str[cursor])
+                    if columns_str[cursor] == closer:
+                        cursor += 1
+                        break
+                    cursor += 1
+                continue
+
+            if char == "[":
+                while cursor < length:
+                    current.append(columns_str[cursor])
+                    if columns_str[cursor] == "]":
+                        cursor += 1
+                        break
+                    cursor += 1
+                continue
+
             if char == "(":
                 paren_depth += 1
                 current.append(char)
@@ -283,6 +593,8 @@ class SqlDdlParser(BaseSchemaParser):
                 current = []
             else:
                 current.append(char)
+
+            cursor += 1
 
         if current:
             result.append("".join(current))
@@ -299,21 +611,24 @@ class SqlDdlParser(BaseSchemaParser):
         Returns:
             SchemaField or None if couldn't parse
         """
-        # Normalize whitespace
         col_def = " ".join(col_def.split())
-
-        # Extract column name (first word, handle quoted identifiers)
-        match = re.match(r'(["`]?)(\w+)\1\s+(.+)', col_def, re.IGNORECASE)
-        if not match:
+        if not col_def:
             return None
 
-        col_name = match.group(2)
-        type_and_constraints = match.group(3)
+        raw_name, cursor = self._read_identifier(col_def, 0)
+        if not raw_name:
+            return None
 
-        # Parse data type
+        col_name = self._unquote_identifier(raw_name)
+        if not col_name:
+            return None
+
+        type_and_constraints = col_def[cursor:].strip()
+        if not type_and_constraints:
+            # A bare identifier with no type is not a column definition.
+            return None
+
         data_type = self._parse_type(type_and_constraints)
-
-        # Parse constraints
         is_nullable = self._parse_nullable(type_and_constraints)
         default_value = self._parse_default(type_and_constraints)
 
@@ -324,11 +639,12 @@ class SqlDdlParser(BaseSchemaParser):
             parent_path="",
             description="",
             is_nullable=is_nullable,
-            is_array=data_type == DataType.ARRAY,
+            is_array=data_type == DataType.ARRAY or type_and_constraints.rstrip().endswith("[]"),
             array_item_type=None,
             default_value=default_value,
             source_metadata={
                 "sql_type": type_and_constraints.split()[0] if type_and_constraints else "",
+                "quoted_name": raw_name if raw_name != col_name else None,
             },
         )
 
@@ -342,7 +658,6 @@ class SqlDdlParser(BaseSchemaParser):
         Returns:
             Matched DataType
         """
-        # Normalize for matching
         type_upper = type_str.upper().strip()
 
         for pattern, dtype in self._compiled_patterns:
@@ -366,8 +681,8 @@ class SqlDdlParser(BaseSchemaParser):
         if "NOT NULL" in upper:
             return False
 
-        # Default is nullable
-        return True
+        # A single-column PRIMARY KEY is implicitly NOT NULL.
+        return "PRIMARY KEY" not in upper
 
     def _parse_default(self, constraints: str) -> str | None:
         """
@@ -379,7 +694,6 @@ class SqlDdlParser(BaseSchemaParser):
         Returns:
             Default value string or None
         """
-        # Match DEFAULT value (handles strings, numbers, keywords)
         match = re.search(
             r"DEFAULT\s+(?:'([^']*)'|\"([^\"]*)\"|(\S+))",
             constraints,
@@ -387,7 +701,6 @@ class SqlDdlParser(BaseSchemaParser):
         )
 
         if match:
-            # Return first non-None group (quoted string or unquoted value)
             return match.group(1) or match.group(2) or match.group(3)
 
         return None
@@ -408,6 +721,4 @@ class SqlDdlParser(BaseSchemaParser):
         if not isinstance(content, str):
             return False
 
-        # Check for CREATE TABLE pattern
-        upper = content.upper()
-        return "CREATE TABLE" in upper or "CREATE TABLE IF NOT EXISTS" in upper
+        return bool(self._CREATE_TABLE_RE.search(content))

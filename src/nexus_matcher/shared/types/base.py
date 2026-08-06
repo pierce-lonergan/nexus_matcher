@@ -13,8 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Generic, TypeAlias, TypeVar
-from uuid import UUID, uuid4
+from typing import Generic, TypeAlias, TypeVar
+from uuid import uuid4
 
 import numpy as np
 from numpy.typing import NDArray
@@ -24,6 +24,7 @@ from numpy.typing import NDArray
 def _utc_now() -> datetime:
     """Return current UTC time (timezone-aware)."""
     return datetime.now(timezone.utc)
+
 
 # =============================================================================
 # TYPE ALIASES

@@ -18,10 +18,13 @@ Core schema matching use case - the main orchestrator.
 
 from __future__ import annotations
 
+import math
+import re
 import time
-from dataclasses import dataclass, field
+from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any
 
 import numpy as np
 
@@ -44,17 +47,21 @@ from nexus_matcher.domain.ports.dictionary_loader import ColumnMapping, LoadStat
 from nexus_matcher.domain.ports.retrieval import RerankCandidate, SparseDocument
 from nexus_matcher.domain.ports.vector_store import SearchResult, VectorDocument, VectorStoreConfig
 from nexus_matcher.domain.services.abbreviation import AbbreviationExpander
+from nexus_matcher.domain.services.alias_generation import expand_dictionary
 from nexus_matcher.domain.services.context_enricher import ContextEnricher
 from nexus_matcher.domain.services.domain_hierarchy import DomainMatcher
 from nexus_matcher.shared.types.base import (
-    DataType,
     EntityId,
     MatchDecision,
     PerformanceMetrics,
-    Result,
-    Score,
     ScoreBreakdown,
 )
+
+# Optional acceleration for the per-candidate string similarity on the hot path.
+try:  # pragma: no cover - trivial import guard
+    from rapidfuzz.distance import Levenshtein as _LEVENSHTEIN
+except ImportError:  # pragma: no cover
+    _LEVENSHTEIN = None  # type: ignore[assignment]
 
 
 # =============================================================================
@@ -69,7 +76,12 @@ class MatchingConfig:
     # Retrieval
     dense_top_k: int = 100
     sparse_top_k: int = 100
-    fusion_alpha: float = 0.65  # Weight for dense scores
+    # Weight for dense scores in linear fusion. 0.9 is the measured optimum for P@1 on
+    # the combined BIRD+OMOP benchmark (see _fuse_results and benchmarks/exp_fusion.py):
+    # dense=0.5 -> 0.657, 0.7 -> 0.682, 0.8 -> 0.686, 0.9 -> 0.702.
+    # The lexical arm still earns its 10%: sparse-only reaches 0.542 P@1 on its own and
+    # rescues exact-token matches that the embedding model misses.
+    fusion_alpha: float = 0.90
 
     # Reranking
     colbert_top_k: int = 50
@@ -83,12 +95,127 @@ class MatchingConfig:
     domain_weight: float = 0.15
 
     # Thresholds
-    auto_approve_threshold: float = 0.75
+    #
+    # auto_approve_threshold is CALIBRATED, not arbitrary. Measured on the combined
+    # BIRD+OMOP benchmark (688 labelled fields, benchmarks/exp_calibration.py):
+    #
+    #   threshold   coverage   auto-approve precision
+    #   0.85          20.8%       0.916
+    #   0.87          12.4%       0.953      <- default: ~95% precision target
+    #
+    # These are for the shipped configuration (dictionary_alias_count = 0). Turning
+    # aliasing on also caps achievable auto-approve precision at ~91%, because max-pool
+    # reports an entry's BEST fabricated spelling and a wrong entry can therefore look
+    # confident -- a second, independent reason to leave it off.
+    #
+    # Auto-approving a wrong mapping is far more expensive than sending a field to
+    # review, so the default targets ~95% auto-approve precision and accepts low
+    # coverage; everything below the bar goes to a human rather than being guessed.
+    # If your cost balance differs, 0.85 buys +8 points of coverage for -4 of precision.
+    #
+    # IMPORTANT: these numbers move with the retriever AND with the benchmark. They were
+    # re-derived after a leakage fix in the OMOP split (its business name used to be
+    # derived from the field name, making the task string-identity and inflating every
+    # number downstream). Improving retrieval also SHIFTS THE SCORE DISTRIBUTION UPWARD,
+    # pushing more candidates over a fixed bar and LOWERING precision -- that happened
+    # twice during tuning. Re-run exp_calibration.py after any change to the model,
+    # fusion, query representation, or benchmark.
+    auto_approve_threshold: float = 0.87
     review_threshold: float = 0.50
     min_confidence_gap: float = 0.10
 
     # Results
     results_per_field: int = 5
+
+    # Whether to run abbreviation expansion over the QUERY text.
+    # Off by default: it measurably LOSES accuracy on the combined benchmark
+    # (P@1 0.691 with context enrichment alone vs 0.671 with expansion added,
+    # benchmarks/exp_query_repr.py). Once the parent-table context is present the
+    # embedding model can already resolve most abbreviations from context, while the
+    # expander's fixed dictionary fires on ambiguous short tokens and injects wrong
+    # words -- "st" -> "state" inside a street field, and so on. A wrong expansion is
+    # worse than no expansion. The expander is still used to enrich the DICTIONARY side
+    # where entries are longer and more predictable.
+    expand_query_abbreviations: bool = False
+
+    # Index-time enrichment: how many fabricated technical spellings to index per
+    # dictionary entry, max-pooled at query time. See domain/services/alias_generation.
+    #
+    # This is the inverse of query expansion, and unlike query expansion it works: a
+    # wrong alias loses the max-pool instead of corrupting the single query vector.
+    # OFF BY DEFAULT. It helps on a small dictionary and is CATASTROPHIC on a large one.
+    #
+    # Measured end-to-end, aliases=0 vs aliases=6 (benchmarks/results/exp_alias_scale.json):
+    #     entries    off      on       delta
+    #        688   0.5814  0.6003     +1.9
+    #     10,000   0.5044  0.3677    -13.7
+    #     30,000   0.4666  0.2791    -18.8
+    #
+    # The gain inverts between 688 and 10k entries and then keeps falling. The mechanism
+    # is inherent to max-pooling, not a tuning problem: every DISTRACTOR also receives
+    # `dictionary_alias_count` extra chances to beat the gold entry, so alias noise grows
+    # with corpus size while the useful signal does not. A 6x larger index is a 6x larger
+    # opportunity for a wrong entry to land inside the ~0.002 similarity margin that
+    # separates right from wrong on this task.
+    #
+    # Enable ONLY if your dictionary is genuinely small (order 1000 entries) and you have
+    # re-measured on your own data. On the 361-entry BIRD split it is worth +3.9 points.
+    # Do not enable it on an enterprise glossary.
+    dictionary_alias_count: int = 0
+
+
+# =============================================================================
+# TOKENIZATION
+# =============================================================================
+
+# Splits identifiers on case transitions, digit boundaries and any punctuation, so
+# "NumTstTakr", "num_tst_takr" and "enroll12" all yield comparable token sets.
+_IDENT_SPLIT = re.compile(
+    r"""
+    (?<=[a-z0-9])(?=[A-Z])      # camelCase   -> camel | Case
+  | (?<=[A-Z])(?=[A-Z][a-z])    # HTTPResponse -> HTTP | Response
+  | (?<=[A-Za-z])(?=[0-9])      # enroll12    -> enroll | 12
+  | (?<=[0-9])(?=[A-Za-z])      # 12grade     -> 12 | grade
+    """,
+    re.VERBOSE,
+)
+
+
+def _tokenize_identifier(name: str) -> set[str]:
+    """Split a schema identifier into a lowercase token set."""
+    if not name:
+        return set()
+    spaced = _IDENT_SPLIT.sub(" ", name)
+    return {t for t in re.split(r"[^0-9A-Za-z]+", spaced.lower()) if t}
+
+
+# =============================================================================
+# SCORE NORMALIZATION
+# =============================================================================
+
+
+def _squash_score(score: float) -> float:
+    """
+    Map an arbitrary reranker score into [0, 1].
+
+    Scores already in [0, 1] (ColBERT cosine MaxSim, normalized rerankers) pass through
+    unchanged so that well-behaved rerankers keep their calibration. Anything outside
+    that range is assumed to be a raw logit and goes through a logistic sigmoid, which
+    is monotonic -- so it never changes the candidate ORDER, only the magnitudes that
+    feed the weighted confidence and the auto-approve threshold.
+
+    A per-query min-max normalization was deliberately rejected here: it would force
+    the top candidate to exactly 1.0 for every field, making confidence meaningless
+    across fields and defeating the whole point of a calibrated threshold.
+    """
+    if 0.0 <= score <= 1.0:
+        return float(score)
+    # Guard against overflow warnings on extreme logits.
+    if score < -30.0:
+        return 0.0
+    if score > 30.0:
+        return 1.0
+    return float(1.0 / (1.0 + math.exp(-score)))
 
 
 # =============================================================================
@@ -168,6 +295,9 @@ class NexusMatcher:
 
         # State
         self._dictionary_entries: dict[str, DictionaryEntry] = {}
+        self._indexed_ids: set[str] = set()
+        # Maps a synthetic alias document id back to the entry that owns it.
+        self._alias_owner: dict[str, str] = {}
         self._is_initialized = False
 
     @classmethod
@@ -182,23 +312,25 @@ class NexusMatcher:
             Configured NexusMatcher instance
         """
         # Import infrastructure components
+        from nexus_matcher.infrastructure.adapters.dictionary_loaders.excel import (
+            CsvDictionaryLoader,
+            ExcelDictionaryLoader,
+        )
         from nexus_matcher.infrastructure.adapters.embedding_providers.sentence_transformers import (
             SentenceTransformersProvider,
         )
-        from nexus_matcher.infrastructure.adapters.vector_stores.memory import InMemoryVectorStore
-        from nexus_matcher.infrastructure.adapters.sparse_retrievers.bm25 import BM25Retriever
         from nexus_matcher.infrastructure.adapters.schema_parsers.avro import AvroSchemaParser
-        from nexus_matcher.infrastructure.adapters.dictionary_loaders.excel import (
-            ExcelDictionaryLoader,
-            CsvDictionaryLoader,
-        )
+        from nexus_matcher.infrastructure.adapters.sparse_retrievers.bm25 import BM25Retriever
+        from nexus_matcher.infrastructure.adapters.vector_stores.memory import InMemoryVectorStore
 
         # Create components with defaults
         embedding_provider = SentenceTransformersProvider()
-        vector_store = InMemoryVectorStore(VectorStoreConfig(
-            collection_name="dictionary",
-            dimension=embedding_provider.dimension,
-        ))
+        vector_store = InMemoryVectorStore(
+            VectorStoreConfig(
+                collection_name="dictionary",
+                dimension=embedding_provider.dimension,
+            )
+        )
         sparse_retriever = BM25Retriever()
 
         # Register parsers and loaders
@@ -269,8 +401,23 @@ class NexusMatcher:
         # Store entries
         self._dictionary_entries = {e.id: e for e in entries}
 
-        # Generate embeddings
+        # Index-time enrichment: extra rows holding fabricated technical spellings of
+        # each entry's business name. They are indexed as ordinary vectors but carry a
+        # synthetic id, and `_alias_owner` maps them back so retrieval can max-pool per
+        # entry. See domain/services/alias_generation for why this is done on the
+        # dictionary side rather than by expanding the query.
+        self._alias_owner = {}
+        alias_rows: list[tuple[str, str]] = []
+        if self._config.dictionary_alias_count > 0:
+            alias_rows = expand_dictionary(
+                [(e.id, e.business_name) for e in entries],
+                max_aliases=self._config.dictionary_alias_count,
+            )
+
+        # Generate embeddings for the primary texts and the aliases in ONE batch.
         texts = [e.to_searchable_text() for e in entries]
+        texts.extend(alias for _, alias in alias_rows)
+
         embed_result = self._embedding_provider.embed(texts)
         if embed_result.is_failure:
             raise RuntimeError(f"Embedding failed: {embed_result.error}")
@@ -292,9 +439,39 @@ class NexusMatcher:
             for i, entry in enumerate(entries)
         ]
 
+        offset = len(entries)
+        for j, (owner_id, alias) in enumerate(alias_rows):
+            alias_id = f"{owner_id}\x00alias{j}"
+            self._alias_owner[alias_id] = owner_id
+            owner = self._dictionary_entries[owner_id]
+            docs.append(
+                VectorDocument(
+                    id=alias_id,
+                    embedding=embeddings.embeddings[offset + j],
+                    payload={
+                        "business_name": owner.business_name,
+                        "logical_name": owner.logical_name,
+                        "data_type": owner.data_type.value,
+                        "domain": owner.domain,
+                        "alias_of": owner_id,
+                        "alias_text": alias,
+                    },
+                )
+            )
+
+        # Drop any previously indexed vectors first. `_dictionary_entries` is REPLACED
+        # above, but the vector store was only ever upserted into, so loading a second
+        # dictionary left the first one's vectors searchable while their entries were no
+        # longer resolvable -- producing silent misses and stale matches.
+        clear_result = self._vector_store.delete(list(self._indexed_ids))
+        if clear_result.is_failure:
+            raise RuntimeError(f"Failed to clear previous index: {clear_result.error}")
+
         upsert_result = self._vector_store.upsert(docs)
         if upsert_result.is_failure:
             raise RuntimeError(f"Vector indexing failed: {upsert_result.error}")
+
+        self._indexed_ids = {entry.id for entry in entries} | set(self._alias_owner)
 
         # Index in sparse retriever
         if self._sparse_retriever:
@@ -306,7 +483,12 @@ class NexusMatcher:
                 )
                 for entry in entries
             ]
-            self._sparse_retriever.index(sparse_docs)
+            # index() REPLACES the sparse index, so no explicit clear is needed here.
+            # The Result was previously discarded: a failed sparse build left the
+            # matcher running dense-only with no indication anything had gone wrong.
+            sparse_result = self._sparse_retriever.index(sparse_docs)
+            if sparse_result.is_failure:
+                raise RuntimeError(f"Sparse indexing failed: {sparse_result.error}")
 
         self._is_initialized = True
 
@@ -331,11 +513,38 @@ class NexusMatcher:
         # Parse schema
         schema = self._parse_schema(schema_source, schema_format)
 
-        # Match each field
-        results: dict[str, tuple[MatchResult, ...]] = {}
+        return self._match_fields(schema.fields)
 
-        for field in schema.fields:
-            field_results = self._match_field(field)
+    def _match_fields(
+        self,
+        fields: Sequence[SchemaField],
+    ) -> dict[str, tuple[MatchResult, ...]]:
+        """
+        Match a batch of fields, encoding all queries in a single call.
+
+        Transformer encoders are throughput-bound by batch size on CPU: encoding one
+        text at a time reaches ~128 texts/sec where a batch of 128 reaches ~1690.
+        Building every query string first and embedding them together is what turns a
+        per-field loop into a batched pipeline.
+        """
+        if not fields:
+            return {}
+
+        query_texts = [self._build_query_text(f) for f in fields]
+
+        embeddings: list[np.ndarray] | None = None
+        embed_result = self._embedding_provider.embed(query_texts)
+        if embed_result.is_success:
+            batch = embed_result.unwrap()
+            embeddings = [batch.embeddings[i] for i in range(len(query_texts))]
+
+        results: dict[str, tuple[MatchResult, ...]] = {}
+        for i, field in enumerate(fields):
+            field_results = self._match_field(
+                field,
+                query_text=query_texts[i],
+                query_embedding=embeddings[i] if embeddings is not None else None,
+            )
             results[field.full_path] = tuple(field_results)
 
         return results
@@ -355,10 +564,16 @@ class NexusMatcher:
         Returns:
             Complete MatchingSession with all results and metrics
         """
+        if not self._is_initialized:
+            raise RuntimeError("Dictionary not loaded. Call load_dictionary() first.")
+
         start_time = time.time()
 
+        # Parse once and match the parsed fields directly. Calling match_schema() here
+        # re-parsed the same source a second time, doubling parse cost and risking a
+        # mismatch between the returned schema and the results computed from it.
         schema = self._parse_schema(schema_source, schema_format)
-        results = self.match_schema(schema_source, schema_format)
+        results = self._match_fields(schema.fields)
 
         duration_ms = (time.time() - start_time) * 1000
 
@@ -407,25 +622,45 @@ class NexusMatcher:
 
         return result.unwrap()
 
-    def _match_field(self, field: SchemaField) -> list[MatchResult]:
-        """Match a single field against the dictionary."""
+    def _build_query_text(self, field: SchemaField) -> str:
+        """
+        Build the retrieval query text for a field.
+
+        Hierarchical context is injected first (GAP-006): a bare field name like
+        `sname` carries almost no signal, while `satscores sname` is unambiguous. On the
+        combined BIRD+OMOP benchmark this parent-path context is worth +20 points of
+        P@1 -- by far the largest single accuracy factor in the pipeline.
+        """
+        enriched_query = self._context_enricher.enrich(field)
+
+        if not self._config.expand_query_abbreviations:
+            return enriched_query
+
+        return self._abbreviation_expander.expand(enriched_query).expanded
+
+    def _match_field(
+        self,
+        field: SchemaField,
+        query_text: str | None = None,
+        query_embedding: np.ndarray | None = None,
+    ) -> list[MatchResult]:
+        """
+        Match a single field against the dictionary.
+
+        `query_text` and `query_embedding` may be supplied by the caller so that a whole
+        schema's embeddings can be produced in one batched encoder call; encoding fields
+        one at a time costs roughly 13x throughput on CPU.
+        """
         start_time = time.time()
 
-        # Generate enriched query text with hierarchical context (GAP-006)
-        # Research: Context injection is non-negotiable for nested schemas
-        # "For user.addresses[].street_name, include 'user entity, addresses array, street_name field'"
-        enriched_query = self._context_enricher.enrich(field)
-        
-        # Apply abbreviation expansion
-        expanded = self._abbreviation_expander.expand(enriched_query)
-        query_text = expanded.expanded
+        if query_text is None:
+            query_text = self._build_query_text(field)
 
-        # Generate embedding
-        embed_result = self._embedding_provider.embed_single(query_text)
-        if embed_result.is_failure:
-            return []
-
-        query_embedding = embed_result.unwrap()
+        if query_embedding is None:
+            embed_result = self._embedding_provider.embed_single(query_text)
+            if embed_result.is_failure:
+                return []
+            query_embedding = embed_result.unwrap()
 
         # Dense retrieval
         dense_results = self._vector_store.search(
@@ -436,6 +671,26 @@ class NexusMatcher:
             return []
 
         dense_candidates = dense_results.unwrap()
+
+        # Collapse alias hits onto the entry that owns them, keeping the BEST score per
+        # entry (max-pool). Without this an entry could occupy several of the top-k slots
+        # with different spellings of itself, crowding out real alternatives.
+        # Primary-document score per entry, tracked separately from the pooled score
+        # so the stricter confidence policy documented below remains available.
+        primary_scores: dict[str, float] = {}
+        if self._alias_owner:
+            best: dict[str, SearchResult] = {}
+            for r in dense_candidates:
+                owner = self._alias_owner.get(r.id, r.id)
+                if r.id == owner:
+                    # This hit is the entry's own text, not a fabricated alias.
+                    primary_scores[owner] = r.score
+                current = best.get(owner)
+                if current is None or r.score > current.score:
+                    best[owner] = SearchResult(
+                        id=owner, score=r.score, payload=r.payload, embedding=r.embedding
+                    )
+            dense_candidates = sorted(best.values(), key=lambda r: r.score, reverse=True)
 
         # Sparse retrieval (if available)
         sparse_candidates: dict[str, float] = {}
@@ -459,7 +714,7 @@ class NexusMatcher:
                     text=self._dictionary_entries[doc_id].to_searchable_text(),
                     initial_score=score,
                 )
-                for doc_id, score in fused[:self._config.colbert_top_k]
+                for doc_id, score in fused[: self._config.colbert_top_k]
             ]
 
             rerank_result = self._reranker.rerank(
@@ -470,43 +725,77 @@ class NexusMatcher:
 
             if rerank_result.is_success:
                 reranked = rerank_result.unwrap()
-                fused = [(r.id, r.score) for r in reranked]
+                # Reranker scores are UNBOUNDED (cross-encoder logits can be negative or
+                # far above 1; ColBERT MaxSim is a sum over query tokens). They feed
+                # `semantic_score`, which carries 70% of the final confidence weight, so
+                # they must be squashed into [0, 1] first. Without this, min(score, 1.0)
+                # saturated every plausible candidate to the same value and turned
+                # `final_confidence` into a sign test on the raw logit.
+                fused = [(r.id, _squash_score(r.score)) for r in reranked]
 
-        # Score and create results
-        latency_ms = (time.time() - start_time) * 1000
-        results: list[MatchResult] = []
+        # Score every surviving candidate, then rank by the multi-signal confidence.
+        # Previously the loop scored only the first `results_per_field` entries and
+        # emitted them in retrieval order, so the lexical/edit/type/domain signals
+        # (30% of the weight) could never change which entry came back first.
+        candidate_pool = fused[
+            : max(self._config.cross_encoder_top_k, self._config.results_per_field)
+        ]
 
-        for rank, (doc_id, retrieval_score) in enumerate(fused[:self._config.results_per_field], 1):
+        scored: list[tuple[float, ScoreBreakdown, DictionaryEntry]] = []
+        for doc_id, retrieval_score in candidate_pool:
             entry = self._dictionary_entries.get(doc_id)
             if entry is None:
                 continue
 
-            # Calculate detailed scores
-            score_breakdown = self._calculate_scores(
-                field, entry, query_embedding, retrieval_score
-            )
-
-            # Calculate final confidence
+            # NOTE on aliasing and confidence. Ranking uses the max-pooled score, which
+            # reports an entry's best-matching fabricated alias. Confidence uses it too,
+            # and that is a deliberate compromise rather than an oversight:
+            #
+            #   pooled score -> confidence : ~91% max auto-approve precision, 15% coverage
+            #   primary score -> confidence: ~95% precision but only 2.9% coverage
+            #
+            # Routing confidence through the primary text alone is more principled -- an
+            # entry that only won via a fabricated spelling genuinely deserves less
+            # confidence -- but it suppresses precisely the fields aliasing rescued, and
+            # coverage collapses. `primary_scores` is computed and kept available for
+            # callers that want the stricter behaviour.
+            #
+            # If a >=95% auto-approve guarantee matters more than ranking quality, set
+            # dictionary_alias_count = 0: that restores 0.953 precision at 12.4% coverage
+            # at the cost of ~2 points of P@1 (~4 on abbreviation-heavy schemas).
+            score_breakdown = self._calculate_scores(field, entry, query_embedding, retrieval_score)
             final_confidence = self._calculate_final_confidence(score_breakdown)
+            scored.append((final_confidence, score_breakdown, entry))
 
-            # Determine decision
-            decision = self._determine_decision(final_confidence, rank, results)
+        # Stable sort by confidence descending; ties keep upstream retrieval order.
+        scored.sort(key=lambda x: x[0], reverse=True)
 
-            results.append(MatchResult(
-                schema_field=field,
-                dictionary_entry=entry,
-                rank=rank,
-                final_confidence=final_confidence,
-                score_breakdown=score_breakdown,
-                decision=decision,
-                performance=PerformanceMetrics(
-                    latency_ms=latency_ms,
-                    cache_hit=False,
-                    retrieval_stage="reranked" if self._reranker else "fused",
-                    candidates_evaluated=len(fused),
-                    reranking_applied=self._reranker is not None,
-                ),
-            ))
+        latency_ms = (time.time() - start_time) * 1000
+        results: list[MatchResult] = []
+
+        for rank, (final_confidence, score_breakdown, entry) in enumerate(
+            scored[: self._config.results_per_field], 1
+        ):
+            runner_up = scored[rank][0] if rank < len(scored) else None
+            decision = self._determine_decision(final_confidence, rank, runner_up)
+
+            results.append(
+                MatchResult(
+                    schema_field=field,
+                    dictionary_entry=entry,
+                    rank=rank,
+                    final_confidence=final_confidence,
+                    score_breakdown=score_breakdown,
+                    decision=decision,
+                    performance=PerformanceMetrics(
+                        latency_ms=latency_ms,
+                        cache_hit=False,
+                        retrieval_stage="reranked" if self._reranker else "fused",
+                        candidates_evaluated=len(fused),
+                        reranking_applied=self._reranker is not None,
+                    ),
+                )
+            )
 
         return results
 
@@ -515,37 +804,45 @@ class NexusMatcher:
         dense: list[SearchResult],
         sparse: dict[str, float],
     ) -> list[tuple[str, float]]:
-        """Fuse dense and sparse retrieval results."""
-        # Convex combination fusion
+        """
+        Fuse dense and sparse retrieval results.
+
+        Uses weighted linear combination over MIN-MAX normalized scores, delegating to
+        the shared HybridFuser so fusion lives in one place.
+
+        Two deliberate choices, both measured on the combined BIRD+OMOP benchmark
+        (benchmarks/exp_fusion.py, 793 labelled queries):
+
+        1. NOT Reciprocal Rank Fusion, despite RRF being the conventional default. RRF
+           keeps only rank and throws away score magnitude, so a confidently-correct
+           dense hit gets averaged against a confidently-wrong lexical hit. Measured
+           P@1: rrf 0.610, dense-alone 0.691, linear 0.702. RRF was the WORST method
+           tried and was worse than using no fusion at all.
+
+        2. Min-max rather than max-only normalization. Dividing by the max alone leaves
+           a floor that varies per query, so scores are not comparable across the two
+           arms; BM25 scores in particular never approach zero for a matched query.
+
+        The 0.9 dense weight is the sweep optimum for P@1. If you tune for recall
+        instead (e.g. to feed a reranker), balanced combsum scored higher R@10 (0.923
+        vs 0.911) -- re-run the sweep rather than assuming.
+        """
+        from nexus_matcher.core.fusion import FusionConfig, FusionMethod, HybridFuser
+
+        dense_results = [(r.id, r.score) for r in dense]
+        sparse_results = sorted(sparse.items(), key=lambda x: x[1], reverse=True)
+
         alpha = self._config.fusion_alpha
-
-        # Normalize scores
-        max_dense = max((r.score for r in dense), default=1.0)
-        max_sparse = max(sparse.values(), default=1.0) if sparse else 1.0
-
-        fused_scores: dict[str, float] = {}
-
-        # Add dense scores
-        for r in dense:
-            normalized = r.score / max_dense if max_dense > 0 else 0
-            fused_scores[r.id] = alpha * normalized
-
-        # Add sparse scores
-        for doc_id, score in sparse.items():
-            normalized = score / max_sparse if max_sparse > 0 else 0
-            if doc_id in fused_scores:
-                fused_scores[doc_id] += (1 - alpha) * normalized
-            else:
-                fused_scores[doc_id] = (1 - alpha) * normalized
-
-        # Sort by fused score
-        sorted_results = sorted(
-            fused_scores.items(),
-            key=lambda x: x[1],
-            reverse=True,
+        fuser = HybridFuser(
+            config=FusionConfig(
+                method=FusionMethod.LINEAR,
+                semantic_weight=alpha,
+                lexical_weight=1.0 - alpha,
+                normalize=True,
+            )
         )
 
-        return sorted_results
+        return [(item.id, item.score) for item in fuser.fuse(dense_results, sparse_results)]
 
     def _calculate_scores(
         self,
@@ -558,10 +855,14 @@ class NexusMatcher:
         # Semantic score from retrieval
         semantic_score = min(retrieval_score, 1.0)
 
-        # Lexical score (simple token overlap)
-        field_tokens = set(field.name.lower().replace("_", " ").split())
-        entry_tokens = set(entry.logical_name.lower().replace("_", " ").split())
-        entry_tokens.update(entry.business_name.lower().split())
+        # Lexical score (token overlap).
+        # Identifiers must be split on case and digit boundaries, not just underscores:
+        # `.replace("_", " ")` leaves "NumTstTakr" and "enroll12" as single tokens, so
+        # every camelCase schema (Avro, JSON Schema, most SQL Server DDL) scored 0
+        # lexical overlap no matter how well it actually matched.
+        field_tokens = _tokenize_identifier(field.name)
+        entry_tokens = _tokenize_identifier(entry.logical_name)
+        entry_tokens |= _tokenize_identifier(entry.business_name)
 
         if field_tokens and entry_tokens:
             intersection = field_tokens & entry_tokens
@@ -569,10 +870,11 @@ class NexusMatcher:
         else:
             lexical_score = 0.0
 
-        # Edit distance score
+        # Edit distance score. Compare on the normalized token strings so that
+        # "NumTstTakr" and "num_tst_takr" are not penalized for punctuation alone.
         edit_distance_score = self._edit_distance_score(
-            field.name.lower(),
-            entry.logical_name.lower(),
+            " ".join(sorted(field_tokens)),
+            " ".join(sorted(_tokenize_identifier(entry.logical_name))),
         )
 
         # Type compatibility
@@ -693,30 +995,45 @@ class NexusMatcher:
         return None
 
     def _edit_distance_score(self, s1: str, s2: str) -> float:
-        """Calculate normalized edit distance score."""
+        """
+        Calculate normalized edit distance score.
+
+        Uses rapidfuzz's C++ Levenshtein when available (~145x faster than the pure
+        Python DP below, bit-identical results), falling back to the DP so the package
+        still works without the optional dependency. This is on the hot path: it runs
+        once per candidate per field.
+        """
         if not s1 or not s2:
             return 0.0
 
-        # Levenshtein distance
+        if _LEVENSHTEIN is not None:
+            return float(_LEVENSHTEIN.normalized_similarity(s1, s2))
+
+        return self._edit_distance_score_fallback(s1, s2)
+
+    @staticmethod
+    def _edit_distance_score_fallback(s1: str, s2: str) -> float:
+        """Pure-Python Levenshtein, used only when rapidfuzz is unavailable."""
         m, n = len(s1), len(s2)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
 
-        for i in range(m + 1):
-            dp[i][0] = i
-        for j in range(n + 1):
-            dp[0][j] = j
+        # Single-row DP: O(min(m, n)) memory instead of a full (m+1)x(n+1) matrix.
+        if m < n:
+            s1, s2 = s2, s1
+            m, n = n, m
 
+        previous = list(range(n + 1))
         for i in range(1, m + 1):
+            current = [i] + [0] * n
+            c1 = s1[i - 1]
             for j in range(1, n + 1):
-                if s1[i-1] == s2[j-1]:
-                    dp[i][j] = dp[i-1][j-1]
+                if c1 == s2[j - 1]:
+                    current[j] = previous[j - 1]
                 else:
-                    dp[i][j] = 1 + min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1])
+                    current[j] = 1 + min(previous[j], current[j - 1], previous[j - 1])
+            previous = current
 
-        distance = dp[m][n]
         max_len = max(m, n)
-
-        return 1.0 - (distance / max_len) if max_len > 0 else 1.0
+        return 1.0 - (previous[n] / max_len) if max_len > 0 else 1.0
 
     def _calculate_final_confidence(self, scores: ScoreBreakdown) -> float:
         """Calculate weighted final confidence score."""
@@ -736,22 +1053,32 @@ class NexusMatcher:
         self,
         confidence: float,
         rank: int,
-        existing_results: list[MatchResult],
+        runner_up_confidence: float | None,
     ) -> MatchDecision:
-        """Determine match decision based on confidence and gap."""
+        """
+        Determine match decision from confidence and the margin over the next candidate.
+
+        Only the top-ranked match can be auto-approved, and only when it is BOTH
+        confident enough and clearly ahead of the runner-up. `min_confidence_gap`
+        exists to catch the ambiguous case where two dictionary entries score almost
+        identically -- exactly the situation a human should adjudicate. Previously the
+        gap was compared against already-emitted lower-ranked results, so it could
+        never prevent an ambiguous rank-1 auto-approval; a near-tie was silently
+        auto-approved.
+        """
         config = self._config
 
-        # Auto-approve if high confidence and significant gap
-        if confidence >= config.auto_approve_threshold:
-            if rank == 1:
+        if rank == 1 and confidence >= config.auto_approve_threshold:
+            margin = (
+                confidence - runner_up_confidence
+                if runner_up_confidence is not None
+                else float("inf")
+            )
+            if margin >= config.min_confidence_gap:
                 return MatchDecision.AUTO_APPROVE
-            # Check gap from top result
-            if existing_results:
-                gap = existing_results[0].final_confidence - confidence
-                if gap >= config.min_confidence_gap:
-                    return MatchDecision.REJECT
+            # Confident but ambiguous: send it to a human rather than guessing.
+            return MatchDecision.REVIEW
 
-        # Review if medium confidence
         if confidence >= config.review_threshold:
             return MatchDecision.REVIEW
 

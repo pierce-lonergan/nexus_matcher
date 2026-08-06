@@ -5,16 +5,18 @@ Tests: Redis cache | Target: src/infrastructure/adapters/caches/redis.py
 TDD Phase: RED → Tests written before implementation
 """
 
-import pytest
 import json
 from datetime import timedelta
-from unittest.mock import Mock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
-from nexus_matcher.domain.ports.cache import CacheConfig, CacheStats
+import pytest
+
+from nexus_matcher.domain.ports.cache import CacheConfig
 
 # Check if redis is available
 try:
     import redis
+
     REDIS_AVAILABLE = True
 except ImportError:
     REDIS_AVAILABLE = False
@@ -31,7 +33,7 @@ class TestRedisCacheProperties:
         )
 
         config = CacheConfig()
-        
+
         with patch("nexus_matcher.infrastructure.adapters.caches.redis.redis.Redis"):
             cache = RedisCache(config, host="localhost", port=6379)
             assert cache.cache_type == "redis"
@@ -67,7 +69,7 @@ class TestRedisCacheConnection:
         config = CacheConfig()
 
         with patch("nexus_matcher.infrastructure.adapters.caches.redis.redis.Redis") as mock_redis:
-            cache = RedisCache(config, host="localhost", port=6379)
+            RedisCache(config, host="localhost", port=6379)
             mock_redis.assert_called_once()
 
     @pytest.mark.skipif(not REDIS_AVAILABLE, reason="redis not installed")
@@ -79,8 +81,10 @@ class TestRedisCacheConnection:
 
         config = CacheConfig()
 
-        with patch("nexus_matcher.infrastructure.adapters.caches.redis.redis.Redis.from_url") as mock_from_url:
-            cache = RedisCache(config, url="redis://localhost:6379/0")
+        with patch(
+            "nexus_matcher.infrastructure.adapters.caches.redis.redis.Redis.from_url"
+        ) as mock_from_url:
+            RedisCache(config, url="redis://localhost:6379/0")
             mock_from_url.assert_called_once()
 
 

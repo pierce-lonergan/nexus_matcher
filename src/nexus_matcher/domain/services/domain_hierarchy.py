@@ -20,10 +20,10 @@ Domain hierarchy service for computing domain-based matching scores.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Iterator
+from dataclasses import dataclass
 from enum import Enum
-from typing import ClassVar, Iterator
-
+from typing import ClassVar
 
 # =============================================================================
 # ENUMS
@@ -33,11 +33,11 @@ from typing import ClassVar, Iterator
 class DomainRelationship(Enum):
     """Types of relationships between domains."""
 
-    EXACT = "exact"          # Same domain
-    PARENT = "parent"        # Domain1 is parent of Domain2
-    CHILD = "child"          # Domain1 is child of Domain2
-    SIBLING = "sibling"      # Share immediate parent
-    COUSIN = "cousin"        # Share ancestor within 2 levels
+    EXACT = "exact"  # Same domain
+    PARENT = "parent"  # Domain1 is parent of Domain2
+    CHILD = "child"  # Domain1 is child of Domain2
+    SIBLING = "sibling"  # Share immediate parent
+    COUSIN = "cousin"  # Share ancestor within 2 levels
     UNRELATED = "unrelated"  # No common ancestor or distant
 
 

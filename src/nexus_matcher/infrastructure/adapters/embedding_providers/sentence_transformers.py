@@ -15,7 +15,7 @@ SentenceTransformers embedding provider implementation.
 
 from __future__ import annotations
 
-from typing import Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -93,12 +93,13 @@ class SentenceTransformersProvider(BaseEmbeddingProvider):
             raise ImportError(
                 "sentence-transformers is required. "
                 "Install with: pip install nexus-matcher[embeddings]"
-            )
+            ) from None
 
         # Determine device
         device = self._device
         if device is None or device == "auto":
             import torch
+
             if torch.cuda.is_available():
                 device = "cuda"
             elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():

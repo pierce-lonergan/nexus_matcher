@@ -1,0 +1,22 @@
+{
+  "benchmark": "combined",
+  "model": "BAAI/bge-small-en-v1.5",
+  "sparse": true,
+  "query_prefix": true,
+  "p_at_1": 0.5813953488372093,
+  "p_at_5": 0.8255813953488372,
+  "mrr_at_10": 0.6852522840531557,
+  "recall": {
+    "1": 0.5813953488372093,
+    "5": 0.8255813953488372,
+    "10": 0.877906976744186
+  },
+  "fields_per_sec": 364.1827918124485,
+  "index_seconds": 2.0665654000185896,
+  "decisions": {
+    "AUTO_APPROVE": 85,
+    "REVIEW": 603,
+    "REJECT": 0
+  },
+  "auto_approve_precision": 0.9529411764705882
+}

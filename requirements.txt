@@ -31,6 +31,11 @@ openpyxl>=3.1.0           # Excel file support
 rank-bm25>=0.2.2          # BM25 algorithm
 
 # =============================================================================
+# NATIVE ACCELERATORS (optional - pure-Python fallbacks exist)
+# =============================================================================
+rapidfuzz>=3.0.0          # C++ Levenshtein, ~145x faster than the DP fallback
+
+# =============================================================================
 # CACHING (GAP-003, GAP-004, GAP-005)
 # =============================================================================
 # blake3 is optional - falls back to hashlib.sha256 if not available
@@ -57,12 +62,13 @@ pytest>=7.4.0
 pytest-cov>=4.1.0
 pytest-asyncio>=0.21.0
 pytest-mock>=3.11.0
+pytest-timeout>=2.1.0     # Integration job runs pytest --timeout=120
 httpx>=0.24.0             # For testing FastAPI
 
 # =============================================================================
 # OPTIONAL: Embedding Providers (uncomment if needed)
 # =============================================================================
-# sentence-transformers>=2.2.0,<3.0.0
+# sentence-transformers>=2.2.0    # no upper cap: 5.x is what this is benchmarked on
 # torch>=2.0.0
 # transformers>=4.30.0
 

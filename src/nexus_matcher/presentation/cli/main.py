@@ -16,9 +16,8 @@ Command-line interface for NexusMatcher using Typer.
 from __future__ import annotations
 
 import json
-import sys
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 import typer
 from rich import print as rprint
@@ -47,6 +46,7 @@ def version_callback(value: bool) -> None:
     """Show version and exit."""
     if value:
         from nexus_matcher import __version__
+
         rprint(f"[bold blue]NexusMatcher[/bold blue] version [green]{__version__}[/green]")
         raise typer.Exit()
 
@@ -56,7 +56,8 @@ def main(
     version: Annotated[
         bool,
         typer.Option(
-            "--version", "-v",
+            "--version",
+            "-v",
             help="Show version and exit",
             callback=version_callback,
             is_eager=True,
@@ -89,30 +90,34 @@ def match(
     dictionary: Annotated[
         Path,
         typer.Option(
-            "--dictionary", "-d",
+            "--dictionary",
+            "-d",
             help="Path to data dictionary file (Excel, CSV)",
             exists=True,
             readable=True,
         ),
     ],
     output: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
-            "--output", "-o",
+            "--output",
+            "-o",
             help="Output file path (JSON or CSV)",
         ),
     ] = None,
     format: Annotated[
         str,
         typer.Option(
-            "--format", "-f",
+            "--format",
+            "-f",
             help="Output format: json, csv, table",
         ),
     ] = "table",
     top_k: Annotated[
         int,
         typer.Option(
-            "--top-k", "-k",
+            "--top-k",
+            "-k",
             help="Number of matches per field",
             min=1,
             max=20,
@@ -121,7 +126,8 @@ def match(
     threshold: Annotated[
         float,
         typer.Option(
-            "--threshold", "-t",
+            "--threshold",
+            "-t",
             help="Minimum confidence threshold",
             min=0.0,
             max=1.0,
@@ -130,7 +136,8 @@ def match(
     verbose: Annotated[
         bool,
         typer.Option(
-            "--verbose", "-V",
+            "--verbose",
+            "-V",
             help="Show detailed output",
         ),
     ] = False,
@@ -186,16 +193,19 @@ def match(
         # Summary
         total_fields = len(results)
         auto_approved = sum(
-            1 for matches in results.values()
+            1
+            for matches in results.values()
             if matches and matches[0].decision.value == "AUTO_APPROVE"
         )
-        rprint(f"\n[bold]Summary:[/bold] {auto_approved}/{total_fields} fields auto-approved ({auto_approved/total_fields*100:.1f}%)")
+        rprint(
+            f"\n[bold]Summary:[/bold] {auto_approved}/{total_fields} fields auto-approved ({auto_approved / total_fields * 100:.1f}%)"
+        )
 
     except Exception as e:
         rprint(f"[red]Error: {e}[/red]")
         if verbose:
             console.print_exception()
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
 
 # =============================================================================
@@ -214,16 +224,18 @@ def sync(
         ),
     ],
     output_dir: Annotated[
-        Optional[Path],
+        Path | None,
         typer.Option(
-            "--output-dir", "-o",
+            "--output-dir",
+            "-o",
             help="Directory for index files",
         ),
     ] = None,
     verbose: Annotated[
         bool,
         typer.Option(
-            "--verbose", "-V",
+            "--verbose",
+            "-V",
             help="Show detailed output",
         ),
     ] = False,
@@ -267,13 +279,13 @@ def sync(
             if len(stats.errors) > 10:
                 rprint(f"  [dim]... and {len(stats.errors) - 10} more[/dim]")
 
-        rprint(f"\n[green]✓ Dictionary synced successfully[/green]")
+        rprint("\n[green]✓ Dictionary synced successfully[/green]")
 
     except Exception as e:
         rprint(f"[red]Error: {e}[/red]")
         if verbose:
             console.print_exception()
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
 
 # =============================================================================
@@ -286,28 +298,32 @@ def api(
     host: Annotated[
         str,
         typer.Option(
-            "--host", "-h",
+            "--host",
+            "-h",
             help="Bind host",
         ),
     ] = "0.0.0.0",
     port: Annotated[
         int,
         typer.Option(
-            "--port", "-p",
+            "--port",
+            "-p",
             help="Bind port",
         ),
     ] = 8000,
     reload: Annotated[
         bool,
         typer.Option(
-            "--reload", "-r",
+            "--reload",
+            "-r",
             help="Enable auto-reload for development",
         ),
     ] = False,
     workers: Annotated[
         int,
         typer.Option(
-            "--workers", "-w",
+            "--workers",
+            "-w",
             help="Number of worker processes",
             min=1,
         ),
@@ -323,7 +339,7 @@ def api(
     try:
         import uvicorn
 
-        rprint(f"[bold blue]Starting NexusMatcher API[/bold blue]")
+        rprint("[bold blue]Starting NexusMatcher API[/bold blue]")
         rprint(f"  Host: [green]{host}[/green]")
         rprint(f"  Port: [green]{port}[/green]")
         rprint(f"  Reload: [green]{reload}[/green]")
@@ -341,11 +357,13 @@ def api(
         )
 
     except ImportError:
-        rprint("[red]Error: uvicorn not installed. Install with: pip install nexus-matcher[api][/red]")
-        raise typer.Exit(1)
+        rprint(
+            "[red]Error: uvicorn not installed. Install with: pip install nexus-matcher[api][/red]"
+        )
+        raise typer.Exit(1) from None
     except Exception as e:
         rprint(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
+        raise typer.Exit(1) from e
 
 
 # =============================================================================
@@ -392,6 +410,7 @@ def info() -> None:
 def _get_matcher():
     """Get or create matcher instance."""
     from nexus_matcher.application.use_cases.match_schema import NexusMatcher
+
     return NexusMatcher.from_config()
 
 
@@ -482,7 +501,7 @@ def _format_csv(results: dict, top_k: int, threshold: float) -> str:
             lines.append(
                 f'"{field_path}",{match.rank},"{match.dictionary_entry.business_name}",'
                 f'"{match.dictionary_entry.logical_name}",{match.final_confidence:.4f},'
-                f'{match.decision.value}'
+                f"{match.decision.value}"
             )
 
     return "\n".join(lines)

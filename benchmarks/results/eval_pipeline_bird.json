@@ -1,0 +1,22 @@
+{
+  "benchmark": "bird",
+  "model": "BAAI/bge-small-en-v1.5",
+  "sparse": true,
+  "query_prefix": true,
+  "p_at_1": 0.6011080332409973,
+  "p_at_5": 0.7894736842105263,
+  "mrr_at_10": 0.6821802312799543,
+  "recall": {
+    "1": 0.6011080332409973,
+    "5": 0.7894736842105263,
+    "10": 0.8476454293628809
+  },
+  "fields_per_sec": 528.4038281779439,
+  "index_seconds": 0.7994146000128239,
+  "decisions": {
+    "AUTO_APPROVE": 75,
+    "REVIEW": 286,
+    "REJECT": 0
+  },
+  "auto_approve_precision": 0.96
+}

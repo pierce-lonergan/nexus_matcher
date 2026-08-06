@@ -19,13 +19,20 @@ Port interface for schema parsing - supports multiple schema formats.
 
 from __future__ import annotations
 
+# `json` must be imported at module scope, not inside parse()'s
+# `if isinstance(content, str)` branch. It was function-local there, so when a
+# dict was passed and _parse_content raised, evaluating the
+# `except json.JSONDecodeError` clause hit UnboundLocalError -- which escaped
+# parse() entirely instead of producing Result.failure. Any parser raising a
+# validation error on dict input crashed its caller rather than returning a
+# failed Result.
+import json
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol, TextIO, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
-from nexus_matcher.domain.models.entities import Schema, SchemaField
+from nexus_matcher.domain.models.entities import Schema
 from nexus_matcher.shared.types.base import Result
-
 
 # =============================================================================
 # SCHEMA PARSER PROTOCOL
@@ -153,11 +160,7 @@ class BaseSchemaParser(ABC):
     def parse(self, content: str | dict[str, Any]) -> Result[Schema]:
         """Parse schema from string or dict."""
         try:
-            if isinstance(content, str):
-                import json
-                parsed = json.loads(content)
-            else:
-                parsed = content
+            parsed = json.loads(content) if isinstance(content, str) else content
 
             schema = self._parse_content(parsed)
             return Result.success(schema)
@@ -177,7 +180,7 @@ class BaseSchemaParser(ABC):
         if path.suffix.lower() not in self.file_extensions:
             return Result.failure(
                 f"Unsupported extension {path.suffix}, expected one of {self.file_extensions}",
-                "UNSUPPORTED_FORMAT"
+                "UNSUPPORTED_FORMAT",
             )
 
         try:
@@ -305,6 +308,7 @@ class SchemaParserRegistry:
                     self.register(parser)
                 except Exception as e:
                     import logging
+
                     logging.warning(f"Failed to load parser {ep.name}: {e}")
         except ImportError:
             pass  # Entry points not available

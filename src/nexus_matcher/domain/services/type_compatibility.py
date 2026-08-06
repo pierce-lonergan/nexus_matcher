@@ -26,7 +26,6 @@ from typing import ClassVar
 
 from nexus_matcher.shared.types.base import DataType
 
-
 # =============================================================================
 # ENUMS
 # =============================================================================
@@ -52,7 +51,7 @@ class TypeCategory(Enum):
 class CompatibilityLevel(Enum):
     """Levels of type compatibility."""
 
-    EXACT = "exact"           # 1.00 - Same type
+    EXACT = "exact"  # 1.00 - Same type
     EQUIVALENT = "equivalent"  # 0.95-0.99 - Semantically identical
     COMPATIBLE = "compatible"  # 0.80-0.94 - Safe conversion
     CONVERTIBLE = "convertible"  # 0.50-0.79 - Possible conversion
@@ -83,31 +82,23 @@ TYPE_TO_CATEGORY: dict[DataType, TypeCategory] = {
     DataType.FLOAT: TypeCategory.NUMERIC,
     DataType.DOUBLE: TypeCategory.NUMERIC,
     DataType.DECIMAL: TypeCategory.NUMERIC,
-
     # String types
     DataType.STRING: TypeCategory.STRING,
-
     # Temporal types
     DataType.DATE: TypeCategory.TEMPORAL,
     DataType.TIMESTAMP: TypeCategory.TEMPORAL,
-
     # Boolean
     DataType.BOOLEAN: TypeCategory.BOOLEAN,
-
     # Binary
     DataType.BYTES: TypeCategory.BINARY,
-
     # Complex types
     DataType.ARRAY: TypeCategory.COMPLEX,
     DataType.RECORD: TypeCategory.COMPLEX,
     DataType.JSON: TypeCategory.COMPLEX,
-
     # Enum type (treat as string-like)
     DataType.ENUM: TypeCategory.STRING,
-
     # UUID type (treat as string-like)
     DataType.UUID: TypeCategory.STRING,
-
     # Unknown
     DataType.UNKNOWN: TypeCategory.NULL,
 }
@@ -155,31 +146,25 @@ COMPATIBILITY_MATRIX: dict[tuple[DataType, DataType], tuple[float, str]] = {
     (DataType.INTEGER, DataType.FLOAT): (0.90, "Integer to float conversion"),
     (DataType.INTEGER, DataType.DOUBLE): (0.90, "Integer to double conversion"),
     (DataType.INTEGER, DataType.DECIMAL): (0.85, "Integer to decimal conversion"),
-
     (DataType.LONG, DataType.INTEGER): (0.75, "Narrowing conversion (possible overflow)"),
     (DataType.LONG, DataType.FLOAT): (0.85, "Long to float (precision loss)"),
     (DataType.LONG, DataType.DOUBLE): (0.90, "Long to double conversion"),
     (DataType.LONG, DataType.DECIMAL): (0.85, "Long to decimal conversion"),
-
     (DataType.FLOAT, DataType.INTEGER): (0.70, "Float to integer truncation"),
     (DataType.FLOAT, DataType.LONG): (0.70, "Float to long truncation"),
     (DataType.FLOAT, DataType.DOUBLE): (0.95, "Widening float to double"),
     (DataType.FLOAT, DataType.DECIMAL): (0.80, "Float to decimal"),
-
     (DataType.DOUBLE, DataType.INTEGER): (0.65, "Double to integer truncation"),
     (DataType.DOUBLE, DataType.LONG): (0.70, "Double to long truncation"),
     (DataType.DOUBLE, DataType.FLOAT): (0.75, "Narrowing double to float"),
     (DataType.DOUBLE, DataType.DECIMAL): (0.80, "Double to decimal"),
-
     (DataType.DECIMAL, DataType.INTEGER): (0.65, "Decimal to integer truncation"),
     (DataType.DECIMAL, DataType.LONG): (0.70, "Decimal to long truncation"),
     (DataType.DECIMAL, DataType.FLOAT): (0.70, "Decimal to float (precision loss)"),
     (DataType.DECIMAL, DataType.DOUBLE): (0.75, "Decimal to double (precision loss)"),
-
     # Temporal conversions
     (DataType.DATE, DataType.TIMESTAMP): (0.85, "Date to timestamp (adds time component)"),
     (DataType.TIMESTAMP, DataType.DATE): (0.70, "Timestamp to date (loses time)"),
-
     # Cross-category conversions (generally lower scores)
     # Numeric to String
     (DataType.INTEGER, DataType.STRING): (0.35, "Integer to string conversion"),
@@ -187,33 +172,28 @@ COMPATIBILITY_MATRIX: dict[tuple[DataType, DataType], tuple[float, str]] = {
     (DataType.FLOAT, DataType.STRING): (0.35, "Float to string conversion"),
     (DataType.DOUBLE, DataType.STRING): (0.35, "Double to string conversion"),
     (DataType.DECIMAL, DataType.STRING): (0.40, "Decimal to string conversion"),
-
     # String to Numeric (parsing required)
     (DataType.STRING, DataType.INTEGER): (0.25, "String to integer (parsing)"),
     (DataType.STRING, DataType.LONG): (0.25, "String to long (parsing)"),
     (DataType.STRING, DataType.FLOAT): (0.25, "String to float (parsing)"),
     (DataType.STRING, DataType.DOUBLE): (0.25, "String to double (parsing)"),
     (DataType.STRING, DataType.DECIMAL): (0.30, "String to decimal (parsing)"),
-
     # Boolean conversions
     (DataType.BOOLEAN, DataType.INTEGER): (0.40, "Boolean to integer (0/1)"),
     (DataType.BOOLEAN, DataType.LONG): (0.40, "Boolean to long (0/1)"),
     (DataType.BOOLEAN, DataType.STRING): (0.45, "Boolean to string (true/false)"),
     (DataType.INTEGER, DataType.BOOLEAN): (0.35, "Integer to boolean"),
     (DataType.STRING, DataType.BOOLEAN): (0.35, "String to boolean (parsing)"),
-
     # Temporal to String
     (DataType.DATE, DataType.STRING): (0.50, "Date to string (format dependent)"),
     (DataType.TIMESTAMP, DataType.STRING): (0.50, "Timestamp to string (format dependent)"),
     (DataType.STRING, DataType.DATE): (0.40, "String to date (parsing)"),
     (DataType.STRING, DataType.TIMESTAMP): (0.40, "String to timestamp (parsing)"),
-
     # UNKNOWN handling (like NULL)
     (DataType.UNKNOWN, DataType.STRING): (0.50, "Unknown can represent string"),
     (DataType.UNKNOWN, DataType.INTEGER): (0.45, "Unknown to numeric (needs default)"),
     (DataType.STRING, DataType.UNKNOWN): (0.45, "String can be unknown"),
     (DataType.INTEGER, DataType.UNKNOWN): (0.40, "Integer can be unknown"),
-
     # Complex types
     (DataType.ARRAY, DataType.JSON): (0.60, "Array to JSON representation"),
     (DataType.RECORD, DataType.JSON): (0.70, "Record to JSON representation"),
@@ -221,15 +201,12 @@ COMPATIBILITY_MATRIX: dict[tuple[DataType, DataType], tuple[float, str]] = {
     (DataType.JSON, DataType.RECORD): (0.65, "JSON to record (if object)"),
     (DataType.ARRAY, DataType.RECORD): (0.20, "Array vs structured record"),
     (DataType.RECORD, DataType.ARRAY): (0.20, "Record vs array"),
-
     # Binary type
     (DataType.BYTES, DataType.STRING): (0.30, "Bytes to string (encoding)"),
     (DataType.STRING, DataType.BYTES): (0.30, "String to bytes (encoding)"),
-
     # UUID special handling
     (DataType.UUID, DataType.STRING): (0.90, "UUID to string representation"),
     (DataType.STRING, DataType.UUID): (0.70, "String to UUID (parsing)"),
-
     # ENUM handling
     (DataType.ENUM, DataType.STRING): (0.85, "Enum to string value"),
     (DataType.STRING, DataType.ENUM): (0.60, "String to enum (if valid)"),
@@ -242,7 +219,6 @@ CATEGORY_CROSS_SCORES: dict[tuple[TypeCategory, TypeCategory], float] = {
     (TypeCategory.STRING, TypeCategory.STRING): 0.90,
     (TypeCategory.TEMPORAL, TypeCategory.TEMPORAL): 0.75,
     (TypeCategory.COMPLEX, TypeCategory.COMPLEX): 0.30,
-
     # Cross-category defaults
     (TypeCategory.NUMERIC, TypeCategory.STRING): 0.30,
     (TypeCategory.STRING, TypeCategory.NUMERIC): 0.25,
@@ -252,7 +228,6 @@ CATEGORY_CROSS_SCORES: dict[tuple[TypeCategory, TypeCategory], float] = {
     (TypeCategory.STRING, TypeCategory.TEMPORAL): 0.35,
     (TypeCategory.BOOLEAN, TypeCategory.STRING): 0.40,
     (TypeCategory.STRING, TypeCategory.BOOLEAN): 0.30,
-
     # Binary vs others (generally low compatibility)
     (TypeCategory.BINARY, TypeCategory.STRING): 0.25,
     (TypeCategory.STRING, TypeCategory.BINARY): 0.25,
@@ -264,7 +239,6 @@ CATEGORY_CROSS_SCORES: dict[tuple[TypeCategory, TypeCategory], float] = {
     (TypeCategory.TEMPORAL, TypeCategory.BINARY): 0.10,
     (TypeCategory.BINARY, TypeCategory.COMPLEX): 0.15,
     (TypeCategory.COMPLEX, TypeCategory.BINARY): 0.15,
-
     # Complex vs others
     (TypeCategory.COMPLEX, TypeCategory.STRING): 0.20,
     (TypeCategory.STRING, TypeCategory.COMPLEX): 0.15,
@@ -274,7 +248,6 @@ CATEGORY_CROSS_SCORES: dict[tuple[TypeCategory, TypeCategory], float] = {
     (TypeCategory.BOOLEAN, TypeCategory.COMPLEX): 0.10,
     (TypeCategory.COMPLEX, TypeCategory.TEMPORAL): 0.15,
     (TypeCategory.TEMPORAL, TypeCategory.COMPLEX): 0.15,
-
     # NULL/UNKNOWN handling
     (TypeCategory.NULL, TypeCategory.STRING): 0.50,
     (TypeCategory.NULL, TypeCategory.NUMERIC): 0.45,

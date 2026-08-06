@@ -2,6 +2,17 @@
 > Chronological record of all enhancement sessions
 > Last Updated: 2025-12-09
 
+
+> **Historical record, preserved as written — do not cite its numbers.**
+> This log is kept for provenance. Several results recorded in it were later found to be
+> unsupported: the cache figures (56.99% hit rate, 99.3% cost reduction) have no
+> artifacts, the INT8 "1.68x / 3.07% accuracy loss" figures appear in no artifact, and
+> the "100% Precision@1" result came from a benchmark that never called `NexusMatcher`.
+> The corrections are recorded in
+> [CHANGELOG.md](../CHANGELOG.md#documentation--retractions) and
+> [BENCHMARK_REGISTRY.md](BENCHMARK_REGISTRY.md). The current measured state is in
+> [PROJECT_STATE.md](PROJECT_STATE.md).
+
 ---
 
 ## Session 0 — 2025-12-09 — INITIALIZATION

@@ -1,0 +1,22 @@
+{
+  "benchmark": "omop",
+  "model": "BAAI/bge-small-en-v1.5",
+  "sparse": true,
+  "query_prefix": true,
+  "p_at_1": 0.5749235474006116,
+  "p_at_5": 0.8868501529051988,
+  "mrr_at_10": 0.7055240036891414,
+  "recall": {
+    "1": 0.5749235474006116,
+    "5": 0.8868501529051988,
+    "10": 0.9357798165137615
+  },
+  "fields_per_sec": 397.68428562652343,
+  "index_seconds": 1.6904325000068638,
+  "decisions": {
+    "AUTO_APPROVE": 0,
+    "REVIEW": 327,
+    "REJECT": 0
+  },
+  "auto_approve_precision": null
+}

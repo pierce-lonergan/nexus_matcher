@@ -25,7 +25,7 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import Any, Generic, TypeVar
+from typing import Any, TypeVar
 
 from nexus_matcher.domain.ports.cache import BaseCache, CacheConfig, CacheStats
 
@@ -63,7 +63,7 @@ class L1LRUCache(BaseCache[Any]):
     Example:
         cache = L1LRUCache()  # Default 5K capacity
         cache.set("embedding_hash", embedding_vector)
-        
+
         result = cache.get("embedding_hash")
         if result is not None:
             # Cache hit - sub-ms latency

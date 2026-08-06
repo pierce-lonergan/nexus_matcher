@@ -3,15 +3,16 @@ tests.integration.test_sql_ddl_integration | Layer: TEST
 Integration tests for SQL DDL parser with NexusMatcher.
 """
 
-import pytest
 from pathlib import Path
 
+import pytest
+
+from nexus_matcher.domain.ports.schema_parser import SchemaParserRegistry
 from nexus_matcher.infrastructure.adapters.schema_parsers import (
-    SqlDdlParser,
     AvroSchemaParser,
     JsonSchemaParser,
+    SqlDdlParser,
 )
-from nexus_matcher.domain.ports.schema_parser import SchemaParserRegistry
 from nexus_matcher.shared.types.base import DataType
 
 
