@@ -118,6 +118,8 @@ from nexus_matcher.shared.types import (
 )
 
 __all__ = [
+    # --- embedding providers ---------------------------------------------
+    "BundledOnnxProvider",
     "Cache",
     "Config",
     # DI Container
@@ -128,6 +130,12 @@ __all__ = [
     "DictionaryEntry",
     "DictionaryLoader",
     "EmbeddingProvider",
+    # --- schema parsing --------------------------------------------------
+    "FlattenedAvroParser",
+    "GlossaryIndex",
+    "HnswVectorStore",
+    # --- vector stores ---------------------------------------------------
+    "InMemoryVectorStore",
     "Lifecycle",
     "MatchDecision",
     "MatchResult",
@@ -141,6 +149,7 @@ __all__ = [
     "SchemaParser",
     "Score",
     "SparseRetriever",
+    "SyncReport",
     "VectorStore",
     "__author__",
     "__copyright__",
@@ -149,7 +158,14 @@ __all__ = [
     "__pkg_info__",
     # Version info
     "__version__",
+    "build_index",
     "create_app",
+    "default_embedding_provider",
+    "flatten_avro_schema",
+    # --- ingestion -------------------------------------------------------
+    "ingest",
+    "load_entries",
+    "sync",
 ]
 
 
@@ -192,5 +208,35 @@ def __getattr__(name: str):
         from nexus_matcher.domain import ports
 
         return getattr(ports, name)
+
+    # Ingestion: read a glossary from anywhere, and re-embed only what changed.
+    if name in ("ingest", "build_index", "sync", "load_entries", "GlossaryIndex", "SyncReport"):
+        from nexus_matcher.application import ingest as _ingest
+
+        return _ingest if name == "ingest" else getattr(_ingest, name)
+
+    # Flattened Avro: the production input shape.
+    if name in ("FlattenedAvroParser", "flatten_avro_schema"):
+        from nexus_matcher.infrastructure.adapters.schema_parsers import flattened_avro
+
+        return getattr(flattened_avro, name)
+
+    # Embedding providers. Loaded lazily so that importing nexus_matcher does NOT pull in
+    # onnxruntime: import cost is ~80ms today and a user who only wants the domain models
+    # should not pay for an inference runtime.
+    if name in ("BundledOnnxProvider", "default_embedding_provider"):
+        from nexus_matcher.infrastructure.adapters.embedding_providers import bundled_onnx
+
+        return getattr(bundled_onnx, name)
+
+    if name == "HnswVectorStore":
+        from nexus_matcher.infrastructure.adapters.vector_stores.hnsw import HnswVectorStore
+
+        return HnswVectorStore
+
+    if name == "InMemoryVectorStore":
+        from nexus_matcher.infrastructure.adapters.vector_stores.memory import InMemoryVectorStore
+
+        return InMemoryVectorStore
 
     raise AttributeError(f"module 'nexus_matcher' has no attribute '{name}'")

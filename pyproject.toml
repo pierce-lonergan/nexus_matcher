@@ -199,6 +199,7 @@ nexus-matcher = "nexus_matcher.presentation.cli.main:app"
 avro = "nexus_matcher.infrastructure.adapters.schema_parsers.avro:AvroSchemaParser"
 json_schema = "nexus_matcher.infrastructure.adapters.schema_parsers.json_schema:JsonSchemaParser"
 sql_ddl = "nexus_matcher.infrastructure.adapters.schema_parsers.sql_ddl:SqlDdlParser"
+flattened_avro = "nexus_matcher.infrastructure.adapters.schema_parsers.flattened_avro:FlattenedAvroParser"
 
 [project.entry-points."nexus_matcher.dictionary_loaders"]
 excel = "nexus_matcher.infrastructure.adapters.dictionary_loaders.excel:ExcelDictionaryLoader"
@@ -211,6 +212,9 @@ hnsw = "nexus_matcher.infrastructure.adapters.vector_stores.hnsw:HnswVectorStore
 
 [project.entry-points."nexus_matcher.embedding_providers"]
 sentence_transformers = "nexus_matcher.infrastructure.adapters.embedding_providers.sentence_transformers:SentenceTransformersProvider"
+# The default. Registered so plugin discovery can find the offline encoder too.
+bundled_onnx = "nexus_matcher.infrastructure.adapters.embedding_providers.bundled_onnx:BundledOnnxProvider"
+static = "nexus_matcher.infrastructure.adapters.embedding_providers.static_embedding:StaticEmbeddingProvider"
 
 [project.urls]
 Homepage = "https://github.com/pierce-lonergan/nexus_matcher"

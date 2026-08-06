@@ -70,3 +70,58 @@ def test_console_script_is_declared():
     assert any(ep.name == "nexus-matcher" for ep in scripts), (
         f"the nexus-matcher CLI is not declared; found {[e.name for e in scripts]}"
     )
+
+
+# =============================================================================
+# PUBLIC API SURFACE
+# =============================================================================
+
+
+def test_every_declared_export_is_reachable():
+    """
+    Everything in __all__ must actually resolve.
+
+    __init__ resolves names lazily through PEP 562 __getattr__, so a name can sit in
+    __all__ while its branch is missing and nothing fails until a user types it. Several
+    modules written for this release (ingest, FlattenedAvroParser, BundledOnnxProvider)
+    were unreachable from the top level for exactly that reason -- present in the package,
+    invisible to anyone who did not already know the deep module path.
+    """
+    import nexus_matcher
+
+    missing = [name for name in nexus_matcher.__all__ if not hasattr(nexus_matcher, name)]
+    assert not missing, f"declared in __all__ but unreachable: {missing}"
+
+
+def test_importing_the_package_does_not_load_an_inference_runtime():
+    """
+    `import nexus_matcher` must stay cheap.
+
+    The bundled encoder is the default provider, so it is tempting to import it eagerly.
+    Doing so would pull onnxruntime into every process that merely wants a DictionaryEntry
+    and roughly quadruple import time. The lazy __getattr__ is what prevents that, and
+    this test is what stops someone "simplifying" it away.
+    """
+    import subprocess
+    import sys
+
+    code = (
+        "import sys, nexus_matcher;"
+        "assert 'onnxruntime' not in sys.modules, 'onnxruntime imported eagerly';"
+        "assert 'torch' not in sys.modules, 'torch imported eagerly';"
+        "print('lazy')"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=300, check=False
+    )
+    assert result.returncode == 0, result.stderr[-1500:]
+    assert "lazy" in result.stdout
+
+
+def test_the_documented_three_line_api_resolves():
+    """The README's headline usage must work from the top-level namespace."""
+    import nexus_matcher
+
+    assert callable(nexus_matcher.build_index)
+    assert callable(nexus_matcher.sync)
+    assert nexus_matcher.GlossaryIndex is not None
