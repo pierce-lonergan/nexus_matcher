@@ -127,6 +127,15 @@ jobs:
       - name: Standing hazards
         run: pytest tests/hazards -v
 
+      # Properties and packaging contracts. Added with the rest of Wave C/D; the scope
+      # detector in tests/museum/NM-0023 failed until they were wired here, which is
+      # exactly the defect it exists to catch -- a real suite that nothing executes.
+      - name: Property tests
+        run: pytest tests/properties -v
+
+      - name: Packaging contracts
+        run: pytest tests/packaging -v
+
       - name: Defect museum
         run: pytest tests/museum -v
 

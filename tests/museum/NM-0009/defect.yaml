@@ -1,0 +1,8 @@
+id: NM-0009
+symptom: "match on a schema that parses to zero fields died with `Error: division by zero` -- an ordinary bad input reported as an arithmetic fault inside the tool"
+severity: MEDIUM
+fixed_in: 2.0.1
+gate_that_should_have_caught_it: "none -- every CLI test fed a schema that parsed to at least one field, so the summary line's denominator was never zero"
+gate_that_catches_it_now: "tests/museum/NM-0009/test_nm_0009.py"
+touches:
+  - src/nexus_matcher/presentation/cli/main.py

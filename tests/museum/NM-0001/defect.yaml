@@ -1,0 +1,8 @@
+id: NM-0001
+symptom: "match/sync/info die with UnicodeEncodeError on a cp437/cp850/cp1252 console -- after the matching work is paid for, with a codec error instead of results"
+severity: HIGH
+fixed_in: 2.0.1
+gate_that_should_have_caught_it: "none -- every CLI test ran through typer's CliRunner, whose captured stream is UTF-8, so no test ever had a non-UTF-8 stdout"
+gate_that_catches_it_now: "tests/museum/NM-0001/test_nm_0001.py, plus tests/unit/presentation/test_cli_regressions.py"
+touches:
+  - src/nexus_matcher/presentation/cli/main.py

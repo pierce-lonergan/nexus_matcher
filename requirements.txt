@@ -1,95 +1,73 @@
-# requirements.txt | NexusMatcher v2.0.0
-# Generated from pyproject.toml dependencies
-# Install with: pip install -r requirements.txt
+# requirements.txt | GENERATED FILE -- DO NOT EDIT
+#
+# Rendered from pyproject.toml by scripts/gen_requirements.py.
+# tests/packaging/test_requirements_derivation.py regenerates this file and diffs it on
+# every test run, so an edit here is reverted by the next generation and fails the suite.
+#
+# Change a dependency in pyproject.toml, then run:
+#     python scripts/gen_requirements.py
+#
+# This file exists because it drifted twice: once carrying two packaging defects already
+# fixed in pyproject.toml, and once missing onnxruntime/tokenizers/tomli entirely, which
+# left a start.sh install unable to load the bundled encoder.
+#
+# Composition: <core>, parsers, loaders, sparse, api, cli, dev
+# Deliberately excluded: accel, async, cache, colbert, docs, embeddings, full, graph, observability, quantization, static-embeddings, vector-stores
 
-# =============================================================================
-# CORE DEPENDENCIES (Required)
-# =============================================================================
-# Note: numpy 2.x required for Python 3.13 (prebuilt wheels)
+# ===========================================================================
+# CORE -- installed by a bare `pip install nexus-matcher`
+# ===========================================================================
+click>=8.0.0
 numpy>=1.24.0
+onnxruntime>=1.17.0
+openpyxl>=3.1.0
 pydantic>=2.0.0,<3.0.0
 pydantic-settings>=2.0.0,<3.0.0
+rapidfuzz>=3.0.0
+rich>=13.0.0
 structlog>=23.0.0
+tokenizers>=0.15.0
+tomli>=2.0.0; python_version < '3.11'
+typer>=0.9.0
 
-# =============================================================================
-# SCHEMA PARSERS
-# =============================================================================
-fastavro>=1.8.0           # Avro schema parsing
-jsonschema>=4.17.0        # JSON Schema validation
-sqlparse>=0.4.4           # SQL DDL parsing
+# ===========================================================================
+# EXTRA: parsers
+# ===========================================================================
+# (every requirement already listed above)
 
-# =============================================================================
-# DICTIONARY LOADERS
-# =============================================================================
-pandas>=2.0.0
-openpyxl>=3.1.0           # Excel file support
+# ===========================================================================
+# EXTRA: loaders
+# ===========================================================================
+pyarrow>=14.0.0
+sqlalchemy>=2.0.0
 
-# =============================================================================
-# SPARSE RETRIEVAL
-# =============================================================================
-rank-bm25>=0.2.2          # BM25 algorithm
+# ===========================================================================
+# EXTRA: sparse
+# ===========================================================================
+rank-bm25>=0.2.2
 
-# =============================================================================
-# NATIVE ACCELERATORS (optional - pure-Python fallbacks exist)
-# =============================================================================
-rapidfuzz>=3.0.0          # C++ Levenshtein, ~145x faster than the DP fallback
-
-# =============================================================================
-# CACHING (GAP-003, GAP-004, GAP-005)
-# =============================================================================
-# blake3 is optional - falls back to hashlib.sha256 if not available
-# Uncomment if you have a compatible version for your Python:
-# blake3>=0.4.0
-
-# =============================================================================
-# REST API
-# =============================================================================
+# ===========================================================================
+# EXTRA: api
+# ===========================================================================
 fastapi>=0.100.0
 uvicorn[standard]>=0.23.0
-python-multipart>=0.0.6
 
-# =============================================================================
-# CLI
-# =============================================================================
-typer>=0.9.0  # typer no longer ships an 'all' extra; [all] emits a pip warning
-rich>=13.0.0
+# ===========================================================================
+# EXTRA: cli
+# ===========================================================================
+# (every requirement already listed above)
 
-# =============================================================================
-# DEVELOPMENT & TESTING
-# =============================================================================
+# ===========================================================================
+# EXTRA: dev
+# ===========================================================================
+black>=23.7.0
+httpx>=0.24.0
+hypothesis>=6.82.0
+mypy>=1.5.0
+pre-commit>=3.3.0
 pytest>=7.4.0
-pytest-cov>=4.1.0
 pytest-asyncio>=0.21.0
+pytest-cov>=4.1.0
 pytest-mock>=3.11.0
-pytest-timeout>=2.1.0     # Integration job runs pytest --timeout=120
-httpx>=0.24.0             # For testing FastAPI
-
-# =============================================================================
-# OPTIONAL: Embedding Providers (uncomment if needed)
-# =============================================================================
-# sentence-transformers>=2.2.0    # no upper cap: 5.x is what this is benchmarked on
-# torch>=2.0.0
-# transformers>=4.30.0
-
-# =============================================================================
-# OPTIONAL: Vector Stores (uncomment if needed)
-# =============================================================================
-# qdrant-client>=1.6.0,<2.0.0
-# faiss-cpu>=1.7.4
-
-# =============================================================================
-# OPTIONAL: Caching with Redis (uncomment if needed)
-# =============================================================================
-# redis>=4.5.0
-
-# =============================================================================
-# OPTIONAL: ColBERT MaxSim (GAP-001) (uncomment if needed)
-# =============================================================================
-# ragatouille>=0.0.8
-
-# =============================================================================
-# OPTIONAL: INT8 Quantization (GAP-002) (uncomment if needed)
-# =============================================================================
-# onnxruntime>=1.16.0
-# optimum[onnxruntime]>=1.14.0
-# openvino>=2024.0.0
+pytest-timeout>=2.1.0
+ruff>=0.0.290

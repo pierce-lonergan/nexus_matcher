@@ -120,6 +120,15 @@ dependencies = [
     # because the >=0.9.0 floor still admits typer 0.9.x, which does not pull rich at all.
     "typer>=0.9.0",
     "rich>=13.0.0",
+    # click is imported DIRECTLY, at module scope, by presentation/cli/main.py:25 -- the
+    # console script's own entry module -- and `except click.exceptions.Exit` guards the
+    # two places the CLI converts a Typer exit into a return code. It was declared by
+    # nobody and worked only because typer happens to depend on it. Same standard already
+    # applied to rich above: a module this package imports itself is a dependency of this
+    # package, not something to borrow from another project's requirements, which are free
+    # to change without notice. Floor matches typer's own (click>=8.0.0), and
+    # click.exceptions.Exit predates it.
+    "click>=8.0.0",
     # tomllib is stdlib from 3.11; this package supports 3.10, where
     # `NexusMatcher.from_config("matching.toml")` -- the line printed in both README and
     # QUICKSTART -- raises ModuleNotFoundError without a backport. 15 KB, pure Python, and
@@ -219,22 +228,40 @@ colbert = [
     "ragatouille>=0.0.8",  # requires Python <3.12; see above
 ]
 
-# Caching
+# Caching. redis backs adapters/caches/redis.py. diskcache was dropped 2026-08-09: there is
+# no disk cache adapter -- `grep -rni diskcache src tests` returned only this file and the
+# _EXTRA_FOR_MODULE entry pointing back at it. It installed a package no line of this
+# project could load.
 cache = [
     "redis>=4.5.0",
-    "diskcache>=5.6.0",
 ]
 
-# Schema parsers
-parsers = [
-    "fastavro>=1.8.0",        # Avro
-    "jsonschema>=4.17.0",     # JSON Schema
-    "sqlparse>=0.4.4",        # SQL DDL
-]
+# Schema parsers. EMPTY ON PURPOSE, and the emptiness is the point.
+#
+# This extra used to install fastavro, jsonschema and sqlparse "for" the three parsers in
+# adapters/schema_parsers/. Verified by AST over all of src/ on 2026-08-09: not one of the
+# three is imported anywhere. avro.py and json_schema.py parse with stdlib `json`, sql_ddl.py
+# with `re` -- read their DEPENDS_ON headers, which say exactly that. So `pip install
+# nexus-matcher[parsers]` downloaded three packages to enable parsers that were already
+# working without them, and would have kept doing it forever, because installing too much
+# never fails and nobody re-reads an extra that resolves.
+#
+# The NAME is kept, with no requirements, rather than deleted: hatchling still emits
+# `Provides-Extra: parsers` for an empty list (verified against the 2.4 metadata
+# constructor), so `nexus-matcher[parsers]` keeps resolving for anyone who pinned it and
+# for the `full` extra below. Deleting the name instead would produce
+# `WARNING: nexus-matcher 2.0.1 does not provide the extra 'parsers'` -- the exact defect
+# already recorded against typer's `all` extra on the `cli` entry below.
+#
+# A parser that grows a real dependency puts it back here, and
+# tests/packaging/test_extras_graph.py requires the matching _EXTRA_FOR_MODULE entry.
+parsers = []
 
-# Dictionary loaders
+# Dictionary loaders. pandas was dropped 2026-08-09: application/ingest.py and
+# adapters/dictionary_loaders/excel.py both read .xlsx with openpyxl and .csv with the
+# stdlib, and excel.py's comments record that replacing pandas was deliberate (~50 MB of
+# transitive weight for a spreadsheet read). The extra was still installing it.
 loaders = [
-    "pandas>=2.0.0",
     "openpyxl>=3.1.0",
     "sqlalchemy>=2.0.0",
     # application/ingest.py reads .parquet sources alongside .csv/.xlsx/.json. Its sibling
@@ -243,11 +270,15 @@ loaders = [
     "pyarrow>=14.0.0",
 ]
 
-# REST API server
+# REST API server. python-multipart was dropped 2026-08-09: FastAPI needs it only to parse
+# form bodies and file uploads, and this API has neither -- every route in
+# presentation/api/app.py is a GET (health, live, ready, startup, root), and `grep -rn
+# "UploadFile\|File(\|Form("` over presentation/ returns nothing. Adding an upload endpoint
+# means putting it back; FastAPI raises a clear "Form data requires python-multipart" at
+# route-definition time, so that mistake cannot ship silently.
 api = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
-    "python-multipart>=0.0.6",
 ]
 
 # CLI. Kept as an extra name so `nexus-matcher[cli]` and the `pip install -e ".[cli]"` in
@@ -266,10 +297,16 @@ cli = [
     "rich>=13.0.0",
 ]
 
-# Async processing
-async = [
-    "celery>=5.3.0",
-]
+# Async processing. EMPTY ON PURPOSE, same reasoning as `parsers` above.
+#
+# celery was dropped 2026-08-09. There is no task queue in this project: `grep -rni celery
+# src` returned only the _EXTRA_FOR_MODULE entry, and the one thing named "async
+# processing" -- application/use_cases/batch_match.py -- runs on a stdlib
+# ThreadPoolExecutor. `pip install nexus-matcher[async]` installed a distributed task
+# framework, plus its broker client stack, to enable nothing at all.
+#
+# Name kept so `nexus-matcher[async]` and the `full` extra below keep resolving.
+async = []
 
 # Full installation (all features). `colbert` is the one deliberate omission - see the
 # resolver evidence on that extra above.

@@ -193,25 +193,45 @@ _OPTIONAL_EXPORTS = ("create_app",)
 # no obvious link to this project; this turns it into one naming the extra to install.
 # Kept for every extra, not just today's optional exports, so a lazy branch that grows a
 # new dependency gets the good message for free.
+#
+# This covered 7 of the 15 runtime extras until 2026-08-09. The eight unmapped ones were
+# the ones whose packages a user is LEAST likely to recognise -- a missing model2vec,
+# ragatouille, cpuinfo or opentelemetry named nothing, suggested nothing, and left the
+# reader to work out which of fifteen extras carries it.
+#
+# Both directions are now gated by tests/packaging/test_extras_graph.py: every optional
+# distribution an extra installs has an entry here, and every entry points at an extra that
+# genuinely installs it. Neither this dict nor pyproject.toml can drift alone.
+#
+# Two rules govern what does NOT belong here:
+#
+# 1. Core dependencies are excluded, even when an extra also lists them. typer, rich,
+#    click, rapidfuzz and openpyxl all ship on a bare install; answering their absence with
+#    "install nexus-matcher[cli]" would send someone with a broken core install chasing an
+#    extra that was never the problem.
+# 2. A module shipped by more than one extra maps to the one that is ABOUT it. torch and
+#    transformers are in `embeddings` and `quantization`; they map to `embeddings`, whose
+#    install fixes either caller. The mapping only has to name a command that works.
 _EXTRA_FOR_MODULE = {
     "fastapi": "api",
     "uvicorn": "api",
-    "multipart": "api",
-    "python_multipart": "api",
     "sentence_transformers": "embeddings",
-    "torch": "embeddings",
-    "transformers": "embeddings",
+    "torch": "embeddings",  # also in `quantization`; see rule 2 above
+    "transformers": "embeddings",  # also in `quantization`
     "qdrant_client": "vector-stores",
     "usearch": "vector-stores",
     "redis": "cache",
-    "diskcache": "cache",
-    "fastavro": "parsers",
-    "jsonschema": "parsers",
-    "sqlparse": "parsers",
-    "pandas": "loaders",
     "pyarrow": "loaders",
     "sqlalchemy": "loaders",
-    "celery": "async",
+    "rank_bm25": "sparse",
+    "blake3": "accel",
+    "cpuinfo": "accel",  # the py-cpuinfo distribution imports as `cpuinfo`
+    "networkx": "graph",
+    "prometheus_client": "observability",
+    "opentelemetry": "observability",  # both opentelemetry-api and -sdk import as this
+    "onnx": "quantization",
+    "model2vec": "static-embeddings",
+    "ragatouille": "colbert",
 }
 
 

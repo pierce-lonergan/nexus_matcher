@@ -1,0 +1,8 @@
+id: NM-0020
+symptom: "ranking depended on PYTHONHASHSEED -- the fused candidate list was built from a set, so two runs of identical code returned different top matches; P@1 spanned 0.2301-0.2339 across six hash seeds on the 1556-query FHIR benchmark"
+severity: HIGH
+fixed_in: unreleased
+gate_that_should_have_caught_it: "none -- every ranking test ran in one process with one hash seed, and the accuracy suite compared against a baseline recorded the same way"
+gate_that_catches_it_now: "tests/museum/NM-0020/test_nm_0020.py, plus tests/hazards/test_h005_total_order.py and tests/unit/core/test_fusion_determinism.py"
+touches:
+  - src/nexus_matcher/core/fusion.py

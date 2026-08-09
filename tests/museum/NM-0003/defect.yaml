@@ -1,0 +1,8 @@
+id: NM-0003
+symptom: "match --output is silently ignored whenever the format resolves to table, so the CLI's own documented `-o results.json` example wrote no file and exited 0"
+severity: HIGH
+fixed_in: 2.0.1
+gate_that_should_have_caught_it: "none -- every CLI test that used --output also passed --format explicitly, so the default path was never exercised with -o"
+gate_that_catches_it_now: "tests/museum/NM-0003/test_nm_0003.py, plus tests/unit/presentation/test_cli_regressions.py"
+touches:
+  - src/nexus_matcher/presentation/cli/main.py

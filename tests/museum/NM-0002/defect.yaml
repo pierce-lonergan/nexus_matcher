@@ -1,0 +1,8 @@
+id: NM-0002
+symptom: "the nexus-matcher console script is declared unconditionally but typer and rich shipped only in the cli extra, so pip put a command on PATH that died on `import typer`"
+severity: BLOCKER
+fixed_in: 2.0.1
+gate_that_should_have_caught_it: "tests/unit/test_entry_points.py -- it proved the console script was DECLARED, never that it could start without an extra; and every dev and CI environment already had typer"
+gate_that_catches_it_now: "tests/museum/NM-0002/test_nm_0002.py (imports every declared console script with the extras hidden from the import system)"
+touches:
+  - pyproject.toml

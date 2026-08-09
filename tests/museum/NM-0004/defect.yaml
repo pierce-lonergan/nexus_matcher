@@ -1,0 +1,8 @@
+id: NM-0004
+symptom: "sync declared --output-dir, advertised it in its own docstring example, and referenced it nowhere -- so `sync dict.csv -o ./index` built an index, discarded it and exited 0 reporting success"
+severity: HIGH
+fixed_in: 2.0.1
+gate_that_should_have_caught_it: "none -- the CLI tests asserted exit codes and printed text, and a flag that does nothing changes neither"
+gate_that_catches_it_now: "tests/museum/NM-0004/test_nm_0004.py"
+touches:
+  - src/nexus_matcher/presentation/cli/main.py

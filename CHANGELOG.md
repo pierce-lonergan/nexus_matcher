@@ -12,6 +12,21 @@ that it came from. Numbers without an artifact are not stated.
 
 ## [Unreleased]
 
+### Fixed
+
+- **NM-0020 — ranking depended on `PYTHONHASHSEED`.** Fusion iterated a set, so the order
+  of tied candidates changed with how the interpreter was started. With a measured margin
+  of 0.0024 cosine between the correct entry and the nearest wrong one, ties are the normal
+  case here, not an edge case — so this decided real answers. Ranking is now total and
+  seed-independent, verified across four seeds in separate interpreters.
+- **NM-0023 — CI linted only part of the repository.** `ruff` ran over
+  `src/nexus_matcher` and `tests` only; `scripts/` and `benchmarks/` were covered by
+  nobody and 33 errors accumulated there unseen. All four directories are linted now, with
+  a named, dated exemption for six rules on nine frozen experiment scripts so that *new*
+  benchmark code is fully covered. A scope detector fails the build if the list ever
+  narrows again — and it immediately caught its own directory, `tests/museum`, which no CI
+  job was running.
+
 ### Added — measurement
 
 - **A real, labelled benchmark.** `benchmarks/datasets/build_benchmarks.py` builds 793

@@ -1,0 +1,8 @@
+id: NM-0007
+symptom: "`from nexus_matcher import *` raised ModuleNotFoundError: No module named 'fastapi' on a default install, because create_app was listed in __all__ and fastapi ships only in the api extra"
+severity: BLOCKER
+fixed_in: 2.0.1
+gate_that_should_have_caught_it: "tests/unit/test_entry_points.py::test_every_declared_export_is_reachable -- it walked __all__ in the dev venv, where every extra is installed, so the one name that needed an extra resolved fine"
+gate_that_catches_it_now: "tests/museum/NM-0007/test_nm_0007.py (walks __all__ with the extras hidden from the import system)"
+touches:
+  - src/nexus_matcher/__init__.py

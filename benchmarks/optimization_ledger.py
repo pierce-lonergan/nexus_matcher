@@ -32,6 +32,25 @@ exists to make those four mistakes structurally impossible rather than merely di
       Every record carries git SHA, dirty-tree flag, platform, CPU count, Python version,
       the full MatchingConfig, the seed, and a CPU-busy sample taken at measurement time.
 
+Three standing hazards are enforced here rather than remembered
+---------------------------------------------------------------
+  H-002  A threshold calibrated on one corpus does not transfer. Every quality record
+         carries a CorpusIdentity -- benchmark, kind, entry count, query count and a
+         content digest -- and `compare()` RAISES `CorpusMismatch` rather than diffing
+         across them. Corpus size is in the identity because it is a regime change, not a
+         scaling factor: dictionary aliasing is +1.9 P@1 at 688 entries and -18.8 at
+         30,000, and the sign inverts.
+
+  H-003  Optimizations that fix artifacts of their own measurement environment. Any change
+         whose own description names threading, BLAS, GEMM or batch scheduling cannot be a
+         WIN without a `ThreadSweep` showing the win at 1 thread AND at the library
+         default. See `judge_thread_sweep` for the 24-thread collapse this comes from.
+
+  H-008  Absolute throughput is not gateable on this machine (0.9% spread idle, 30.6%
+         under load) but complexity SHAPE is, because a ratio between two scales measured
+         in the same run cancels machine state. `measure_shape()` pins throughput and p95
+         latency at 30k as fractions of their values at 1k. See SHAPE_BOUNDS.
+
 The asymmetry is deliberate and is the whole design
 ---------------------------------------------------
 Claiming a WIN requires evidence: the target must move further than the calibrated noise
@@ -80,13 +99,16 @@ CLI
     python benchmarks/optimization_ledger.py --record "my change"   # measure + append
     python benchmarks/optimization_ledger.py --leaderboard
     python benchmarks/optimization_ledger.py --compare BASE_ID CAND_ID --target p_at_1
+    python benchmarks/optimization_ledger.py --shape                # complexity shape only
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
+import os
 import platform
 import statistics
 import subprocess
@@ -119,6 +141,12 @@ DEFAULT_SEED = 20260809
 DEFAULT_BENCHMARK = "fhir"
 DEFAULT_SCALES: tuple[tuple[int, int], ...] = ((1000, 300), (5000, 300))
 DEFAULT_TRIALS = 3
+
+# What counts as "moved" before this machine's own noise has been calibrated. Two runs can
+# agree to 0.4% by luck, and a 0% band would then certify the next fluctuation as a win.
+# 3% is deliberately cheap insurance: well under the ~30% swing this repo's history
+# recorded, so it never masks a real optimization.
+DEFAULT_NOISE_FLOOR = 0.03
 
 # Metrics where a bigger number is better. Everything else (latency, memory) is inverted
 # when we render "did this improve?", so a reader never has to remember which is which.
@@ -278,8 +306,6 @@ def provenance(seed: int, config: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def _cpu_count() -> int:
-    import os
-
     return os.cpu_count() or 0
 
 
@@ -494,6 +520,134 @@ def paired_compare_metric(
 
 
 # =============================================================================
+# CORPUS IDENTITY  (H-002)
+# =============================================================================
+
+
+class CorpusMismatch(ValueError):
+    """
+    Two records were produced on different corpora, so their numbers do not compare.
+
+    A ValueError subclass rather than a new exception hierarchy, because callers that
+    already catch the refusal broadly must keep working; the type exists so a test can
+    assert the refusal happened for THIS reason and not because some string moved.
+    """
+
+
+@dataclass(frozen=True)
+class CorpusIdentity:
+    """
+    Which corpus a quality number came from, precise enough to refuse a bad comparison.
+
+    H-002 is not "results vary a bit between corpora". Corpus size is a REGIME CHANGE
+    here: dictionary aliasing is worth +1.9 P@1 at 688 entries and -18.8 at 30,000 -- the
+    sign inverts, because every distractor also gets N extra chances to beat the gold, so
+    alias noise scales with corpus size while alias signal does not. A threshold, a
+    tolerance or a verdict carried across that boundary is not approximately right, it is
+    backwards.
+
+    `n_entries` is therefore part of the IDENTITY, not metadata attached to it. So is
+    `n_queries`: `quality_limit` silently truncates the query set, and P@1 over 400
+    queries is a different quantity from P@1 over 1556 of them.
+
+    `digest` fingerprints the actual content (entry ids + query-to-gold pairs), which
+    catches the case sizes cannot: a corpus rebuilt with the same shape and different
+    labels. It is empty on records written before the field existed -- `assert_same_corpus`
+    reports that as unverifiable rather than pretending it checked.
+    """
+
+    benchmark: str
+    kind: str  # "real" | "synthetic"
+    n_entries: int
+    n_queries: int
+    digest: str = ""
+
+    @property
+    def has_digest(self) -> bool:
+        return bool(self.digest)
+
+    def describe(self) -> str:
+        d = self.digest or "no-digest"
+        return f"{self.benchmark}/{self.kind} {self.n_entries} entries x {self.n_queries} queries [{d}]"
+
+    def differences(self, other: CorpusIdentity) -> list[str]:
+        """Every field on which these two corpora disagree, in plain words."""
+        out: list[str] = []
+        if self.benchmark != other.benchmark:
+            out.append(f"benchmark {self.benchmark!r} vs {other.benchmark!r}")
+        if self.kind != other.kind:
+            out.append(f"corpus kind {self.kind!r} vs {other.kind!r}")
+        if self.n_entries != other.n_entries:
+            out.append(
+                f"corpus SIZE {self.n_entries} vs {other.n_entries} entries -- techniques "
+                f"in this repo invert sign across exactly this axis"
+            )
+        if self.n_queries != other.n_queries:
+            out.append(f"query count {self.n_queries} vs {other.n_queries}")
+        if self.has_digest and other.has_digest and self.digest != other.digest:
+            out.append(
+                f"content digest {self.digest} vs {other.digest} -- same shape, "
+                f"different entries or different gold labels"
+            )
+        return out
+
+
+def corpus_digest(dataset: Any) -> str:
+    """
+    A stable fingerprint of a labelled corpus: what is in it, and what counts as correct.
+
+    hashlib, not `hash()`: PYTHONHASHSEED makes the builtin differ between processes, and
+    a fingerprint that changes when you restart the interpreter would refuse every
+    comparison including the legitimate ones. Sorted, so entry order cannot change it.
+    """
+    h = hashlib.blake2b(digest_size=8)
+    h.update(str(getattr(dataset, "name", "")).encode("utf-8"))
+    for eid in sorted(str(e.id) for e in dataset.entries):
+        h.update(b"\x00e")
+        h.update(eid.encode("utf-8"))
+    for qid, gold in sorted((str(q.id), str(q.gold_id)) for q in dataset.queries):
+        h.update(b"\x00q")
+        h.update(qid.encode("utf-8"))
+        h.update(b"\x00g")
+        h.update(gold.encode("utf-8"))
+    return h.hexdigest()
+
+
+def assert_same_corpus(baseline: CorpusIdentity, candidate: CorpusIdentity) -> list[str]:
+    """
+    Refuse a cross-corpus comparison outright. Returns warnings for what it could not check.
+
+    Refusing is the point. The alternative -- comparing anyway and noting the difference in
+    a field somebody may read -- is how a 688-entry calibration became a 30,000-entry
+    default. There is no `force` argument and there should not be one: if you genuinely
+    want both numbers, measure both corpora and report two results.
+    """
+    diffs = baseline.differences(candidate)
+    if diffs:
+        raise CorpusMismatch(
+            "refusing to compare records from different corpora:\n  "
+            + "\n  ".join(diffs)
+            + f"\n  baseline: {baseline.describe()}"
+            + f"\n  candidate: {candidate.describe()}"
+            + "\n  A threshold, tolerance or verdict calibrated on one corpus is "
+            "UNVALIDATED on the other (H-002). Re-measure, do not translate."
+        )
+    warnings: list[str] = []
+    if not (baseline.has_digest and candidate.has_digest):
+        which = [
+            name
+            for name, ident in (("baseline", baseline), ("candidate", candidate))
+            if not ident.has_digest
+        ]
+        warnings.append(
+            f"corpus content digest missing on the {' and '.join(which)} record: sizes and "
+            f"names match, but nothing proves the corpus CONTENT is the same one. Re-measure "
+            f"to get a checkable record."
+        )
+    return warnings
+
+
+# =============================================================================
 # QUALITY  (paired, per-query)
 # =============================================================================
 
@@ -518,6 +672,10 @@ class QualityMetrics:
     mrr_at_10: float
     auto_approve_precision: float
     auto_approve_coverage: float
+    # H-002: which corpus produced these numbers, at content resolution. Defaults to ""
+    # only so records written before the field existed still load; measure_quality always
+    # fills it, and compare() says out loud when a record cannot be checked at this depth.
+    corpus_digest: str = ""
     query_ids: list[str] = dc_field(default_factory=list)
     correct_at_1: list[int] = dc_field(default_factory=list)
     hit_at_5: list[int] = dc_field(default_factory=list)
@@ -527,6 +685,16 @@ class QualityMetrics:
     auto_correct: list[int] = dc_field(default_factory=list)
     seconds: float = 0.0
     notes: list[str] = dc_field(default_factory=list)
+
+    def identity(self) -> CorpusIdentity:
+        """The corpus these numbers belong to. See CorpusIdentity for why size is in it."""
+        return CorpusIdentity(
+            benchmark=self.benchmark,
+            kind=self.corpus,
+            n_entries=self.n_entries,
+            n_queries=self.n_queries,
+            digest=self.corpus_digest,
+        )
 
     def vector(self, metric: str) -> list[float]:
         return {
@@ -668,7 +836,7 @@ def measure_quality(
     if len(ranked) != len(fields):
         raise RuntimeError(f"matcher returned {len(ranked)} result sets for {len(fields)} fields")
 
-    return _score_quality(ds, ranked, MatchDecision, corpus, seconds, notes)
+    return _score_quality(ds, ranked, MatchDecision, corpus, seconds, notes, corpus_digest(ds))
 
 
 def _score_quality(
@@ -678,6 +846,7 @@ def _score_quality(
     corpus: str,
     seconds: float,
     notes: list[str],
+    digest: str = "",
 ) -> QualityMetrics:
     """Turn one run's raw match results into per-query vectors and their aggregates."""
     query_ids: list[str] = []
@@ -716,6 +885,7 @@ def _score_quality(
         mrr_at_10=sum(rr10) / n,
         auto_approve_precision=(sum(auto_ok) / n_auto) if n_auto else 0.0,
         auto_approve_coverage=n_auto / n,
+        corpus_digest=digest,
         query_ids=query_ids,
         correct_at_1=correct1,
         hit_at_5=hit5,
@@ -832,6 +1002,268 @@ def measure_cost(
 
 
 # =============================================================================
+# COMPLEXITY SHAPE  (H-008)
+# =============================================================================
+#
+# Absolute throughput is not gateable on this machine and never will be. Measured here,
+# identical code: 0.9% spread idle, 30.6% spread at 49.5% CPU busy. A fixed threshold on
+# fields/sec is therefore wrong in both directions -- too loose when idle to catch a real
+# regression, too tight under load to avoid inventing one.
+#
+# A RATIO BETWEEN TWO SCALES MEASURED IN THE SAME RUN IS DIFFERENT. Whatever the machine
+# is doing to the 1k measurement it is also doing to the 30k measurement, so the machine
+# state largely divides out and what survives is the SHAPE of the cost curve -- which is
+# a property of the algorithm. Re-pinned on this tree 2026-08-09, interleaved, WHILE OTHER
+# AGENTS WERE RUNNING (which is the point -- these are not idle numbers and do not need
+# to be):
+#
+#     throughput 30k/1k     0.856 .. 0.904   (single trials: 0.608 .. 0.882)
+#     p95 latency 30k/1k    1.590 .. 1.659   (single trials: 1.417 .. 1.712)
+#     index rate 30k/1k     0.871 .. 0.929   (single trials: 0.843 .. 0.995)
+#
+# The single-trial spread is the reason `measure_shape` interleaves scales and takes the
+# best trial at each: best-of-3 cut the throughput-ratio spread from 31.4% to 2.2%.
+#
+# WHAT THIS GATE CANNOT SEE: a uniform slowdown. Halve the speed at every scale and the
+# ratio is unchanged. That is deliberate division of labour -- absolute cost is judged by
+# compare() against a calibrated noise band, shape is judged here, and neither substitutes
+# for the other.
+
+SHAPE_SCALES: tuple[tuple[int, int], ...] = ((1000, 300), (30000, 300))
+
+# Three interleaved trials at each scale. Two is not enough (spread 9.0%), and four buys
+# 0.3 points of spread for another 35 seconds.
+SHAPE_TRIALS = 3
+
+
+@dataclass(frozen=True)
+class ShapeBound:
+    """
+    A bound on how a metric is allowed to change between the smallest and largest scale.
+
+    Bounds are RATCHETS: they may tighten, never loosen. Each carries the headroom it was
+    chosen with, because a bound with unstated headroom is indistinguishable from one
+    picked to make today's number pass.
+    """
+
+    metric: str
+    lower: float | None
+    upper: float | None
+    why: str
+
+    def violated_by(self, ratio: float) -> bool:
+        if self.lower is not None and ratio < self.lower:
+            return True
+        return self.upper is not None and ratio > self.upper
+
+
+SHAPE_BOUNDS: tuple[ShapeBound, ...] = (
+    ShapeBound(
+        "match_fields_per_sec",
+        lower=0.40,
+        upper=None,
+        why=(
+            "match throughput at 30k must stay at least 40% of throughput at 1k. Observed "
+            "0.856-0.904 best-of-3, so 2.1x headroom against flaking; the O(|q| x N) scan "
+            "that shipped once took 550 -> 49.7 fields/sec, a ratio of 0.09, which this "
+            "floor catches with 4.4x to spare. The worst SINGLE contended trial ever "
+            "recorded here was 0.608, still 1.5x above the floor."
+        ),
+    ),
+    ShapeBound(
+        "latency_ms_p95",
+        lower=None,
+        upper=4.0,
+        why=(
+            "p95 per-field latency at 30k must stay under 4x its value at 1k. Observed "
+            "1.590-1.659 best-of-3 (worst single trial 1.712), so 2.4x headroom. A linear "
+            "scan over the corpus puts this in the tens; 30x the corpus for 4x the tail is "
+            "the loosest curve anyone should be able to ship without saying so."
+        ),
+    ),
+    ShapeBound(
+        "index_entries_per_sec",
+        lower=0.40,
+        upper=None,
+        why=(
+            "index build must not go quadratic. Observed 0.871-0.929 best-of-3 (worst "
+            "single trial 0.843), so 2.1x headroom; an O(N^2) build would land near 0.03."
+        ),
+    ),
+)
+
+
+@dataclass
+class ShapeRatio:
+    """One metric's large-scale value as a fraction of its small-scale value."""
+
+    metric: str
+    small_scope: str
+    large_scope: str
+    small: float
+    large: float
+    ratio: float
+    lower: float | None
+    upper: float | None
+    why: str = ""
+
+    @property
+    def ok(self) -> bool:
+        if self.lower is not None and self.ratio < self.lower:
+            return False
+        return not (self.upper is not None and self.ratio > self.upper)
+
+    @property
+    def bound_text(self) -> str:
+        if self.lower is not None and self.upper is not None:
+            return f"[{self.lower:.3g}, {self.upper:.3g}]"
+        if self.lower is not None:
+            return f">= {self.lower:.3g}"
+        if self.upper is not None:
+            return f"<= {self.upper:.3g}"
+        return "(unbounded)"
+
+    def describe(self) -> str:
+        verdict = "ok" if self.ok else "OUT OF SHAPE"
+        return (
+            f"{self.metric}: {self.small:.4g} @ {self.small_scope} -> {self.large:.4g} @ "
+            f"{self.large_scope}  ratio {self.ratio:.4f}, bound {self.bound_text}  [{verdict}]"
+        )
+
+
+@dataclass
+class ShapeReport:
+    scales: list[tuple[int, int]]
+    trials: int
+    statistic: str
+    ratios: list[ShapeRatio]
+
+    @property
+    def failures(self) -> list[ShapeRatio]:
+        return [r for r in self.ratios if not r.ok]
+
+    @property
+    def verdict(self) -> str:
+        return "SHAPE-BROKEN" if self.failures else "SHAPE-OK"
+
+    def render(self) -> str:
+        lines = [
+            f"\nComplexity shape: {self.scales[0]} -> {self.scales[-1]}, "
+            f"{self.trials} interleaved trials, {self.statistic}-of-trials",
+        ]
+        lines.extend(f"  {r.describe()}" for r in self.ratios)
+        lines.append(f"  VERDICT: {self.verdict}")
+        for r in self.failures:
+            lines.append(f"  ! {r.why}")
+        return "\n".join(lines)
+
+
+def shape_report(
+    cost: Sequence[CostAtScale],
+    *,
+    statistic: str = "best",
+    bounds: Sequence[ShapeBound] = SHAPE_BOUNDS,
+    trials: int = 0,
+) -> ShapeReport:
+    """
+    Turn measured cost at two or more scales into ratios, and judge them.
+
+    Pure: takes measurements, returns a verdict. Everything expensive happens in
+    `measure_shape`, so the decision rule can be exercised on synthetic cost with no model
+    load at all -- which is the only way to watch this gate go red on demand.
+    """
+    ordered = sorted(cost, key=lambda c: c.entries)
+    if len(ordered) < 2:
+        raise ValueError(
+            f"complexity shape needs at least two scales; got {len(ordered)}. A single "
+            f"scale can only produce an absolute timing, which this machine cannot gate on."
+        )
+    small, large = ordered[0], ordered[-1]
+
+    ratios: list[ShapeRatio] = []
+    for bound in bounds:
+        s_stat = small.stats.get(bound.metric)
+        l_stat = large.stats.get(bound.metric)
+        if s_stat is None or l_stat is None:
+            continue
+        s_val = float(getattr(s_stat, statistic))
+        l_val = float(getattr(l_stat, statistic))
+        ratios.append(
+            ShapeRatio(
+                metric=bound.metric,
+                small_scope=small.key,
+                large_scope=large.key,
+                small=s_val,
+                large=l_val,
+                ratio=(l_val / s_val) if s_val else float("inf"),
+                lower=bound.lower,
+                upper=bound.upper,
+                why=bound.why,
+            )
+        )
+    return ShapeReport(
+        scales=[(c.entries, c.fields) for c in ordered],
+        trials=trials or small.trials,
+        statistic=statistic,
+        ratios=ratios,
+    )
+
+
+def measure_shape(
+    matcher_factory: Callable[[], Any] | None = None,
+    *,
+    scales: Sequence[tuple[int, int]] = SHAPE_SCALES,
+    trials: int = SHAPE_TRIALS,
+    statistic: str = "best",
+    bounds: Sequence[ShapeBound] = SHAPE_BOUNDS,
+    progress: bool = False,
+) -> ShapeReport:
+    """
+    Measure every scale in ONE process, INTERLEAVED, and report the shape of the curve.
+
+    Interleaved -- all scales inside each trial, rather than all trials of one scale then
+    all trials of the next -- because the thing being cancelled is machine state, and
+    machine state moves over seconds. Measuring 1k three times during a quiet minute and
+    30k three times during a busy one produces a ratio that describes the minute, not the
+    algorithm; that is exactly the fluctuation that made one contended trial here read
+    0.608 against a true 0.86.
+
+    `statistic="best"` for the same reason perf comparisons use it: interference only ever
+    makes a run slower, so the extreme in the good direction is the least contaminated
+    estimate of what the machine can actually do at that scale.
+    """
+    from perf_harness import measure
+
+    per_scale: dict[tuple[int, int], list[Any]] = {tuple(s): [] for s in scales}
+    for t in range(trials):
+        for scale in scales:
+            entries_n, fields_n = scale
+            if progress:
+                print(f"  shape trial {t + 1}/{trials} @ {entries_n} entries", flush=True)
+            per_scale[tuple(scale)].append(
+                measure(entries_n, fields_n, matcher_factory=matcher_factory)
+            )
+
+    cost = [
+        CostAtScale(
+            entries=entries_n,
+            fields=fields_n,
+            trials=trials,
+            stats={
+                "match_fields_per_sec": _summarise([r.match_fields_per_sec for r in rows], True),
+                "index_entries_per_sec": _summarise([r.index_entries_per_sec for r in rows], True),
+                "latency_ms_p50": _summarise([r.latency_ms_p50 for r in rows], False),
+                "latency_ms_p95": _summarise([r.latency_ms_p95 for r in rows], False),
+                "latency_ms_p99": _summarise([r.latency_ms_p99 for r in rows], False),
+                "peak_memory_mb": _summarise([r.peak_tracemalloc_mb for r in rows], False),
+            },
+        )
+        for (entries_n, fields_n), rows in per_scale.items()
+    ]
+    return shape_report(cost, statistic=statistic, bounds=bounds, trials=trials)
+
+
+# =============================================================================
 # NOISE CALIBRATION  (M1)
 # =============================================================================
 
@@ -898,7 +1330,7 @@ def calibrate_noise(
     trials: int = DEFAULT_TRIALS,
     benchmark: str = DEFAULT_BENCHMARK,
     quality_limit: int | None = None,
-    floor: float = 0.03,
+    floor: float = DEFAULT_NOISE_FLOOR,
     seed: int = DEFAULT_SEED,
     progress: bool = True,
 ) -> tuple[NoiseBand, list[Measurement]]:
@@ -975,6 +1407,418 @@ def _add_band(band: NoiseBand, metric: str, values: Sequence[float], scope: str 
 
 
 # =============================================================================
+# THREAD SENSITIVITY  (H-003)
+# =============================================================================
+
+# Every knob that decides how many threads a BLAS-backed numpy op will use.
+#
+# ALL of them, not just OMP_NUM_THREADS. numpy wheels ship OpenBLAS on Linux and Windows
+# and MKL or Accelerate elsewhere, and each backend reads its own variable. Setting one
+# and missing the one your wheel actually links against produces a run labelled "1 thread"
+# that dispatched 24 -- which is not a lesser version of this check, it is the measurement
+# error the check exists to catch, now wearing a label that says it was checked.
+THREAD_ENV_VARS = (
+    "OMP_NUM_THREADS",
+    "OPENBLAS_NUM_THREADS",
+    "MKL_NUM_THREADS",
+    "NUMEXPR_NUM_THREADS",
+    "VECLIB_MAXIMUM_THREADS",
+)
+
+# Words in a change's own description that mean its mechanism can be sensitive to how many
+# threads the box is dispatching. Matched as substrings against the label and notes, so
+# "batched", "multithreaded" and "GEMM" all hit. Over-inclusive on purpose: the cost of a
+# false positive is one extra sweep, and the cost of a false negative is the small-corpus
+# fallback -- an optimization that existed only to correct its own measurement conditions.
+THREAD_SENSITIVE_MECHANISMS = (
+    "thread",
+    "blas",
+    "mkl",
+    "gemm",
+    "matmul",
+    "batch",
+    "parallel",
+    "concurren",
+    "omp",
+    "simd",
+    "vectoriz",
+    "worker",
+    "pool",
+    "schedul",
+)
+
+
+def thread_env(
+    threads: int | None,
+    base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """
+    An environment that pins (or un-pins) BLAS threading for a CHILD interpreter.
+
+    Child, not this one: OpenBLAS reads these variables when it is loaded, which happens
+    on `import numpy`. Setting them in-process after numpy is imported changes nothing and
+    produces a sweep whose two arms are identical -- green, and measuring one condition
+    twice. Everything here therefore goes through a fresh interpreter.
+
+    `threads=None` means "whatever the library picks", which is the condition a user
+    actually runs in and the one the 24-thread collapse happened under, so it is the
+    other half of the sweep and not an absence of a setting.
+    """
+    env = dict(os.environ if base is None else base)
+    for var in THREAD_ENV_VARS:
+        if threads is None:
+            env.pop(var, None)
+        else:
+            env[var] = str(threads)
+    return env
+
+
+def mechanism_needs_thread_sweep(*texts: str | Sequence[str] | None) -> list[str]:
+    """
+    Which thread-sensitive words appear in a change's own description of itself.
+
+    Non-empty means H-003 applies: the win has to be shown at 1 thread AND at the
+    library default before anyone may call it one.
+    """
+    blob: list[str] = []
+    for t in texts:
+        if t is None:
+            continue
+        if isinstance(t, str):
+            blob.append(t)
+        else:
+            blob.extend(str(x) for x in t)
+    joined = " ".join(blob).lower()
+    return sorted({w for w in THREAD_SENSITIVE_MECHANISMS if w in joined})
+
+
+@dataclass(frozen=True)
+class ThreadObservation:
+    """Baseline vs candidate for one metric, measured at one thread setting."""
+
+    threads: int | None
+    baseline: float
+    candidate: float
+
+    @property
+    def label(self) -> str:
+        return "library default" if self.threads is None else f"{self.threads} thread(s)"
+
+    @property
+    def relative_delta(self) -> float:
+        return ((self.candidate - self.baseline) / abs(self.baseline)) if self.baseline else 0.0
+
+    def moved(self, band: float, higher_is_better: bool) -> int:
+        """+1 improved past the band, -1 got worse past it, 0 inside the band."""
+        rel = self.relative_delta if higher_is_better else -self.relative_delta
+        if rel > band:
+            return 1
+        if rel < -band:
+            return -1
+        return 0
+
+
+@dataclass
+class ThreadSweep:
+    """
+    The verdict on whether a win survives a change in thread count.
+
+    The recorded failure this pins: a small-corpus fallback added to `search_batch` because
+    the GEMM path "lost" at 793 entries.
+
+         1 thread:   loop 14.7 ms   GEMM   7.4 ms   -> GEMM 2.00x FASTER
+         4 threads:  loop 17.3 ms   GEMM   6.9 ms   -> GEMM 2.51x FASTER
+        24 threads:  loop 16.5 ms   GEMM 176.1 ms   -> GEMM 0.09x
+
+    Identical FLOPs. The fallback won only where OpenBLAS spread a small GEMM over 24
+    threads on a saturated box -- i.e. it was an optimization for the measurement
+    conditions, and shipping it would have made every uncontended run slower forever.
+    """
+
+    metric: str
+    higher_is_better: bool
+    noise_band: float
+    observations: list[ThreadObservation]
+    verdict: str
+    thread_dependent: bool
+    demonstrated: bool
+    reasons: list[str] = dc_field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "metric": self.metric,
+            "higher_is_better": self.higher_is_better,
+            "noise_band": self.noise_band,
+            "observations": [asdict(o) for o in self.observations],
+            "verdict": self.verdict,
+            "thread_dependent": self.thread_dependent,
+            "demonstrated": self.demonstrated,
+            "reasons": self.reasons,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> ThreadSweep:
+        return cls(
+            metric=d["metric"],
+            higher_is_better=d["higher_is_better"],
+            noise_band=d["noise_band"],
+            observations=[ThreadObservation(**o) for o in d["observations"]],
+            verdict=d["verdict"],
+            thread_dependent=d["thread_dependent"],
+            demonstrated=d["demonstrated"],
+            reasons=d.get("reasons", []),
+        )
+
+    def render(self) -> str:
+        head = f"{'threads':<18} {'baseline':>12} {'candidate':>12} {'delta':>9}  effect"
+        lines = [
+            f"\nThread sweep on {self.metric} (band {self.noise_band:.1%})",
+            head,
+            "-" * len(head),
+        ]
+        for o in self.observations:
+            moved = o.moved(self.noise_band, self.higher_is_better)
+            effect = {1: "WIN", -1: "LOSS", 0: "in-noise"}[moved]
+            lines.append(
+                f"{o.label:<18} {o.baseline:>12.4g} {o.candidate:>12.4g} "
+                f"{o.relative_delta:>+8.1%}  {effect}"
+            )
+        lines.append("")
+        lines.append(f"VERDICT: {self.verdict}")
+        for r in self.reasons:
+            lines.append(f"  - {r}")
+        return "\n".join(lines)
+
+
+def judge_thread_sweep(
+    metric: str,
+    observations: Sequence[ThreadObservation],
+    *,
+    noise_band: float = DEFAULT_NOISE_FLOOR,
+    higher_is_better: bool | None = None,
+) -> ThreadSweep:
+    """
+    Decide whether a measured win is a property of the code or of the thread count.
+
+    Verdicts:
+      WIN-EVERYWHERE     improved past the band at every thread setting. The only one that
+                         counts as a win.
+      THREAD-DEPENDENT   improved at some settings and not at others, or improved at one
+                         and lost at another. This is the H-003 shape, and it is the
+                         verdict the small-corpus fallback should have received.
+      NO-WIN             nothing moved past the band anywhere.
+      LOSS-EVERYWHERE    got worse past the band at every setting.
+      INCOMPLETE         fewer than two thread settings were measured, so the question was
+                         not asked. Not a pass.
+    """
+    higher = metric in HIGHER_IS_BETTER if higher_is_better is None else higher_is_better
+    obs = list(observations)
+    band = max(noise_band, 0.0)
+
+    if len(obs) < 2:
+        return ThreadSweep(
+            metric=metric,
+            higher_is_better=higher,
+            noise_band=band,
+            observations=obs,
+            verdict="INCOMPLETE",
+            thread_dependent=False,
+            demonstrated=False,
+            reasons=[
+                f"only {len(obs)} thread setting(s) measured. One setting cannot tell a "
+                f"real speedup from a scheduling artefact -- that distinction IS the "
+                f"measurement. Run at 1 thread and at the library default."
+            ],
+        )
+
+    moves = [(o, o.moved(band, higher)) for o in obs]
+    wins = [o for o, m in moves if m == 1]
+    losses = [o for o, m in moves if m == -1]
+
+    if len(wins) == len(obs):
+        return ThreadSweep(
+            metric=metric,
+            higher_is_better=higher,
+            noise_band=band,
+            observations=obs,
+            verdict="WIN-EVERYWHERE",
+            thread_dependent=False,
+            demonstrated=True,
+            reasons=[
+                f"{metric} improved past the {band:.1%} band at every thread setting "
+                f"measured ({', '.join(o.label for o in obs)}).",
+            ],
+        )
+
+    if wins:
+        where = ", ".join(f"{o.label} {o.relative_delta:+.1%}" for o in obs)
+        return ThreadSweep(
+            metric=metric,
+            higher_is_better=higher,
+            noise_band=band,
+            observations=obs,
+            verdict="THREAD-DEPENDENT",
+            thread_dependent=True,
+            demonstrated=False,
+            reasons=[
+                f"{metric} improved at {len(wins)} of {len(obs)} thread settings: {where}.",
+                "A win that exists at one thread count and not another is a property of "
+                "the scheduler, not of the code. H-003: the small-corpus fallback looked "
+                "like a 2.5x win for exactly this reason and was fixing its own "
+                "measurement conditions.",
+            ],
+        )
+
+    if len(losses) == len(obs):
+        verdict, reason = (
+            "LOSS-EVERYWHERE",
+            f"{metric} got worse past the {band:.1%} band at every thread setting.",
+        )
+    else:
+        verdict, reason = (
+            "NO-WIN",
+            f"{metric} did not move past the {band:.1%} band at any thread setting.",
+        )
+    return ThreadSweep(
+        metric=metric,
+        higher_is_better=higher,
+        noise_band=band,
+        observations=obs,
+        verdict=verdict,
+        thread_dependent=bool(losses) and len(losses) != len(obs),
+        demonstrated=False,
+        reasons=[reason],
+    )
+
+
+def run_under_threads(
+    code: str,
+    *,
+    threads: int | None,
+    timeout: float = 1800.0,
+    cwd: Path = REPO_ROOT,
+) -> dict[str, Any]:
+    """
+    Run `code` in a FRESH interpreter with the BLAS thread knobs pinned, return its JSON.
+
+    The child must print one JSON object as its last line. It is asked to echo back the
+    thread variables it actually saw, so the caller can assert the setting took effect
+    instead of trusting that it did -- an env var that never reached the child is the
+    silent version of this whole failure mode.
+    """
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=cwd,
+        env=thread_env(threads),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"thread-sweep child exited {proc.returncode} at threads={threads}:\n"
+            f"{proc.stderr[-2000:]}"
+        )
+    lines = [ln for ln in proc.stdout.strip().splitlines() if ln.strip()]
+    if not lines:
+        raise RuntimeError(f"thread-sweep child printed nothing at threads={threads}")
+    return json.loads(lines[-1])
+
+
+_PERF_PROBE = """
+import json, os, sys
+sys.path.insert(0, {bench!r})
+sys.path.insert(0, {src!r})
+from perf_harness import measure
+
+factory = None
+spec = {spec!r}
+if spec:
+    import importlib
+    mod, _, attr = spec.partition(":")
+    factory = getattr(importlib.import_module(mod), attr)
+
+rows = [measure({entries!r}, {fields!r}, matcher_factory=factory) for _ in range({trials!r})]
+vals = [getattr(r, {metric!r}) for r in rows]
+print(json.dumps({{
+    "values": vals,
+    "best": (max(vals) if {higher!r} else min(vals)),
+    "median": sorted(vals)[len(vals) // 2],
+    "thread_env": {{k: os.environ.get(k) for k in {envvars!r}}},
+}}))
+"""
+
+
+def perf_thread_runner(
+    baseline_spec: str | None,
+    candidate_spec: str | None,
+    *,
+    metric: str = "match_fields_per_sec",
+    entries: int = 1000,
+    fields: int = 300,
+    trials: int = 3,
+) -> Callable[[int | None], ThreadObservation]:
+    """
+    A runner that measures baseline and candidate at one thread setting, in child processes.
+
+    Specs are `"module:attribute"` naming a zero-argument matcher factory, or None for the
+    shipped default. Both arms are measured in the SAME thread condition and the
+    least-contaminated trial is taken at each -- interference only ever makes a run slower,
+    so the extreme in the good direction is the closest thing to the machine's true cost.
+    """
+    higher = metric in HIGHER_IS_BETTER
+
+    def probe(spec: str | None) -> str:
+        return _PERF_PROBE.format(
+            bench=str(BENCH_DIR),
+            src=str(REPO_ROOT / "src"),
+            spec=spec,
+            entries=entries,
+            fields=fields,
+            trials=trials,
+            metric=metric,
+            higher=higher,
+            envvars=list(THREAD_ENV_VARS),
+        )
+
+    def run(threads: int | None) -> ThreadObservation:
+        base = run_under_threads(probe(baseline_spec), threads=threads)
+        cand = run_under_threads(probe(candidate_spec), threads=threads)
+        _assert_threads_took_effect(base, threads)
+        _assert_threads_took_effect(cand, threads)
+        return ThreadObservation(threads=threads, baseline=base["best"], candidate=cand["best"])
+
+    return run
+
+
+def _assert_threads_took_effect(payload: dict[str, Any], threads: int | None) -> None:
+    """A sweep whose env never reached the child measured one condition twice."""
+    seen = payload.get("thread_env") or {}
+    want = None if threads is None else str(threads)
+    wrong = {k: v for k, v in seen.items() if v != want}
+    if wrong:
+        raise RuntimeError(
+            f"thread pinning did not reach the child: asked for {want!r}, child saw "
+            f"{wrong}. The two arms of this sweep would be the same condition measured "
+            f"twice, which is the failure H-003 is about."
+        )
+
+
+def measure_thread_sweep(
+    runner: Callable[[int | None], ThreadObservation],
+    *,
+    metric: str = "match_fields_per_sec",
+    thread_counts: Sequence[int | None] = (1, None),
+    noise_band: float = DEFAULT_NOISE_FLOOR,
+    higher_is_better: bool | None = None,
+) -> ThreadSweep:
+    """Run `runner` at each thread setting and judge the result. See judge_thread_sweep."""
+    obs = [runner(t) for t in thread_counts]
+    return judge_thread_sweep(metric, obs, noise_band=noise_band, higher_is_better=higher_is_better)
+
+
+# =============================================================================
 # RECORDS + LEDGER
 # =============================================================================
 
@@ -995,9 +1839,32 @@ class Measurement:
     target_metric: str | None = None
     simulated: bool = False
     notes: list[str] = dc_field(default_factory=list)
+    # H-003. Present only when somebody ran the 1-thread/N-thread sweep. Its ABSENCE is
+    # load-bearing: compare() refuses to call a threading, BLAS or batch-scheduling change
+    # a WIN without one, because that is the class of change that can win purely by
+    # matching the box it was measured on.
+    thread_sweep: ThreadSweep | None = None
 
     def scale_keys(self) -> list[str]:
         return [c.key for c in (self.cost or [])]
+
+    def corpus_identity(self) -> CorpusIdentity:
+        """
+        The corpus this record's numbers belong to (H-002).
+
+        A record with no quality block cannot state its corpus size, so it declares -1 and
+        will only ever match another record that also cannot. An unknown size is not a
+        matching size: waving it through is precisely the transfer this guard exists to
+        stop.
+        """
+        if self.quality is None:
+            return CorpusIdentity(
+                benchmark=self.benchmark,
+                kind=self.corpus,
+                n_entries=-1,
+                n_queries=-1,
+            )
+        return self.quality.identity()
 
     def cost_stat(self, metric: str, scope: str) -> CostStat | None:
         for c in self.cost or []:
@@ -1019,6 +1886,7 @@ class Measurement:
             "target_metric": self.target_metric,
             "simulated": self.simulated,
             "notes": self.notes,
+            "thread_sweep": self.thread_sweep.to_dict() if self.thread_sweep else None,
         }
 
     @classmethod
@@ -1049,6 +1917,9 @@ class Measurement:
             target_metric=d.get("target_metric"),
             simulated=d.get("simulated", False),
             notes=d.get("notes", []),
+            thread_sweep=(
+                ThreadSweep.from_dict(d["thread_sweep"]) if d.get("thread_sweep") else None
+            ),
         )
 
 
@@ -1102,6 +1973,7 @@ def record(
     *,
     noise: NoiseBand | None = None,
     target_metric: str | None = None,
+    thread_sweep: ThreadSweep | None = None,
     path: Path = LEDGER_PATH,
 ) -> Measurement:
     """
@@ -1114,6 +1986,8 @@ def record(
         measurement.noise = noise
     if target_metric is not None:
         measurement.target_metric = target_metric
+    if thread_sweep is not None:
+        measurement.thread_sweep = thread_sweep
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(measurement.to_dict(), default=_json_default) + "\n")
@@ -1409,21 +2283,29 @@ def compare(
                     verdict that the 715 -> 520 entries/sec "regression" should have got.
       NEUTRAL       no target was declared and nothing tripped: a change verified not to
                     break anything, which is the correct result for a refactor.
+
+    Two things happen before and after that decision, and neither is negotiable:
+
+      H-002  the corpora are checked FIRST, and a mismatch raises `CorpusMismatch` instead
+             of producing a verdict. There is no comparison to annotate if the two records
+             were not measured on the same task.
+      H-003  a WIN is downgraded to INCONCLUSIVE if the change's own description names a
+             threading, BLAS or batch-scheduling mechanism and no passing `ThreadSweep` is
+             attached. Only WIN is touched: you buy your way into a win, never out of a
+             loss.
     """
     guard_map = {g.metric: g for g in guards}
     band = noise or candidate_record.noise or baseline_record.noise
     warnings: list[str] = []
 
-    if baseline_record.corpus != candidate_record.corpus:
-        raise ValueError(
-            f"refusing to compare a '{baseline_record.corpus}' record against a "
-            f"'{candidate_record.corpus}' one -- the corpora are not the same task."
-        )
-    if baseline_record.benchmark != candidate_record.benchmark:
-        raise ValueError(
-            f"refusing to compare across benchmarks: "
-            f"{baseline_record.benchmark!r} vs {candidate_record.benchmark!r}"
-        )
+    # H-002. Raises CorpusMismatch (a ValueError) on ANY corpus difference -- name, kind,
+    # entry count, query count or content digest. Deliberately the first thing that
+    # happens: every delta, CI and verdict below is meaningless if the two records were
+    # not measured on the same task, and computing them first only makes the wrong answer
+    # look more thorough.
+    warnings += assert_same_corpus(
+        baseline_record.corpus_identity(), candidate_record.corpus_identity()
+    )
     if band is None:
         warnings.append(
             "NO NOISE CALIBRATION on either record. Every cost delta below is unjudged: "
@@ -1443,6 +2325,8 @@ def compare(
 
     target = target or candidate_record.target_metric
     verdict, reasons = _decide(deltas, target, target_scope, band)
+    verdict, reasons, thread_warnings = _apply_thread_rule(candidate_record, verdict, reasons)
+    warnings += thread_warnings
 
     return Comparison(
         baseline_id=baseline_record.record_id,
@@ -1455,6 +2339,59 @@ def compare(
         reasons=reasons,
         deltas=deltas,
         warnings=warnings,
+    )
+
+
+def _apply_thread_rule(
+    candidate: Measurement,
+    verdict: str,
+    reasons: list[str],
+) -> tuple[str, list[str], list[str]]:
+    """
+    H-003, enforced instead of remembered: a threading win must survive the thread count.
+
+    Only WIN is touched. A REGRESSION stays a REGRESSION -- the asymmetry that runs
+    through this whole module applies here too: you have to buy your way INTO a win, never
+    out of a loss. The mechanism is read from the change's own label and notes, so
+    describing your change honestly is what arms the check; describing it as "faster
+    matching" and hiding that it re-tunes a batch size is the loophole, and it is a
+    loophole in the writing, not in the code.
+    """
+    hits = mechanism_needs_thread_sweep(candidate.label, candidate.notes)
+    if not hits:
+        return verdict, reasons, []
+
+    sweep = candidate.thread_sweep
+    named = ", ".join(hits)
+    if sweep is None:
+        note = (
+            f"mechanism names {named}, so H-003 applies: this change could be winning "
+            f"only at the thread count it was measured at. No thread sweep is attached."
+        )
+        if verdict != "WIN":
+            return verdict, reasons, [note]
+        return (
+            "INCONCLUSIVE",
+            [
+                *reasons,
+                f"DOWNGRADED from WIN: {note} Attach measure_thread_sweep(...) at 1 thread "
+                f"and at the library default. The small-corpus fallback passed every other "
+                f"check in this module and existed only because OpenBLAS dispatched 24 "
+                f"threads across a small GEMM on a saturated box.",
+            ],
+            [],
+        )
+
+    if sweep.demonstrated:
+        return verdict, [*reasons, f"Thread sweep: {sweep.verdict} on {sweep.metric}."], []
+
+    note = f"thread sweep on {sweep.metric} came back {sweep.verdict}, not WIN-EVERYWHERE."
+    if verdict != "WIN":
+        return verdict, reasons, [note, *sweep.reasons]
+    return (
+        "INCONCLUSIVE",
+        [*reasons, f"DOWNGRADED from WIN: {note}", *sweep.reasons],
+        [],
     )
 
 
@@ -1773,6 +2710,7 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Optimization ledger for nexus-matcher.")
     ap.add_argument("--demo", action="store_true", help="prove the ledger works, end to end")
     ap.add_argument("--calibrate", action="store_true", help="measure this machine's noise floor")
+    ap.add_argument("--shape", action="store_true", help="complexity shape: 30k as a ratio of 1k")
     ap.add_argument("--record", type=str, metavar="LABEL", help="measure HEAD and append")
     ap.add_argument("--leaderboard", action="store_true")
     ap.add_argument("--compare", nargs=2, metavar=("BASE_ID", "CAND_ID"))
@@ -1795,6 +2733,12 @@ def main() -> None:
         )
         print("\n" + band.render())
         return
+    if args.shape:
+        report = measure_shape(trials=args.trials, progress=True)
+        print(report.render())
+        # Non-zero on a broken shape: this is a gate, and a gate that only prints is a
+        # decoration -- the exact defect tests/meta/test_ci_has_teeth.py exists to stop.
+        raise SystemExit(1 if report.failures else 0)
     if args.record:
         m = measure_all(
             label=args.record,

@@ -1,0 +1,8 @@
+id: NM-0010
+symptom: "table cells are Rich markup, so a dictionary entry named `[deprecated] Customer Email` was displayed as `Customer Email` -- the UI silently rewriting a data value it was asked to show"
+severity: MEDIUM
+fixed_in: 2.0.1
+gate_that_should_have_caught_it: "none -- every CLI fixture used bracket-free business names and field paths, so no test ever put markup-shaped DATA on the screen"
+gate_that_catches_it_now: "tests/museum/NM-0010/test_nm_0010.py, plus tests/unit/presentation/test_cli_regressions.py"
+touches:
+  - src/nexus_matcher/presentation/cli/main.py
