@@ -715,16 +715,55 @@ class NexusMatcher:
             batch = embed_result.unwrap()
             embeddings = [batch.embeddings[i] for i in range(len(query_texts))]
 
+        dense_per_field = self._search_dense_batch(embeddings)
+
         results: dict[str, tuple[MatchResult, ...]] = {}
         for i, field in enumerate(fields):
             field_results = self._match_field(
                 field,
                 query_text=query_texts[i],
                 query_embedding=embeddings[i] if embeddings is not None else None,
+                dense_candidates=dense_per_field[i] if dense_per_field is not None else None,
             )
             results[self._unique_result_key(field, results)] = tuple(field_results)
 
         return results
+
+    def _search_dense_batch(
+        self, embeddings: list[np.ndarray] | None
+    ) -> list[list[SearchResult]] | None:
+        """
+        Retrieve dense candidates for every field in ONE call, when the store supports it.
+
+        The encoder was already batched; dense retrieval was not. Scoring one query is a
+        matrix-VECTOR product that streams the whole corpus matrix out of RAM, so a
+        688-field schema read a 153 MB matrix 688 times. Batching turns those into one
+        matrix-MATRIX product per chunk, which reads the corpus once and reuses each
+        cache line across every query in the block: measured 2.98x on the real FHIR
+        dictionary (363 us -> 122 us per query).
+
+        Returns None when batching is unavailable or fails, and the caller falls back to
+        per-field search. That fallback is not decoration -- only InMemoryVectorStore
+        implements search_batch today; Qdrant and HNSW do not, and a store supplied by a
+        caller certainly need not. Degrading quietly here is right because the per-field
+        path returns identical results, just slower.
+        """
+        if embeddings is None:
+            return None
+        search_batch = getattr(self._vector_store, "search_batch", None)
+        if search_batch is None:
+            return None
+
+        batched = search_batch(embeddings, top_k=self._config.dense_top_k)
+        if batched.is_failure:
+            return None
+        rows = batched.unwrap()
+        # One row per query is the contract; anything else means the store disagrees with
+        # us about it, and silently zipping mismatched lists would hand a field another
+        # field's candidates -- the same class of defect as the result-key collision.
+        if len(rows) != len(embeddings):
+            return None
+        return rows
 
     @staticmethod
     def _unique_result_key(field: SchemaField, taken: Mapping[str, Any]) -> str:
@@ -849,6 +888,7 @@ class NexusMatcher:
         field: SchemaField,
         query_text: str | None = None,
         query_embedding: np.ndarray | None = None,
+        dense_candidates: list[SearchResult] | None = None,
     ) -> list[MatchResult]:
         """
         Match a single field against the dictionary.
@@ -868,15 +908,17 @@ class NexusMatcher:
                 return []
             query_embedding = embed_result.unwrap()
 
-        # Dense retrieval
-        dense_results = self._vector_store.search(
-            query_embedding,
-            top_k=self._config.dense_top_k,
-        )
-        if dense_results.is_failure:
-            return []
-
-        dense_candidates = dense_results.unwrap()
+        # Dense retrieval. `dense_candidates` arrives pre-computed when a whole schema was
+        # retrieved in one batched call; searching per field is the fallback, and the
+        # single-field public path.
+        if dense_candidates is None:
+            dense_results = self._vector_store.search(
+                query_embedding,
+                top_k=self._config.dense_top_k,
+            )
+            if dense_results.is_failure:
+                return []
+            dense_candidates = dense_results.unwrap()
 
         # Collapse alias hits onto the entry that owns them, keeping the BEST score per
         # entry (max-pool). Without this an entry could occupy several of the top-k slots
