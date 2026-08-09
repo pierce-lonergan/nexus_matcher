@@ -59,6 +59,17 @@ names, `customer_id` is indistinguishable from a field `id` nested under `custom
 splitter therefore prefers KNOWN structure (an explicit path field, or `__` boundaries)
 and falls back to a conservative heuristic only when nothing better exists. Pass
 `field_paths` or use the raw-Avro parser when exactness matters.
+
+## Identity: the reconstructed path is NOT a key
+
+The split is lossy in one direction and that matters downstream. `contact__email` and
+`contact_email` -- an array of contacts and a scalar column, both legal fields of one
+Avro record -- reconstruct to the same `contact.email`. So the dotted path identifies a
+POSITION IN THE HIERARCHY, which is what the matcher wants for retrieval, and cannot
+identify the column, which is what a caller wants for lookup.
+
+`source_metadata["flattened_name"]` is that identity: the exact string the caller gave
+us, set on every field this module produces. `match_schema` keys its results by it.
 """
 
 from __future__ import annotations
@@ -236,9 +247,14 @@ def field_from_flattened(
         is_array=bool(is_array or touches_array),
         array_item_type=map_data_type(array_element_type) if array_element_type else None,
         source_metadata={
+            **(dict(extra) if extra else {}),
+            # Written LAST because match_schema keys its result dict by this: it is the
+            # caller's handle on the field, and the dotted path above is not (several
+            # flattened names split to one path). An unrecognised column literally named
+            # "flattened_name" used to land in `extra` and overwrite it, leaving the
+            # field addressable only under some other row's name.
             "flattened_name": flattened_name,
             "flattened": True,
-            **(dict(extra) if extra else {}),
         },
     )
 

@@ -3,7 +3,10 @@
 # SENSITIVE: No | REQUIRED_BY: all modules, CI/CD, packaging
 
 [build-system]
-requires = ["hatchling>=1.18.0", "hatch-vcs>=0.3.0"]
+# hatchling floor raised from 1.18 for the PEP 639 `license`/`license-files` keys below.
+# 1.18 predates them and would fall back to treating the SPDX string as a legacy free-text
+# license, which is the exact metadata bug those keys exist to fix.
+requires = ["hatchling>=1.27.0", "hatch-vcs>=0.3.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -11,7 +14,13 @@ name = "nexus-matcher"
 dynamic = ["version"]
 description = "Enterprise-grade semantic schema matching system using neural embeddings, ColBERT reranking, and multi-signal scoring for automated data dictionary mapping"
 readme = "README.md"
-license = {file = "LICENSE"}
+# PEP 639. `license = {file = "LICENSE"}` inlined all 11315 characters of the Apache-2.0
+# text into the metadata's License: field (12915 chars over 201 continuation lines), and
+# left License-Expression empty even though the build emits Metadata-Version 2.4. PyPI
+# reads the expression, not the free-text field, so the sidebar showed no license at all
+# while the wall of licence text sat in the metadata nobody renders.
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 authors = [
     { name = "Pierce Lonergan", email = "lonerganpierce@gmail.com" }
@@ -38,11 +47,16 @@ keywords = [
     "json-schema",
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    # 5, not 4 - Beta: CHANGELOG.md records 1.0.0 (2025-10-15) and 2.0.0 (2025-12-09),
+    # the public surface is pinned by __all__ and documented in docs/API_REFERENCE.md,
+    # and the entry points are regression-tested. "Beta" on a 2.0.x line understates it.
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "Intended Audience :: Information Technology",
-    "License :: OSI Approved :: Apache Software License",
+    # The Apache-2.0 license classifier is deliberately gone: PEP 639 deprecates the
+    # License :: trove classifiers in favour of the SPDX `license` expression set above,
+    # and declaring both makes tools disagree about which one is authoritative.
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
@@ -70,7 +84,9 @@ dependencies = [
     "pydantic>=2.0.0,<3.0.0",
     "pydantic-settings>=2.0.0,<3.0.0",
     "structlog>=23.0.0",
-    "typing-extensions>=4.5.0",
+    # typing-extensions was dropped 2026-08-09: `grep -rn typing.extensions src tests
+    # benchmarks scripts docs` returns hits in requirements.txt and this file only. The
+    # package targets 3.10+, where every typing construct it uses is already in `typing`.
     # The bundled int8 encoder is the DEFAULT provider and the reason `pip install
     # nexus-matcher` works with no download. Its runtime therefore belongs in the core
     # dependencies, not an extra -- making these optional produced a package that shipped
@@ -80,19 +96,35 @@ dependencies = [
     "tokenizers>=0.15.0",
     # C++ Levenshtein on the per-candidate hot path: ~145x the pure-Python DP fallback.
     "rapidfuzz>=3.0.0",
-    # The lexical arm of hybrid retrieval. Core, not an extra, because from_config()
-    # wires a BM25Retriever unconditionally and _index_dictionary raises rather than
-    # silently degrading to dense-only -- so without this a plain `pip install
-    # nexus-matcher` could not index a dictionary at all. It also earns its place:
-    # sparse-only reaches 0.542 P@1 and holds 10% of the fusion weight, rescuing the
-    # exact-token matches the embedding model misses. One pure-Python module whose only
-    # dependency is numpy, which is already required.
-    "rank-bm25>=0.2.2",
+    # rank-bm25 is deliberately NOT here. BM25Retriever used to delegate to its
+    # BM25Okapi, which scored every document for every query term; it now uses a numpy
+    # inverted index and imports nothing. rank-bm25 survives only in `dev`, where the
+    # tests pin the new scores against it. Shipping a core dependency that no runtime
+    # code imports is the same defect this release removed elsewhere.
     # Enterprise data dictionaries are overwhelmingly .xlsx, and the documented
     # quickstart loads one. A 251 KB pure-Python wheel with a single small dependency
     # is a fair price for `load_dictionary("glossary.xlsx")` working on a bare install;
     # pandas, which this replaced, was ~50 MB of transitive weight for the same job.
     "openpyxl>=3.1.0",
+    # [project.scripts] declares `nexus-matcher` unconditionally, and README installs with
+    # a bare `pip install nexus-matcher` and then runs `nexus-matcher match customer.avsc`
+    # eight lines later. With these two in the `cli` extra instead, that documented second
+    # step died on `import typer` at presentation/cli/main.py:22 -- a raw ModuleNotFoundError
+    # traceback from a command pip had just put on PATH. It never showed up in development
+    # because typer is in the `dev` install and in CI, so every environment that ran the CLI
+    # already had it; only a first-time user following the README ever saw it.
+    # Same standard as rank-bm25 and openpyxl above: 122 KB and 303 KB of pure-Python wheel,
+    # no torch, no compiler. Current typer requires rich outright (0.27.1 Requires-Dist:
+    # rich>=13.8.0), so for anyone on a modern typer the `cli` extra was never saving the
+    # download it appeared to. rich stays declared here rather than leaned on transitively,
+    # because the >=0.9.0 floor still admits typer 0.9.x, which does not pull rich at all.
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    # tomllib is stdlib from 3.11; this package supports 3.10, where
+    # `NexusMatcher.from_config("matching.toml")` -- the line printed in both README and
+    # QUICKSTART -- raises ModuleNotFoundError without a backport. 15 KB, pure Python, and
+    # the marker means 3.11+ installs get nothing at all.
+    "tomli>=2.0.0; python_version < '3.11'",
 ]
 
 [project.optional-dependencies]
@@ -115,20 +147,76 @@ vector-stores = [
     "usearch>=2.12.0",
 ]
 
-# Sparse retrieval. Kept as an extra name so `nexus-matcher[sparse]` still resolves for
-# anyone who pinned it, but rank-bm25 moved into the core dependencies -- the default
-# pipeline cannot index a dictionary without it.
+# Sparse retrieval. BM25 is BUILT IN and always available -- BM25Retriever runs on a
+# numpy inverted index and imports nothing -- so this extra installs nothing the default
+# pipeline needs. It is kept as a name purely so `nexus-matcher[sparse]` keeps resolving
+# for anyone who pinned it, and rank-bm25 is here only because the tests compare the
+# built-in scores against it.
 sparse = [
     "rank-bm25>=0.2.2",
 ]
 
-# Native accelerators. Everything here has a pure-Python fallback, so the package
-# still works without them - it is just slower. Declared because
+# Native accelerators. Everything here has a pure-Python or stdlib fallback, so the
+# package still works without them - it is just slower. Declared because
 # application/use_cases/match_schema.py imports rapidfuzz at module scope (inside
 # a try/except) and it was previously installed in dev environments by accident,
 # never by declaration, so a clean `pip install` silently got the slow path.
 accel = [
     "rapidfuzz>=3.0.0",   # C++ Levenshtein, ~145x faster than the DP fallback
+    # Both of these degrade quietly, which is why nobody noticed they were unreachable:
+    # caches/content.py and adapters/incremental fall back to hashlib and log a warning,
+    # and quantized.py's Windows AVX2/AVX512/VNNI probe just reports every feature absent.
+    # You got the slow path and a correct-looking answer either way.
+    "blake3>=0.4.0",      # 8-10x SHA-256 for content hashing; hashlib otherwise
+    "py-cpuinfo>=9.0.0",  # CPU feature detection on Windows; no SIMD dispatch otherwise
+]
+
+# Graph-based structural matching (core/graph_matcher.py). The module already guards the
+# import with NETWORKX_AVAILABLE, so without networkx it imports fine and every
+# graph-matching entry point is simply inert.
+graph = [
+    "networkx>=3.0",
+]
+
+# Metrics backends. shared/metrics.py raises ImportError with install hints for both of
+# these, and until now the hints named packages no extra could deliver.
+observability = [
+    "prometheus-client>=0.17.0",
+    "opentelemetry-api>=1.20.0",
+    "opentelemetry-sdk>=1.20.0",
+]
+
+# INT8/dynamic quantization of embedding models (embedding_providers/quantized.py).
+# onnxruntime is already core; the export path additionally needs the onnx graph library
+# and a torch/transformers pair to load the source model.
+quantization = [
+    "onnx>=1.15.0",
+    "torch>=2.0.0",
+    "transformers>=4.30.0",
+]
+
+# Static (torch-free) embeddings. Backs the `static` embedding provider registered in
+# [project.entry-points] and the third rung of bundled_onnx.py's auto fallback chain, so
+# plugin discovery advertised a provider that nothing could install.
+static-embeddings = [
+    "model2vec>=0.3.0",
+]
+
+# ColBERT MaxSim late-interaction reranking (rerankers/colbert.py). The package summary and
+# the `colbert` keyword both advertise this, and ColBERTMaxSimReranker is the only non-mock
+# implementation of it, yet ragatouille was reachable from no extra - there was no supported
+# way to install the headline feature.
+#
+# Deliberately NOT in `full`, and the only extra excluded from it. Verified 2026-08-09 on
+# CPython 3.13: `pip install ragatouille` is ResolutionImpossible for all 18 published
+# versions, because every langchain-core release caps at Requires-Python <3.12 and its
+# `voyager` dependency publishes no wheel at all ("No matching distribution found"). Folding
+# it into `full` would turn `pip install nexus-matcher[full]` into a hard resolver error on
+# two of the four Python versions this project classifies as supported. Keeping it separate
+# means `[full]` still resolves everywhere and users who want ColBERT ask for it explicitly
+# on a Python that can take it.
+colbert = [
+    "ragatouille>=0.0.8",  # requires Python <3.12; see above
 ]
 
 # Caching
@@ -149,6 +237,10 @@ loaders = [
     "pandas>=2.0.0",
     "openpyxl>=3.1.0",
     "sqlalchemy>=2.0.0",
+    # application/ingest.py reads .parquet sources alongside .csv/.xlsx/.json. Its sibling
+    # branches point at `nexus-matcher[loaders]` on failure; the parquet branch had to say
+    # "pip install pyarrow" instead, because no extra carried it.
+    "pyarrow>=14.0.0",
 ]
 
 # REST API server
@@ -158,9 +250,19 @@ api = [
     "python-multipart>=0.0.6",
 ]
 
-# CLI
+# CLI. Kept as an extra name so `nexus-matcher[cli]` and the `pip install -e ".[cli]"` in
+# QUICKSTART still resolve, but typer and rich moved into the core dependencies -- the
+# console script is declared unconditionally and cannot start without them.
+#
+# The `[all]` marker is also gone. It was valid when written -- typer 0.9.0 really does
+# ship an `all` extra -- but typer has declared no extras at all since 0.12 (checked the
+# 0.12.0 and 0.27.1 wheels: Provides-Extra is empty in both). Since the floor is a floor,
+# every install resolved to a modern typer, asked it for an extra it does not have, and got
+#   WARNING: typer 0.27.1 does not provide the extra 'all'
+# Dropping `[all]` costs nothing: modern typer pulls click, rich, shellingham and colorama
+# as ordinary dependencies, which is exactly what `all` used to add.
 cli = [
-    "typer[all]>=0.9.0",
+    "typer>=0.9.0",
     "rich>=13.0.0",
 ]
 
@@ -169,14 +271,19 @@ async = [
     "celery>=5.3.0",
 ]
 
-# Full installation (all features)
+# Full installation (all features). `colbert` is the one deliberate omission - see the
+# resolver evidence on that extra above.
 full = [
     "nexus-matcher[embeddings,vector-stores,sparse,accel,cache,parsers,loaders,api,cli,async]",
+    "nexus-matcher[graph,observability,quantization,static-embeddings]",
 ]
 
 # Development dependencies
 dev = [
     "pytest>=7.4.0",
+    # tests/unit/infrastructure/test_bm25_vectorized.py pins the built-in BM25 scores
+    # against this reference implementation; it is not a runtime dependency.
+    "rank-bm25>=0.2.2",
     "pytest-cov>=4.1.0",
     "pytest-asyncio>=0.21.0",
     "pytest-mock>=3.11.0",
@@ -233,7 +340,10 @@ static = "nexus_matcher.infrastructure.adapters.embedding_providers.static_embed
 
 [project.urls]
 Homepage = "https://github.com/pierce-lonergan/nexus_matcher"
-Documentation = "https://nexus-matcher.readthedocs.io"
+# Was https://nexus-matcher.readthedocs.io, which returns 404 - that Read the Docs project
+# was never created, so the "Documentation" link in the PyPI sidebar was a dead end. The
+# docs/ tree in the repo is the documentation that actually exists (verified 200).
+Documentation = "https://github.com/pierce-lonergan/nexus_matcher/tree/main/docs"
 Repository = "https://github.com/pierce-lonergan/nexus_matcher"
 Issues = "https://github.com/pierce-lonergan/nexus_matcher/issues"
 Changelog = "https://github.com/pierce-lonergan/nexus_matcher/blob/main/CHANGELOG.md"

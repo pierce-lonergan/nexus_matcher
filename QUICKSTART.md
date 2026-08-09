@@ -16,8 +16,10 @@ pip install -e ".[cli]"
 ```
 
 No model download and no HuggingFace account: the package carries an int8 ONNX build
-of `bge-small-en-v1.5` and uses it by default. Everything runs on CPU. `[cli]` is only
-for the `nexus-matcher` command -- the Python API needs no extras at all.
+of `bge-small-en-v1.5` and uses it by default. Everything runs on CPU. No extra is
+required for anything on this page: `[cli]` still resolves, so the line above keeps
+working, but typer and rich are core dependencies now and `pip install -e .` gets you
+the `nexus-matcher` command too.
 
 ---
 
@@ -122,9 +124,10 @@ nexus-matcher match customer.avsc -d dictionary.csv -k 3 -t 0.5
 
 Available commands: `match`, `sync`, `api`, `info`. Run `nexus-matcher --help`.
 
-On Windows, the CLI writes box-drawing characters and a spinner. In a console using the
-legacy code page this raises `'charmap' codec can't encode character`. Set
-`PYTHONIOENCODING=utf-8` (or use Windows Terminal) before running.
+On a Windows console using a legacy code page the CLI drops to ASCII decorations and an
+ASCII spinner, and escapes anything else it cannot encode rather than aborting on it.
+Nothing needs setting. Use Windows Terminal, or set `PYTHONIOENCODING=utf-8`, if you want
+box drawing and non-ASCII field names rendered exactly.
 
 ---
 
@@ -247,7 +250,8 @@ requires an indexed dictionary; `load_dictionary()` both loads and indexes.
 **`ValueError: No loader found for extension .xyz`** — the loader registry is keyed by
 file extension. `from_config()` registers `.csv`/`.tsv`/`.txt` and Excel formats only.
 
-**`'charmap' codec can't encode character`** on Windows — set `PYTHONIOENCODING=utf-8`.
+**`'charmap' codec can't encode character`** on Windows — fixed in 2.0.1, where it killed
+`match` and `sync` outright. On 2.0.0, set `PYTHONIOENCODING=utf-8`.
 
 **Low confidence across the board** — confidence is dominated by the semantic score
 (weight 0.70) plus a domain score (0.15). Dictionary entries with an empty `Definition`

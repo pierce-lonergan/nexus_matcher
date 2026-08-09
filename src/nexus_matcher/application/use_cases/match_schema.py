@@ -24,7 +24,7 @@ import math
 import re
 import sys
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -273,6 +273,33 @@ def _squash_score(score: float) -> float:
     if score > 30.0:
         return 1.0
     return float(1.0 / (1.0 + math.exp(-score)))
+
+
+# =============================================================================
+# RESULT IDENTITY
+# =============================================================================
+
+
+def field_result_key(field: SchemaField) -> str:
+    """
+    The name a caller uses to look this field up in a match result.
+
+    Results come back as a dict, so every field needs a handle -- and the handle has to
+    be the string the CALLER supplied, not one we derived. The flattened parser
+    deliberately rewrites `cust_addr__city` into the dotted path `cust.addr.city`,
+    because recovering the parent path is worth +19.3 P@1; keyed by that path, a caller
+    asking for their own column name got a KeyError from a result set that did contain
+    their field, and a caller iterating the keys saw names their schema never used.
+
+    `flattened_name` is that original string, and both flattened entry points set it.
+    Every other parser -- raw Avro, JSON Schema, SQL DDL -- has no such name and keeps
+    its dotted `full_path`, which is what those callers have always addressed.
+    """
+    flattened = field.source_metadata.get("flattened_name")
+    if isinstance(flattened, str) and flattened:
+        return flattened
+    # __post_init__ guarantees full_path falls back to the bare field name.
+    return field.full_path
 
 
 # =============================================================================
@@ -590,7 +617,9 @@ class NexusMatcher:
             schema_format: Force specific parser (auto-detect if None)
 
         Returns:
-            Dictionary mapping field paths to match results
+            One entry per parsed field, in schema order, keyed by the name the caller
+            used for it -- the original flattened column name for a flattened schema,
+            the dotted `full_path` for every other format. See `field_result_key`.
         """
         if not self._is_initialized:
             raise RuntimeError("Dictionary not loaded. Call load_dictionary() first.")
@@ -611,6 +640,9 @@ class NexusMatcher:
         text at a time reaches ~128 texts/sec where a batch of 128 reaches ~1690.
         Building every query string first and embedding them together is what turns a
         per-field loop into a batched pipeline.
+
+        Returns exactly one entry per field, in input order. That count is the contract:
+        see `_unique_result_key` for what used to happen when it did not hold.
         """
         if not fields:
             return {}
@@ -630,9 +662,38 @@ class NexusMatcher:
                 query_text=query_texts[i],
                 query_embedding=embeddings[i] if embeddings is not None else None,
             )
-            results[field.full_path] = tuple(field_results)
+            results[self._unique_result_key(field, results)] = tuple(field_results)
 
         return results
+
+    @staticmethod
+    def _unique_result_key(field: SchemaField, taken: Mapping[str, Any]) -> str:
+        """
+        A key for `field` that cannot displace one already in `taken`.
+
+        Results were keyed by `full_path`, which is NOT unique. The flattened parser maps
+        both `contact__email` (an array of contacts) and `contact_email` (a scalar
+        column) -- two legal, distinct fields of a single Avro record -- onto
+        `contact.email`, so the second overwrote the first. `match_schema` then returned
+        fewer entries than it was given: no exception, no warning, just a column absent
+        from the results, inheriting no protection level, in a library whose entire job
+        is to make a field inherit one. The only visible symptom was a count nobody had
+        reason to check.
+
+        Keying by the caller's own name removes the common case. A genuine duplicate --
+        the same column listed twice in an export -- still has to go somewhere, so it
+        takes a `#2`, `#3`, ... suffix. `#` occurs in neither an Avro name nor a dotted
+        path, so a suffixed key reads as synthetic rather than as a real column, and each
+        MatchResult still carries the SchemaField it belongs to.
+        """
+        key = field_result_key(field)
+        if key not in taken:
+            return key
+
+        n = 2
+        while f"{key}#{n}" in taken:
+            n += 1
+        return f"{key}#{n}"
 
     def match_schema_session(
         self,

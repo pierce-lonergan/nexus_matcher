@@ -67,6 +67,12 @@ jobs:
         python-version: ['3.10', '3.11', '3.12', '3.13']
 
     steps:
+      # The preflight script reads README.md and pyproject.toml as well as the wheel,
+      # so the source has to be here. This job used to run without a checkout, which is
+      # part of why nothing noticed the README's relative links were dead on PyPI.
+      - name: Check out source
+        uses: actions/checkout@v4
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -167,11 +173,23 @@ jobs:
           assert "torch" not in sys.modules, "the bundled path pulled in torch"
           print(f"offline encoder OK on {sys.platform}, similarities {sims}")
 
-      - name: Test CLI (if available)
+      # Replaces a step that could not fail. It ran `pip install typer rich` first --
+      # installing the very dependencies whose absence was the bug -- then exercised
+      # `--help`, one of the few commands that still worked, and finished with
+      # `|| echo` plus `continue-on-error: true`. Three independent reasons it stayed
+      # green while the published 2.0.0 CLI was unusable on a default install and
+      # crashed outright on any non-UTF-8 Windows console.
+      #
+      # release_preflight.py installs the wheel into its OWN clean venv with no extras,
+      # runs every console script for real (including under a cp437 codepage), checks
+      # every __all__ name and entry point, proves the bundled encoder returns real
+      # vectors, and runs an end-to-end match offline. It exits non-zero on any failure
+      # and is deliberately NOT continue-on-error.
+      - name: Release preflight (clean-install behaviour of the built wheel)
+        shell: bash
         run: |
-          pip install typer rich
-          nexus-matcher --help || echo "CLI not available without full install"
-        continue-on-error: true
+          python -m pip install --upgrade pip
+          python scripts/release_preflight.py --wheel "$(ls dist/*.whl | head -1)"
 
   publish-testpypi:
     name: Publish to TestPyPI

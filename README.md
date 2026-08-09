@@ -1,7 +1,7 @@
 # NexusMatcher
 
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](LICENSE)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://github.com/pierce-lonergan/nexus_matcher/blob/main/LICENSE)
 
 Map schema fields onto data dictionary entries by meaning, not by string equality.
 
@@ -58,16 +58,25 @@ Or from source:
 git clone https://github.com/pierce-lonergan/nexus_matcher.git
 cd nexus_matcher
 python -m venv .venv && . .venv/bin/activate     # Windows: .venv\Scripts\activate
-pip install -e ".[parsers,loaders,sparse,cli]"
+pip install -e .
 ```
 
-Extras defined in `pyproject.toml`: `embeddings`, `parsers`, `loaders`, `sparse`,
-`vector-stores`, `cache`, `api`, `cli`, `async`, `docs`, `dev`, and `full`. **None of
-them are needed for the quickstart** — install extras only for what they add:
-`cli` for the `nexus-matcher` command, `api` for the REST server, `vector-stores` for
-Qdrant/HNSW, `cache` for Redis, `embeddings` for the torch encoder. `loaders` and
-`sparse` are kept as names so existing pins keep resolving, but their contents moved
-into the core dependencies.
+Extras defined in `pyproject.toml`: `embeddings`, `vector-stores`, `sparse`, `accel`,
+`graph`, `observability`, `quantization`, `static-embeddings`, `colbert`, `cache`,
+`parsers`, `loaders`, `api`, `cli`, `async`, `full`, `dev`, and `docs`. **None of them
+are needed for the quickstart, and that now includes the CLI** — install extras only for
+what they add: `api` for the REST server, `vector-stores` for Qdrant/HNSW, `cache` for
+Redis, `embeddings` for the torch encoder, `loaders` to read a dictionary out of a
+database or a Parquet file, `accel` for BLAKE3 hashing and CPU feature detection, and
+`graph`, `observability`, `quantization`, `static-embeddings` and `colbert` for the
+experimental components under
+[What is actually implemented](#what-is-actually-implemented). `full` is everything
+except `colbert`, which has no resolvable install on Python 3.12+.
+
+`sparse` and `cli` are kept as names so existing pins keep resolving, but their contents
+are core dependencies now: `rank-bm25` because the default pipeline cannot index a
+dictionary without the sparse arm, `typer` and `rich` because the console script is
+declared unconditionally and cannot start without them.
 
 ---
 
@@ -134,7 +143,7 @@ threshold is tuned for precision on auto-approval, not coverage
 
 The miss is worth reading rather than hiding. `cid` is a bare three-letter abbreviation
 with no parent path and no `doc`, which is the hardest input this system takes and the
-one case it is measurably weakest on (see [Known limits](#known-limits)). It is not a
+one case it is measurably weakest on (see [Limitations](#limitations)). It is not a
 quantization artifact — the fp32 sentence-transformers encoder also gets it wrong, just
 differently (`Customer Full Name`, 0.74). Give that field either a parent path or a one
 -line description and it resolves; that single signal is worth +19.3 P@1 on the
@@ -541,7 +550,7 @@ introspection endpoints **only**:
 
 There is **no** HTTP matching endpoint, no dictionary CRUD endpoint, no cache endpoint,
 and no `/metrics` endpoint. Matching over HTTP is not implemented. See
-[docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+[docs/API_REFERENCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/API_REFERENCE.md).
 
 **Schema parsers**: Avro, JSON Schema, SQL DDL. (`from_config()` registers Avro only;
 pass the others explicitly via `schema_parser_registry`.)
@@ -552,7 +561,7 @@ pass the others explicitly via `schema_parser_registry`.)
 
 **Caches**: L1 LRU in-memory, Redis, content-addressed semantic cache. These are
 implemented and unit-tested but are **not** exercised by the accuracy benchmark and have
-no committed performance artifacts — see [docs/BENCHMARK_REGISTRY.md](docs/BENCHMARK_REGISTRY.md).
+no committed performance artifacts — see [docs/BENCHMARK_REGISTRY.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/BENCHMARK_REGISTRY.md).
 
 **Also present, not part of the benchmarked path**: ColBERT MaxSim reranker, INT8
 quantized embedding provider, incremental update manager, learned type projections,
@@ -604,19 +613,19 @@ observed to fail intermittently under load.
 
 ## Documentation
 
-- [QUICKSTART.md](QUICKSTART.md) — the verified five-minute path
-- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — Python, CLI, and the (health-only) REST surface
-- [docs/BENCHMARK_REGISTRY.md](docs/BENCHMARK_REGISTRY.md) — every benchmark run, with its artifact or an explicit note that it has none
-- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — hexagonal layering and component wiring
-- [docs/ENHANCEMENT_JOURNEY.md](docs/ENHANCEMENT_JOURNEY.md) — what was changed and what it measured
-- [CHANGELOG.md](CHANGELOG.md)
-- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [QUICKSTART.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/QUICKSTART.md) — the verified five-minute path
+- [docs/API_REFERENCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/API_REFERENCE.md) — Python, CLI, and the (health-only) REST surface
+- [docs/BENCHMARK_REGISTRY.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/BENCHMARK_REGISTRY.md) — every benchmark run, with its artifact or an explicit note that it has none
+- [docs/ARCHITECTURE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/ARCHITECTURE.md) — hexagonal layering and component wiring
+- [docs/ENHANCEMENT_JOURNEY.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/ENHANCEMENT_JOURNEY.md) — what was changed and what it measured
+- [CHANGELOG.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/CHANGELOG.md)
+- [CONTRIBUTING.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/CONTRIBUTING.md)
 
 ---
 
 ## License
 
-Apache 2.0 — see [LICENSE](LICENSE).
+Apache 2.0 — see [LICENSE](https://github.com/pierce-lonergan/nexus_matcher/blob/main/LICENSE).
 
 ---
 
@@ -633,6 +642,6 @@ Apache 2.0 — see [LICENSE](LICENSE).
 
 **Built for enterprise data engineering**
 
-[Documentation](docs/) • [Issues](https://github.com/pierce-lonergan/nexus_matcher/issues) • [Discussions](https://github.com/pierce-lonergan/nexus_matcher/discussions)
+[Documentation](https://github.com/pierce-lonergan/nexus_matcher/tree/main/docs) • [Issues](https://github.com/pierce-lonergan/nexus_matcher/issues) • [Discussions](https://github.com/pierce-lonergan/nexus_matcher/discussions)
 
 </div>

@@ -118,6 +118,54 @@ The following claims appeared in the README, this changelog, the package docstri
 
 ---
 
+## [2.0.1] - 2026-08-09
+
+Fixes from a verification sweep of the published 2.0.0 wheel — installed into a clean
+environment and driven through the documented quickstart. Packaging, CLI and
+documentation only. The matching pipeline is untouched and no measured number in this
+file moves.
+
+### Fixed
+
+- **`match` and `sync` crashed with `UnicodeEncodeError` on non-UTF-8 Windows consoles.**
+  Rich's default spinner animates with Braille code points that cp437, cp850 and cp1252
+  all refuse to encode, and its `no_wrap` truncation adds U+2026, so the only two commands
+  that do real work died with a bare codec error and exit 1 — after the matching had been
+  paid for, and with nothing to suggest that a terminal or a field name was the problem.
+  The CLI now picks decorations the console can encode and escapes what is left, keeping
+  the user's code page rather than forcing UTF-8 onto it.
+- **The `nexus-matcher` console script was installed without typer or rich.** The entry
+  point is declared unconditionally but its dependencies sat in the `cli` extra, so a
+  plain `pip install nexus-matcher` put a command on `PATH` that could not start. Both
+  moved into the core dependencies; `cli` is kept as a name so existing pins still
+  resolve. Its `typer[all]` marker is also gone — typer has published no extras since
+  0.12, so that asked for something which does not exist and pip warned about it on every
+  install.
+- **`--output/-o` was silently ignored when `--format` was left at its default.** The
+  default was `table` and the table branch had no write path, so
+  `nexus-matcher match schema.avsc -d dictionary.csv -o results.json` printed to stdout,
+  wrote no file and exited 0 — a scripted run could not tell that it had produced nothing.
+  The format is now inferred from the `--output` extension when it is not given.
+- **`match_schema` silently dropped fields whose dotted paths collided.** Results are
+  keyed by field path, and where two fields produced the same path the later one replaced
+  the earlier. The displaced field then never appeared in the results and so never
+  received the governance classification of the entry it would have matched; the returned
+  mapping was simply shorter than the schema, with nothing to say which fields were gone.
+- **Flattened Avro results were keyed by names the caller had not supplied.** The keys in
+  the returned mapping did not match the flattened field names passed in, so looking a
+  result up by the name you provided missed.
+- **`create_app` was listed in `__all__` but needs the `api` extra.** `from nexus_matcher
+  import *` therefore raised `ImportError` on any install without `[api]`, including the
+  bare install the README documents as the complete pipeline.
+- **The `Documentation` project URL 404'd, and the README's relative links were dead on
+  PyPI.** README.md is the PyPI `long_description`, where a relative markdown link
+  resolves against pypi.org rather than against the repository: twelve of them — including
+  every entry in the README's own Documentation section — went nowhere for anyone arriving
+  from the package page. They are absolute GitHub URLs now. One dead in-page anchor went
+  with them; `#known-limits` named no heading in the file and scrolled nowhere.
+
+---
+
 ## [2.0.0] - 2025-12-09
 
 Complete rewrite from a procedural single-file implementation to a hexagonal

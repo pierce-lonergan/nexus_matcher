@@ -65,6 +65,14 @@ Backend Mode
 nexus-matcher api --host 0.0.0.0 --port 8000
 ```
 
+Or build the ASGI app yourself, to mount it or to run it under your own server:
+
+```python
+from nexus_matcher import create_app  # needs pip install nexus-matcher[api]
+
+app = create_app()
+```
+
 Links
 -----
 - Documentation: https://nexus-matcher.readthedocs.io
@@ -79,7 +87,7 @@ from __future__ import annotations
 # CHANGELOG's latest release, the built wheel, the API and the log envelope all
 # said 2.0.0, so `python -m build` would have produced a 1.0.0 artifact and the
 # publish workflow would have tried to release it over the existing 2.0.0.
-__version__ = "2.0.0"
+__version__ = "2.0.1"
 __author__ = "Pierce Lonergan"
 __email__ = "lonerganpierce@gmail.com"
 __license__ = "Apache-2.0"
@@ -162,7 +170,6 @@ __all__ = [
     # Version info
     "__version__",
     "build_index",
-    "create_app",
     "default_embedding_provider",
     "flatten_avro_schema",
     # --- ingestion -------------------------------------------------------
@@ -171,14 +178,50 @@ __all__ = [
     "sync",
 ]
 
+# Reachable through __getattr__, deliberately NOT in __all__: their dependency ships only
+# in an extra, and __all__ is exactly the list `from nexus_matcher import *` walks. With
+# create_app listed, that star-import died on a default install with
+# `ModuleNotFoundError: No module named 'fastapi'` -- from a line the user never wrote,
+# naming a package they never asked for, so it read as "nexus_matcher is broken" rather
+# than "you skipped an extra". __all__ is a promise that a name imports; only names that
+# hold on a bare `pip install nexus-matcher` belong in it. These stay listed in __dir__
+# below, so tab-completion and dir() still surface them.
+_OPTIONAL_EXPORTS = ("create_app",)
+
+# Top-level module -> the extra that ships it. A missing optional dependency surfaces as
+# a ModuleNotFoundError raised deep inside an adapter, naming a third-party package with
+# no obvious link to this project; this turns it into one naming the extra to install.
+# Kept for every extra, not just today's optional exports, so a lazy branch that grows a
+# new dependency gets the good message for free.
+_EXTRA_FOR_MODULE = {
+    "fastapi": "api",
+    "uvicorn": "api",
+    "multipart": "api",
+    "python_multipart": "api",
+    "sentence_transformers": "embeddings",
+    "torch": "embeddings",
+    "transformers": "embeddings",
+    "qdrant_client": "vector-stores",
+    "usearch": "vector-stores",
+    "redis": "cache",
+    "diskcache": "cache",
+    "fastavro": "parsers",
+    "jsonschema": "parsers",
+    "sqlparse": "parsers",
+    "pandas": "loaders",
+    "pyarrow": "loaders",
+    "sqlalchemy": "loaders",
+    "celery": "async",
+}
+
 
 # =============================================================================
 # LAZY IMPORTS FOR OPTIONAL FEATURES
 # =============================================================================
 
 
-def __getattr__(name: str):
-    """Lazy import for optional components."""
+def _lazy_import(name: str):
+    """Resolve one lazily-exported name. Wrapped by __getattr__, never called directly."""
 
     # Config (requires pydantic-settings)
     if name == "Config":
@@ -251,3 +294,51 @@ def __getattr__(name: str):
         return InMemoryVectorStore
 
     raise AttributeError(f"module 'nexus_matcher' has no attribute '{name}'")
+
+
+def __getattr__(name: str):
+    """Lazy import for optional components, with the missing extra named in the error."""
+    try:
+        return _lazy_import(name)
+    except ModuleNotFoundError as exc:
+        extra = _EXTRA_FOR_MODULE.get((exc.name or "").partition(".")[0])
+        if extra is None:
+            raise
+        raise ModuleNotFoundError(
+            f"nexus_matcher.{name} needs the optional '{extra}' extra, which is not "
+            f"installed (no module named {exc.name!r}). Install it with: "
+            f"pip install nexus-matcher[{extra}]",
+            name=exc.name,
+        ) from exc
+
+
+# The module each optional export needs, so __dir__ can check availability without
+# importing anything.
+_OPTIONAL_EXPORT_REQUIRES = {"create_app": "fastapi"}
+
+
+def __dir__() -> list[str]:
+    """
+    Advertise the optional exports -- but only the ones that will actually resolve.
+
+    dir() is not merely a display list. inspect.getmembers(), help(), pydoc and
+    rlcompleter tab-completion all walk it and getattr() every entry, so a name listed
+    here that raises on access makes ALL of them blow up. Listing create_app
+    unconditionally did exactly that on a bare install: `help(nexus_matcher)` died with
+    ModuleNotFoundError: No module named 'fastapi'. Those four worked before the name was
+    added, so advertising it cost more than it bought.
+
+    find_spec only consults the import system's finders; it does not execute the module,
+    so this stays cheap and free of side effects.
+    """
+    from importlib.util import find_spec
+
+    available = []
+    for name in _OPTIONAL_EXPORTS:
+        required = _OPTIONAL_EXPORT_REQUIRES.get(name)
+        try:
+            if required is None or find_spec(required) is not None:
+                available.append(name)
+        except (ImportError, ValueError):  # a broken or namespace-shadowed install
+            continue
+    return sorted({*globals(), *__all__, *available})

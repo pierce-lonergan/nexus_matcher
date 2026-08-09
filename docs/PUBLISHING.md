@@ -100,6 +100,52 @@ Then reserve on PyPI with your first release.
 .\scripts\publish.ps1 build
 ```
 
+### The preflight gate (run this before every release)
+
+```bash
+python scripts/release_preflight.py
+```
+
+Builds a wheel, installs it into a **clean venv with no extras**, and refuses to pass
+unless the package actually works there. Exits non-zero on any failure.
+
+Run it locally before publishing; CI runs it too, in `publish.yml`'s `test-install` job,
+across three operating systems and four Python versions.
+
+It exists because 2.0.0 shipped with a CLI that crashed on any non-UTF-8 Windows console,
+a console script installed without the dependencies it needs, and an `__all__` entry that
+broke `from nexus_matcher import *` on a default install — while CI stayed green. The old
+gate was:
+
+```yaml
+- name: Test CLI (if available)
+  run: |
+    pip install typer rich
+    nexus-matcher --help || echo "CLI not available without full install"
+  continue-on-error: true
+```
+
+It installed the very dependencies whose absence was the bug, exercised `--help` rather
+than the commands that actually broke, and could not turn the build red in any case.
+
+Run against the published 2.0.0 wheel, the preflight independently catches five of those
+defects and exits 1. What it checks:
+
+| Check | Catches |
+|---|---|
+| clean install, no extras | a package that only works in the maintainer's venv |
+| every `__all__` name resolves; `import *` works | an export needing an uninstalled extra |
+| every console script **runs** — including under a `cp437` codepage | the 2.0.0 blocker |
+| bundled encoder loads and returns real vectors | a provider returning random numbers |
+| end-to-end match with `HF_HUB_OFFLINE=1` | a wheel missing its model |
+| every input field appears in the output | fields silently dropped, losing governance |
+| no torch / pandas / sentence-transformers imported | dependency creep on the default path |
+| README has no relative links | dead links on the PyPI project page |
+| every `Project-URL` resolves | a 404 documentation link |
+
+**Do not add `continue-on-error` to it, and do not append `|| true`.** A check that cannot
+fail is not a check — that is the entire lesson this file records.
+
 ### Manual Publish
 
 #### Step 1: Clean Previous Builds

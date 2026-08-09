@@ -83,6 +83,29 @@ class TestHierarchyReconstruction:
         f = field_from_flattened("a_b__c")
         assert f.source_metadata["flattened_name"] == "a_b__c"
 
+    def test_distinct_columns_can_share_a_reconstructed_path(self):
+        """
+        The split is lossy: an array of contacts and a scalar column are two legal
+        fields of one Avro record and land on the same dotted path. The path is
+        therefore a position, not an identity -- which is why match_schema keys its
+        results by the flattened name instead, and why that name must survive.
+        """
+        array_leaf = field_from_flattened("contact__email")
+        scalar = field_from_flattened("contact_email")
+
+        assert array_leaf.full_path == scalar.full_path
+        assert array_leaf.source_metadata["flattened_name"] == "contact__email"
+        assert scalar.source_metadata["flattened_name"] == "contact_email"
+
+    def test_an_unknown_column_cannot_overwrite_the_identity(self):
+        """
+        Unrecognised columns are kept as metadata, so one named "flattened_name" used to
+        replace the real one -- leaving the field addressable only under some other
+        row's name, with nothing raised.
+        """
+        f = field_from_flattened("cust_id", extra={"flattened_name": "not_my_name"})
+        assert f.source_metadata["flattened_name"] == "cust_id"
+
     def test_array_boundary_sets_is_array(self):
         assert field_from_flattened("orders__sku").is_array is True
         assert field_from_flattened("customer_id").is_array is False
