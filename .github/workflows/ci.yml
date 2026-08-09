@@ -99,6 +99,18 @@ jobs:
         run: |
           pytest tests/unit -v --cov=nexus_matcher --cov-report=xml --cov-report=term-missing -m "not slow"
 
+      # Its own step, not folded into the unit run, so that a failure reads as
+      # "retrieval quality regressed" rather than as one more red dot among hundreds.
+      # Nothing else in this workflow measures whether the system is still GOOD at
+      # matching -- only that it does not crash. Every large regression this project has
+      # had (a -8.9 point encoder swap, a -13.7 point aliasing default, an expander that
+      # gave 787 of 793 queries zero BM25 hits) passed the entire test suite.
+      #
+      # Runs on the bundled encoder, which ships in the repo, so there is no download and
+      # no network. ~5 seconds.
+      - name: Accuracy regression gate
+        run: pytest tests/regression -v
+
       - name: Upload coverage
         uses: codecov/codecov-action@v4
         if: matrix.python-version == '3.11'
