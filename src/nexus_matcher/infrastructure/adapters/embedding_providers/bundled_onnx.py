@@ -187,8 +187,30 @@ class BundledOnnxProvider:
         expected = {i.name for i in self._session.get_inputs()}
         out = np.empty((len(texts), EMBEDDING_DIM), dtype=np.float32)
 
+        # Encode in LENGTH ORDER, then scatter back to the caller's order.
+        #
+        # The tokenizer pads each batch to its own longest member, and attention is
+        # quadratic in that padded length. With texts arriving in arbitrary order a batch
+        # of mostly-short entries containing one long one pays the long one's cost for
+        # every row. Measured on the FHIR corpus (4598 real glossary definitions, token
+        # lengths 5..417, p50 26): the padded token count is 3.83x the real token count
+        # in natural order and 1.12x in length order, so 71% of the encoder's work was
+        # spent on padding.
+        #
+        # Character count is the sort key rather than token count, because obtaining true
+        # token lengths would mean tokenising everything twice. It is a proxy, but a
+        # tight one for natural text, and a proxy only costs a little packing efficiency
+        # -- it cannot make the result wrong, since each text is still encoded exactly
+        # once with its own attention mask.
+        #
+        # NOTE: this changes which texts share a batch. The int8 ONNX encoder is not
+        # batch-invariant, so embeddings can differ in the last bits from a run before
+        # this change. That was already true of any change to batch_size.
+        order = np.argsort([len(t) for t in texts], kind="stable")
+
         for start in range(0, len(texts), batch_size):
-            chunk = list(texts[start : start + batch_size])
+            positions = order[start : start + batch_size]
+            chunk = [texts[i] for i in positions]
             encoded = self._tokenizer.encode_batch(chunk)
 
             ids = np.asarray([e.ids for e in encoded], dtype=np.int64)
@@ -207,7 +229,8 @@ class BundledOnnxProvider:
 
             norms = np.linalg.norm(vectors, axis=1, keepdims=True)
             np.maximum(norms, 1e-12, out=norms)
-            out[start : start + len(chunk)] = vectors / norms
+            # Scatter back to the caller's ordering, not the sorted one.
+            out[positions] = vectors / norms
 
         return out
 

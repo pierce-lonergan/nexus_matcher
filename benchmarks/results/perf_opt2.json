@@ -1,0 +1,65 @@
+{
+  "label": "opt1 inverted BM25 + opt2 length-sorted batching",
+  "measurements": [
+    {
+      "entries": 1000,
+      "fields": 500,
+      "index_seconds": 1.8467,
+      "index_entries_per_sec": 541.5,
+      "match_seconds": 1.766,
+      "match_fields_per_sec": 283.1,
+      "latency_ms_p50": 5.435,
+      "latency_ms_p95": 6.353,
+      "latency_ms_p99": 7.112,
+      "latency_ms_mean": 5.454,
+      "peak_tracemalloc_mb": 8.25,
+      "rss_delta_mb": 157.4,
+      "notes": []
+    },
+    {
+      "entries": 5000,
+      "fields": 500,
+      "index_seconds": 9.4661,
+      "index_entries_per_sec": 528.2,
+      "match_seconds": 2.0075,
+      "match_fields_per_sec": 249.1,
+      "latency_ms_p50": 7.119,
+      "latency_ms_p95": 8.311,
+      "latency_ms_p99": 8.762,
+      "latency_ms_mean": 7.013,
+      "peak_tracemalloc_mb": 31.82,
+      "rss_delta_mb": 163.3,
+      "notes": []
+    },
+    {
+      "entries": 10000,
+      "fields": 500,
+      "index_seconds": 18.9961,
+      "index_entries_per_sec": 526.4,
+      "match_seconds": 2.0548,
+      "match_fields_per_sec": 243.3,
+      "latency_ms_p50": 7.176,
+      "latency_ms_p95": 8.278,
+      "latency_ms_p99": 8.681,
+      "latency_ms_mean": 7.092,
+      "peak_tracemalloc_mb": 64.31,
+      "rss_delta_mb": 193.8,
+      "notes": []
+    },
+    {
+      "entries": 30000,
+      "fields": 500,
+      "index_seconds": 57.7315,
+      "index_entries_per_sec": 519.6,
+      "match_seconds": 2.1898,
+      "match_fields_per_sec": 228.3,
+      "latency_ms_p50": 6.831,
+      "latency_ms_p95": 8.598,
+      "latency_ms_p99": 9.035,
+      "latency_ms_mean": 6.998,
+      "peak_tracemalloc_mb": 195.58,
+      "rss_delta_mb": 323.4,
+      "notes": []
+    }
+  ]
+}

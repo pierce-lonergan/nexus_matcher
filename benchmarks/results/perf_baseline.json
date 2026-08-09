@@ -1,0 +1,65 @@
+{
+  "label": "v2.0.0 as published",
+  "measurements": [
+    {
+      "entries": 1000,
+      "fields": 500,
+      "index_seconds": 1.7353,
+      "index_entries_per_sec": 576.3,
+      "match_seconds": 1.8856,
+      "match_fields_per_sec": 265.2,
+      "latency_ms_p50": 6.314,
+      "latency_ms_p95": 8.521,
+      "latency_ms_p99": 9.133,
+      "latency_ms_mean": 6.513,
+      "peak_tracemalloc_mb": 8.8,
+      "rss_delta_mb": 155.6,
+      "notes": []
+    },
+    {
+      "entries": 5000,
+      "fields": 500,
+      "index_seconds": 6.9733,
+      "index_entries_per_sec": 717.0,
+      "match_seconds": 2.6994,
+      "match_fields_per_sec": 185.2,
+      "latency_ms_p50": 9.2,
+      "latency_ms_p95": 12.839,
+      "latency_ms_p99": 13.3,
+      "latency_ms_mean": 9.692,
+      "peak_tracemalloc_mb": 31.99,
+      "rss_delta_mb": 167.2,
+      "notes": []
+    },
+    {
+      "entries": 10000,
+      "fields": 500,
+      "index_seconds": 14.3848,
+      "index_entries_per_sec": 695.2,
+      "match_seconds": 3.7611,
+      "match_fields_per_sec": 132.9,
+      "latency_ms_p50": 11.311,
+      "latency_ms_p95": 17.637,
+      "latency_ms_p99": 18.413,
+      "latency_ms_mean": 11.476,
+      "peak_tracemalloc_mb": 62.45,
+      "rss_delta_mb": 191.8,
+      "notes": []
+    },
+    {
+      "entries": 30000,
+      "fields": 500,
+      "index_seconds": 41.9664,
+      "index_entries_per_sec": 714.9,
+      "match_seconds": 9.4906,
+      "match_fields_per_sec": 52.7,
+      "latency_ms_p50": 28.436,
+      "latency_ms_p95": 39.994,
+      "latency_ms_p99": 41.274,
+      "latency_ms_mean": 26.927,
+      "peak_tracemalloc_mb": 189.45,
+      "rss_delta_mb": 324.5,
+      "notes": []
+    }
+  ]
+}

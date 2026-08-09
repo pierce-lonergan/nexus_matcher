@@ -1,0 +1,20 @@
+{
+  "label": "opt1 inverted index",
+  "measurements": [
+    {
+      "entries": 30000,
+      "fields": 100,
+      "index_seconds": 58.3697,
+      "index_entries_per_sec": 514.0,
+      "match_seconds": 0.4402,
+      "match_fields_per_sec": 227.2,
+      "latency_ms_p50": 6.661,
+      "latency_ms_p95": 8.047,
+      "latency_ms_p99": 8.728,
+      "latency_ms_mean": 6.791,
+      "peak_tracemalloc_mb": 196.2,
+      "rss_delta_mb": 335.6,
+      "notes": []
+    }
+  ]
+}
