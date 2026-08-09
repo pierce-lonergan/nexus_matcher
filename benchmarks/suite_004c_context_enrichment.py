@@ -130,7 +130,7 @@ def generate_test_fields() -> list[SchemaField]:
         ("order", "shipments", "packages", "items", "barcode"),
     ]
     for *parents, field_name in deep_fields:
-        path = ".".join(parents + [field_name])
+        path = ".".join([*parents, field_name])
         parent_path = ".".join(parents)
         fields.append(
             SchemaField(

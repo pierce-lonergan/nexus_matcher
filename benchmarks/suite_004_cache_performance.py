@@ -203,7 +203,7 @@ def benchmark_l1_hit_rate(
     )
 
     # Run queries - first populate, then measure
-    embedding_map = {key: emb for key, emb in embeddings}
+    embedding_map = dict(embeddings)
 
     for _ in range(config.warmup_runs):
         cache.clear()

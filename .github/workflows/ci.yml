@@ -37,10 +37,13 @@ jobs:
           pip install ruff==0.16.1 mypy==2.3.0
 
       - name: Run Ruff linter
-        run: ruff check src/nexus_matcher tests
+        # Every first-party Python directory, not a subset. scripts/ and benchmarks/ were
+        # linted by nobody, and 33 errors accumulated there unnoticed (NM-0023).
+        # tests/museum/NM-0023 fails if this list ever narrows again.
+        run: ruff check src/nexus_matcher tests scripts benchmarks
 
       - name: Run Ruff formatter check
-        run: ruff format --check src/nexus_matcher tests
+        run: ruff format --check src/nexus_matcher tests scripts benchmarks
 
       # MyPy is advisory for now, NOT a silent pass. [tool.mypy] sets strict=true,
       # which the codebase has never satisfied: measured 140 errors in 29 files on
@@ -110,6 +113,33 @@ jobs:
       # no network. ~5 seconds.
       - name: Accuracy regression gate
         run: pytest tests/regression -v
+
+      # The permanent regression tests for every historical defect. Run as a normal suite
+      # here; scripts/museum_replay.py below is the part that proves they can FAIL.
+      # The gate on the gates: parses every workflow for continue-on-error, || true,
+      # || echo, set +e, and steps that install the dependency whose absence they claim
+      # to test. All three of those were present in the step that let 2.0.0 ship broken.
+      - name: Meta gates -- CI must be able to fail
+        run: pytest tests/meta -v
+
+      # One executable check per standing hazard. A hazard is a property of the domain
+      # that keeps producing new defects; docs/HAZARDS.md is the ledger.
+      - name: Standing hazards
+        run: pytest tests/hazards -v
+
+      - name: Defect museum
+        run: pytest tests/museum -v
+
+      # The gate on the gates. Reintroduces each historical defect and asserts the
+      # corresponding test goes red. An entry whose replay still passes is a hole in the
+      # net and fails the build -- which is the whole point, because this repo has shipped
+      # two gates that could not fail: a publish step carrying continue-on-error, and
+      # nineteen tests that did not notice a transposed matrix multiply.
+      #
+      # One Python version is enough: it tests the net, not the runtime.
+      - name: Museum replay -- prove every gate can fail
+        if: matrix.python-version == '3.11'
+        run: python scripts/museum_replay.py
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4

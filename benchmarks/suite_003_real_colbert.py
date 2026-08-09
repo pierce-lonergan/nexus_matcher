@@ -420,8 +420,8 @@ def compare_rankings(
     top_k: int = 10,
 ) -> dict:
     """Compare rankings between MaxSim and bi-encoder."""
-    maxsim_top = set(r.candidate_idx for r in maxsim_results[:top_k])
-    biencoder_top = set(r.candidate_idx for r in biencoder_results[:top_k])
+    maxsim_top = {r.candidate_idx for r in maxsim_results[:top_k]}
+    biencoder_top = {r.candidate_idx for r in biencoder_results[:top_k]}
 
     overlap = len(maxsim_top & biencoder_top)
 
@@ -571,12 +571,11 @@ def run_benchmark():
         )
 
         if num_candidates == 100:
-            target_pass = result.p95_latency_ms <= target_latency_100
+            pass
 
     print()
 
     # Use warm results for validation
-    results = results_warm
 
     # Summary
     print("=" * 70)
@@ -588,7 +587,7 @@ def run_benchmark():
     print("-" * 60)
     print(f"{'Candidates':>12} {'Cold (ms)':>12} {'Warm (ms)':>12} {'Speedup':>10}")
     print("-" * 60)
-    for cold, warm in zip(results_cold, results_warm):
+    for cold, warm in zip(results_cold, results_warm, strict=False):
         speedup = cold.avg_latency_ms / warm.avg_latency_ms if warm.avg_latency_ms > 0 else 0
         print(
             f"{cold.num_candidates:>12} {cold.avg_latency_ms:>12.2f} {warm.avg_latency_ms:>12.2f} {speedup:>9.1f}x"

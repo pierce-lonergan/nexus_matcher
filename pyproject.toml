@@ -497,6 +497,27 @@ ignore = [
 "tests/*" = ["ARG", "PLR2004"]
 "__init__.py" = ["F401"]
 
+# NAMED, DATED EXEMPTION -- 2026-08-06, closing NM-0023.
+#
+# CI linted `src/nexus_matcher tests` only, so scripts/ and benchmarks/ were covered by
+# nobody and 33 errors accumulated there unseen. The scope gap is now closed: CI lints
+# every first-party Python directory, and tests/museum/NM-0023 fails if that ever narrows
+# again.
+#
+# These nine files are the one-shot experiment scripts that produced the recorded results
+# in benchmarks/results/. They are not imported by the package, not on any gate path, and
+# are kept for provenance rather than maintained. Rather than rewrite 31 lines of frozen
+# research code, or silently exclude the whole directory, the exemption is narrowed to
+# these exact files and these exact rules. NEW code under benchmarks/ is fully linted --
+# which is the property that was actually missing.
+#
+# E402 in particular is legitimate here: several of these must set an environment variable
+# before importing torch, so their imports genuinely cannot all sit at the top.
+#
+# This list may shrink, never grow. Adding a file to it requires the same written
+# justification, in docs/DEFENSIBILITY.md.
+"benchmarks/suite_*.py" = ["ARG005", "E402", "E722", "F401", "PLW2901", "PTH123"]
+
 # Optional-dependency availability probes. Each of these files contains the
 # `try: import x / except ImportError: X_AVAILABLE = False` idiom, where the
 # import exists to be attempted, not to be used. Verified 2026-08-05 that every

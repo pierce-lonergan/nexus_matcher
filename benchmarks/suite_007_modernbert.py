@@ -176,7 +176,7 @@ def benchmark_model(
 
     for _ in range(iterations):
         start = time.perf_counter()
-        embeddings = model.encode(batch_texts, convert_to_numpy=True, show_progress_bar=False)
+        model.encode(batch_texts, convert_to_numpy=True, show_progress_bar=False)
         elapsed_ms = (time.perf_counter() - start) * 1000
         latencies.append(elapsed_ms)
 
@@ -294,7 +294,7 @@ def run_benchmark():
 
     # Parse version
     try:
-        major, minor, patch = TRANSFORMERS_VERSION.split(".")[:3]
+        major, minor, _patch = TRANSFORMERS_VERSION.split(".")[:3]
         version_ok = int(major) > 4 or (int(major) == 4 and int(minor) >= 48)
     except:
         version_ok = False

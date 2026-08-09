@@ -1,0 +1,8 @@
+id: NM-0005
+symptom: "match_schema keys results by dotted path; two distinct flattened fields collapse and one is dropped, losing its governance classification"
+severity: HIGH
+fixed_in: 7be3d1d
+gate_that_should_have_caught_it: "none -- no test asserted that output count equals input count"
+gate_that_catches_it_now: "tests/museum/NM-0005/test_nm_0005.py, plus tests/unit/application/test_match_result_identity.py"
+touches:
+  - src/nexus_matcher/application/use_cases/match_schema.py

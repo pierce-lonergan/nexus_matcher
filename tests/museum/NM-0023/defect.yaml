@@ -1,0 +1,8 @@
+id: NM-0023
+symptom: "CI lints only some directories -- 33 ruff errors sat undetected in benchmarks/"
+severity: LOW
+fixed_in: unreleased
+gate_that_should_have_caught_it: "none -- nothing checked that the lint job covers every code directory"
+gate_that_catches_it_now: "tests/museum/NM-0023/test_nm_0023.py (a scope detector over the workflow YAML)"
+touches:
+  - .github/workflows/ci.yml

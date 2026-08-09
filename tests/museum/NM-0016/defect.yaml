@@ -1,0 +1,8 @@
+id: NM-0016
+symptom: "an embedding provider returned np.random.RandomState(hash(text)).randn(dim) instead of encoding anything"
+severity: BLOCKER
+fixed_in: "pre-2.0.0"
+gate_that_should_have_caught_it: "none -- every test asserted vector SHAPE, which random numbers satisfy"
+gate_that_catches_it_now: "tests/museum/NM-0016/test_nm_0016.py, plus the encoder check in scripts/release_preflight.py"
+touches:
+  - src/nexus_matcher/infrastructure/adapters/embedding_providers/bundled_onnx.py

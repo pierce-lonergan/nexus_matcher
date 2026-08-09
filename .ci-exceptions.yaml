@@ -1,0 +1,25 @@
+# CI steps permitted not to gate the build.
+#
+# tests/meta/test_ci_has_teeth.py rejects `continue-on-error`, `|| true`, `|| echo` and
+# friends anywhere in .github/workflows, because 2.0.0 shipped a broken CLI to PyPI past a
+# publish step carrying all three. An exception here is the ONLY way to soften a step, and
+# it costs a written reason -- which is the point. A decision that has to be justified in a
+# reviewed file is a different thing from one buried in a YAML key nobody reads.
+#
+# Rules
+#   * key is "<workflow file>::<job id>::<step name>", matched exactly
+#   * an entry with a blank reason is rejected
+#   * an entry naming a step that no longer exists is rejected, so renaming a step cannot
+#     silently carry its exemption forward
+#   * this list should shrink. Each entry should say what would let it be deleted.
+
+allowed_soft_steps:
+  "ci.yml::lint::Run MyPy (advisory - see comment)": >
+    [tool.mypy] sets strict = true, which this codebase has never satisfied: 140 errors
+    across 29 files measured 2026-08-05. Blocking would leave the pipeline permanently
+    red, and relaxing strict would throw away the signal that makes driving the number
+    down worthwhile. The step runs and prints, so the count stays visible in every build.
+    DELETE THIS ENTRY when the error count reaches zero and flip the step to blocking --
+    that is the whole plan, and this exemption is the bookmark for it. Note this is a
+    type-checking advisory, not a correctness gate: nothing about runtime behaviour
+    depends on it, which is why it is tolerable here and would not be for a test step.

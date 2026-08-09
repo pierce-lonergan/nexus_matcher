@@ -188,7 +188,7 @@ def benchmark_batch_efficiency() -> dict[str, float]:
         compute_count[0] += len(texts)
         return [np.random.rand(768).astype(np.float32) for _ in texts]
 
-    results = cache.batch_get_or_compute(batch, batch_compute)
+    cache.batch_get_or_compute(batch, batch_compute)
 
     return {
         "batch_size": len(batch),
