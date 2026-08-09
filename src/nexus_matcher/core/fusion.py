@@ -23,11 +23,18 @@ Score fusion algorithms for hybrid retrieval combining semantic and lexical scor
 from __future__ import annotations
 
 import logging
+import operator
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Generic, TypeVar
 
 logger = logging.getLogger(__name__)
+
+# Sort keys as C callables rather than lambdas. Ranking sorts every fused candidate on
+# every field, so this is one of the few places where the interpreter overhead of a
+# Python-level key function is actually visible in a profile.
+_score_of = operator.itemgetter(1)
+_item_score = operator.attrgetter("score")
 
 
 # =============================================================================
@@ -247,8 +254,11 @@ def fuse_rrf(
     semantic_scores: dict[T, float] = dict(semantic_results)
     lexical_scores: dict[T, float] = dict(lexical_results)
 
-    # Get all unique items
-    all_items = set(semantic_ranks.keys()) | set(lexical_ranks.keys())
+    # Semantic order first, then lexical-only. A set would iterate in string-hash order,
+    # which Python randomizes per process, so equal-scoring candidates would rank
+    # differently between two runs of identical code. See fuse_linear_ids.
+    all_items: dict[T, None] = dict.fromkeys(semantic_ranks)
+    all_items.update(dict.fromkeys(lexical_ranks))
 
     # Calculate RRF scores
     results: list[ScoredItem[T]] = []
@@ -277,9 +287,87 @@ def fuse_rrf(
         )
 
     # Sort by fused score descending
-    results.sort(key=lambda x: x.score, reverse=True)
+    results.sort(key=_item_score, reverse=True)
 
     # Apply top_k
+    if top_k is not None:
+        results = results[:top_k]
+
+    return results
+
+
+def _minmax_normalize(scores: dict[T, float]) -> dict[T, float]:
+    """
+    Rescale a score map to [0, 1] by its own min and max.
+
+    Shared by every linear-family path so there is exactly one definition of "normalized"
+    in this module. A constant map (max == min) divides by 1.0 rather than 0.0, which maps
+    it to all-zeros -- the honest answer for an arm that ranked nothing.
+    """
+    if not scores:
+        return scores
+    lo = min(scores.values())
+    hi = max(scores.values())
+    span = hi - lo if hi != lo else 1.0
+    return {k: (v - lo) / span for k, v in scores.items()}
+
+
+def fuse_linear_ids(
+    semantic_results: list[tuple[T, float]],
+    lexical_results: list[tuple[T, float]],
+    semantic_weight: float = 0.7,
+    lexical_weight: float = 0.3,
+    normalize_scores: bool = True,
+    top_k: int | None = None,
+) -> list[tuple[T, float]]:
+    """
+    Linear fusion returning only (id, fused_score), for callers that discard provenance.
+
+    Same arithmetic as `fuse_linear` -- same normalization, same weights, bit-identical
+    scores -- but it does not build the two rank maps or the per-item `ScoredItem`. The
+    matcher's hot path fuses ~200 candidates per field and then keeps two attributes of
+    each, so on a 600-field schema the discarded objects were ~120k dataclass
+    constructions that no caller could observe.
+
+    ORDER IS DEFINED HERE, and it is not an implementation detail: equal-scoring
+    candidates are emitted in dense-retrieval order, then lexical-only candidates in
+    lexical order. The set-iteration order this replaced followed string hashing, which
+    Python randomizes per process, so two runs of identical code ranked ties differently:
+    on the 1556-query FHIR benchmark P@1 spanned 0.2301-0.2339 across six hash seeds,
+    a 0.38-point band from nothing but the seed. That is most of the 0.5-point tolerance
+    the optimization ledger guards P@1 with, and it means a near-tie could be
+    auto-approved in one run and sent to review in the next. Ranking must not depend on
+    the value of PYTHONHASHSEED.
+
+    See tests/unit/core/test_fusion_determinism.py.
+    """
+    total_weight = semantic_weight + lexical_weight
+    sem_w = semantic_weight / total_weight
+    lex_w = lexical_weight / total_weight
+
+    semantic_scores: dict[T, float] = dict(semantic_results)
+    lexical_scores: dict[T, float] = dict(lexical_results)
+
+    if normalize_scores:
+        semantic_scores = _minmax_normalize(semantic_scores)
+        lexical_scores = _minmax_normalize(lexical_scores)
+
+    # dict preserves insertion order, so this walks the dense list in rank order and then
+    # picks up whatever only the lexical arm found -- deterministic, and it makes a tie
+    # break toward the better dense rank rather than toward an arbitrary hash.
+    lex_get = lexical_scores.get
+    results: list[tuple[T, float]] = [
+        (item_id, sem_w * sem_score + lex_w * lex_get(item_id, 0.0))
+        for item_id, sem_score in semantic_scores.items()
+    ]
+    results += [
+        (item_id, lex_w * lex_score)
+        for item_id, lex_score in lexical_scores.items()
+        if item_id not in semantic_scores
+    ]
+
+    results.sort(key=_score_of, reverse=True)
+
     if top_k is not None:
         results = results[:top_k]
 
@@ -321,20 +409,12 @@ def fuse_linear(
 
     # Normalize scores to [0, 1] if requested
     if normalize_scores:
-        if semantic_scores:
-            sem_max = max(semantic_scores.values())
-            sem_min = min(semantic_scores.values())
-            sem_range = sem_max - sem_min if sem_max != sem_min else 1.0
-            semantic_scores = {k: (v - sem_min) / sem_range for k, v in semantic_scores.items()}
+        semantic_scores = _minmax_normalize(semantic_scores)
+        lexical_scores = _minmax_normalize(lexical_scores)
 
-        if lexical_scores:
-            lex_max = max(lexical_scores.values())
-            lex_min = min(lexical_scores.values())
-            lex_range = lex_max - lex_min if lex_max != lex_min else 1.0
-            lexical_scores = {k: (v - lex_min) / lex_range for k, v in lexical_scores.items()}
-
-    # Get all unique items
-    all_items = set(semantic_scores.keys()) | set(lexical_scores.keys())
+    # Same deterministic ordering as fuse_linear_ids: dense order, then lexical-only.
+    all_items: dict[T, None] = dict.fromkeys(semantic_scores)
+    all_items.update(dict.fromkeys(lexical_scores))
 
     # Build rank maps for metadata
     semantic_ranks: dict[T, int] = {
@@ -365,7 +445,7 @@ def fuse_linear(
         )
 
     # Sort by fused score descending
-    results.sort(key=lambda x: x.score, reverse=True)
+    results.sort(key=_item_score, reverse=True)
 
     if top_k is not None:
         results = results[:top_k]
@@ -457,7 +537,7 @@ def fuse_combmnz(
         )
 
     # Re-sort by MNZ score
-    results.sort(key=lambda x: x.score, reverse=True)
+    results.sort(key=_item_score, reverse=True)
 
     if top_k is not None:
         results = results[:top_k]
@@ -490,17 +570,8 @@ def fuse_max_score(
     lexical_scores: dict[T, float] = dict(lexical_results)
 
     if normalize_scores:
-        if semantic_scores:
-            sem_max = max(semantic_scores.values())
-            sem_min = min(semantic_scores.values())
-            sem_range = sem_max - sem_min if sem_max != sem_min else 1.0
-            semantic_scores = {k: (v - sem_min) / sem_range for k, v in semantic_scores.items()}
-
-        if lexical_scores:
-            lex_max = max(lexical_scores.values())
-            lex_min = min(lexical_scores.values())
-            lex_range = lex_max - lex_min if lex_max != lex_min else 1.0
-            lexical_scores = {k: (v - lex_min) / lex_range for k, v in lexical_scores.items()}
+        semantic_scores = _minmax_normalize(semantic_scores)
+        lexical_scores = _minmax_normalize(lexical_scores)
 
     # Build rank maps
     semantic_ranks: dict[T, int] = {
@@ -510,8 +581,9 @@ def fuse_max_score(
         item_id: rank + 1 for rank, (item_id, _) in enumerate(lexical_results)
     }
 
-    # Get all unique items
-    all_items = set(semantic_scores.keys()) | set(lexical_scores.keys())
+    # Semantic order, then lexical-only -- not set order. See fuse_linear_ids.
+    all_items: dict[T, None] = dict.fromkeys(semantic_scores)
+    all_items.update(dict.fromkeys(lexical_scores))
 
     # Calculate max scores
     results: list[ScoredItem[T]] = []
@@ -533,7 +605,7 @@ def fuse_max_score(
             )
         )
 
-    results.sort(key=lambda x: x.score, reverse=True)
+    results.sort(key=_item_score, reverse=True)
 
     if top_k is not None:
         results = results[:top_k]
@@ -663,22 +735,59 @@ class HybridFuser(Generic[T]):
         else:
             raise ValueError(f"Unknown fusion method: {method}")
 
-        # Record statistics
+        self._record(semantic_results, lexical_results, len(results))
+
+        return results
+
+    def fuse_ids(
+        self,
+        semantic_results: list[tuple[T, float]],
+        lexical_results: list[tuple[T, float]],
+        top_k: int | None = None,
+    ) -> list[tuple[T, float]]:
+        """
+        Fuse and return only (id, fused_score).
+
+        Identical scores and identical ordering to `fuse`, for callers that immediately
+        discard the per-item provenance -- which is the matcher's hot path, where the
+        `ScoredItem` graph was being built ~200 items deep per field and then thrown away.
+
+        Only LINEAR has a dedicated lean implementation, because it is the shipped method
+        (see MatchingConfig.fusion_alpha). The others project from `fuse` rather than
+        growing a second copy of arithmetic nobody is calling in a loop.
+        """
+        if self._config.method == FusionMethod.LINEAR:
+            results = fuse_linear_ids(
+                semantic_results,
+                lexical_results,
+                semantic_weight=self._config.semantic_weight,
+                lexical_weight=self._config.lexical_weight,
+                normalize_scores=self._config.normalize,
+                top_k=top_k,
+            )
+            self._record(semantic_results, lexical_results, len(results))
+            return results
+
+        return [
+            (item.id, item.score) for item in self.fuse(semantic_results, lexical_results, top_k)
+        ]
+
+    def _record(
+        self,
+        semantic_results: list[tuple[T, float]],
+        lexical_results: list[tuple[T, float]],
+        num_items: int,
+    ) -> None:
+        """Record one fusion's overlap statistics."""
         sem_ids = {item_id for item_id, _ in semantic_results}
         lex_ids = {item_id for item_id, _ in lexical_results}
 
-        in_both = len(sem_ids & lex_ids)
-        in_sem_only = len(sem_ids - lex_ids)
-        in_lex_only = len(lex_ids - sem_ids)
-
         self._stats.record(
-            num_items=len(results),
-            num_in_both=in_both,
-            num_in_semantic_only=in_sem_only,
-            num_in_lexical_only=in_lex_only,
+            num_items=num_items,
+            num_in_both=len(sem_ids & lex_ids),
+            num_in_semantic_only=len(sem_ids - lex_ids),
+            num_in_lexical_only=len(lex_ids - sem_ids),
         )
-
-        return results
 
     def get_diagnostics(self) -> dict[str, Any]:
         """Get diagnostic information."""

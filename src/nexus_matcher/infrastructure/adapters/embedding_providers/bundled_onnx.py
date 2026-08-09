@@ -9,7 +9,7 @@ The zero-setup embedding provider: an int8 ONNX encoder shipped inside the wheel
 
 ## Attributes
 # Security: Never touches the network. No download, no HuggingFace, no telemetry.
-# Performance: ~1259 queries/sec on CPU, faster than the fp32 torch path it replaces
+# Performance: ~1180 texts/sec encoding the real FHIR glossary on an idle 32-thread CPU
 # Reliability: Works in an airgapped container with no configuration
 
 ## Why this is the default
@@ -55,6 +55,42 @@ three times what their published MTEB ratio implies. For a tool whose output dec
 whether a field inherits a PII classification, nine points is not purchasable with
 latency. `StaticEmbeddingProvider` exists as a fallback for environments without
 onnxruntime, not as a recommendation.
+
+## Encoder throughput, and what did NOT move it
+
+Indexing is dominated by this file, so it has been optimised against the real FHIR
+glossary (4598 entries) rather than uniform synthetic text -- uniform text hides padding
+waste entirely and would have scored every change below as a no-op. Idle 32-thread CPU,
+best of interleaved repeats:
+
+    encoder                                            time     texts/sec
+    ORT default threads, char-sort, 64 rows/batch      8.84s        520
+    + intra-op threads capped at 8                     6.90s        667
+    + tokenise once, sort by token length, budget      3.91s       1177
+
+That is **2.26x**, and it is all in `session.run` (98.8% of what remains). Retrieval
+quality was measured on the same corpus and did NOT move: P@1 0.2757 -> 0.2815 with 45
+queries gained and 36 lost, exact McNemar p=0.37. That is the int8 encoder's known
+batch-composition churn, not an improvement -- do not quote it as one.
+
+Measured and REJECTED, so they do not get proposed again:
+
+  * **io_binding** to skip an output copy: 0.992x, i.e. very slightly slower. The premise
+    was wrong -- writing the entire [batch, seq, hidden] output for the whole corpus is
+    236 MB, which numpy fills in 0.020s against a 3.9s encode. It is 0.5% of the time.
+  * **Truncating the graph output to CLS** so the full hidden state is never materialised:
+    same 0.5% ceiling as above, and it would need graph surgery plus an `onnx` dependency
+    on a provider whose entire selling point is not having heavy dependencies.
+  * **ORT_SEQUENTIAL execution mode**: 1.003x. Noise. This graph has no parallel branches
+    for inter-op scheduling to exploit.
+  * **Disabling the thread pool's spin-wait**: 1.49x vs 1.52x for the plain thread cap,
+    i.e. no help once threads are capped. It only ever looked good on a loaded machine,
+    which is the condition it flatters.
+  * **A persistent content-hash vector cache** in this provider: `application/ingest.py`
+    already skips re-embedding unchanged rows via `content_hash`, so a second cache here
+    would duplicate that logic one layer down and add its own invalidation bugs. The gap
+    it would actually close is that `GlossaryIndex` cannot be saved to disk at all, which
+    belongs in ingest, not here.
 """
 
 from __future__ import annotations
@@ -75,6 +111,33 @@ QUERY_INSTRUCTION = "Represent this sentence for searching relevant passages: "
 EMBEDDING_DIM = 384
 MAX_TOKENS = 512
 
+# Cap on rows x padded width in a single session.run, i.e. how much work one call does.
+#
+# This, not the row count, is what the encoder's cost actually tracks. Measured on the
+# FHIR corpus (4598 real glossary definitions) at a fixed 8 intra-op threads, sweeping
+# ROW count alone falls off a cliff -- 64 rows takes 7.7s, 128 rows takes 17.2s, because a
+# 128-row batch of the long entries is 128x417 tokens and stops fitting in cache. Capping
+# the token count instead lets short entries ride in batches of hundreds while long ones
+# drop to a dozen, and every call stays the same size. Budgets from 1024 to 6144 measured
+# indistinguishable (3.9-4.8s); 4096 is the one in that tied set with the least padding
+# waste (1.04x) and the fewest calls.
+#
+# It also bounds peak memory: the [rows, width, 384] float32 output can no longer exceed
+# ~6 MB per call, where a 64-row batch of 417-token entries was allocating 41 MB.
+MAX_BATCH_TOKENS = 4096
+
+# Intra-op threads when the caller does not say. ONNX Runtime's own default is one thread
+# per physical core, which on an idle 32-thread workstation measured 6.07s against 4.00s
+# at 8 threads -- a 1.52x loss, with the two distributions not overlapping at all across 6
+# interleaved repeats. bge-small's GEMMs at these batch sizes are too small to keep more
+# than about 8 threads busy, so past that ONNX Runtime is paying fork/join on every op for
+# cores with nothing to do. Measured against the PREVIOUS fixed-64 batching the same cap
+# was worth 1.28x, so this is a property of the model, not of the batching above it.
+#
+# Capping rather than fixing at 8 leaves small machines, where ORT's default is already at
+# or below the knee, exactly as they were.
+MAX_DEFAULT_THREADS = 8
+
 
 def bundled_model_available() -> bool:
     """True when the wheel actually carries the weights."""
@@ -92,9 +155,10 @@ class BundledOnnxProvider:
         model_dir: Override the model location. Defaults to the bundled copy.
         query_instruction: Prefix applied to QUERIES only. Pass "" to disable, but
             measure first -- dropping it cost 5.3 points of P@1 on our benchmark.
-        num_threads: ONNX Runtime intra-op threads. None lets ORT decide, which is
-            usually right; set it explicitly when running many workers per host to stop
-            them oversubscribing the same cores.
+        num_threads: ONNX Runtime intra-op threads. None uses min(8, cpu_count); see
+            MAX_DEFAULT_THREADS for why ORT's own default is not used. Set it explicitly
+            when running many workers per host to stop them oversubscribing the same
+            cores.
 
     Example:
         provider = BundledOnnxProvider()
@@ -146,8 +210,7 @@ class BundledOnnxProvider:
 
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        if self._num_threads:
-            options.intra_op_num_threads = self._num_threads
+        options.intra_op_num_threads = self._num_threads or self._default_threads()
         # Deterministic single-provider execution; no GPU probing, no surprises.
         self._session = ort.InferenceSession(
             str(onnx_path), options, providers=["CPUExecutionProvider"]
@@ -155,8 +218,16 @@ class BundledOnnxProvider:
 
         tokenizer = Tokenizer.from_file(str(self._model_dir / "tokenizer.json"))
         tokenizer.enable_truncation(max_length=MAX_TOKENS)
-        tokenizer.enable_padding(pad_id=0, pad_token="[PAD]")
+        # Padding is deliberately NOT enabled. `_encode` tokenises the whole input in one
+        # call so it can sort by true token length, and a tokenizer with padding on would
+        # pad that single call to the longest text in the ENTIRE input -- 417 tokens for
+        # every 5-token entry on the FHIR corpus. Each batch is padded in numpy instead,
+        # to its own width.
         self._tokenizer = tokenizer
+
+    @staticmethod
+    def _default_threads() -> int:
+        return max(1, min(MAX_DEFAULT_THREADS, os.cpu_count() or 1))
 
     # -- properties -------------------------------------------------------
 
@@ -179,7 +250,35 @@ class BundledOnnxProvider:
 
     # -- encoding ---------------------------------------------------------
 
-    def _encode(self, texts: Sequence[str], batch_size: int = 64) -> np.ndarray:
+    @staticmethod
+    def _plan_batches(order: np.ndarray, lengths: Sequence[int], max_rows: int) -> list[list[int]]:
+        """
+        Group already-length-sorted rows so no call exceeds MAX_BATCH_TOKENS.
+
+        A batch's cost is rows x the longest member, because every row is padded to it.
+        Rows are added while that product stays under budget, so short entries travel in
+        large batches and long ones in small ones, and every session.run does about the
+        same amount of work.
+        """
+        batches: list[list[int]] = []
+        current: list[int] = []
+        widest = 0
+        # `.tolist()` rather than iterating the array: it yields Python ints, which index
+        # the token list far faster than numpy scalars do.
+        for i in order.tolist():
+            candidate = max(widest, lengths[i])
+            over_budget = candidate * (len(current) + 1) > MAX_BATCH_TOKENS
+            if current and (over_budget or len(current) >= max_rows):
+                batches.append(current)
+                current, widest = [i], lengths[i]
+            else:
+                current.append(i)
+                widest = candidate
+        if current:
+            batches.append(current)
+        return batches
+
+    def _encode(self, texts: Sequence[str], batch_size: int = 512) -> np.ndarray:
         self._load()
         if not texts:
             return np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
@@ -187,38 +286,58 @@ class BundledOnnxProvider:
         expected = {i.name for i in self._session.get_inputs()}
         out = np.empty((len(texts), EMBEDDING_DIM), dtype=np.float32)
 
-        # Encode in LENGTH ORDER, then scatter back to the caller's order.
+        # Tokenise EVERYTHING once, then encode in TRUE TOKEN-LENGTH order and scatter
+        # back to the caller's order.
         #
-        # The tokenizer pads each batch to its own longest member, and attention is
-        # quadratic in that padded length. With texts arriving in arbitrary order a batch
-        # of mostly-short entries containing one long one pays the long one's cost for
-        # every row. Measured on the FHIR corpus (4598 real glossary definitions, token
-        # lengths 5..417, p50 26): the padded token count is 3.83x the real token count
-        # in natural order and 1.12x in length order, so 71% of the encoder's work was
-        # spent on padding.
+        # Every row in a batch is padded to the batch's longest member, and attention is
+        # quadratic in that padded length, so padding is real compute. Measured on the
+        # FHIR corpus (4598 real glossary definitions, token lengths 5..417, p50 26), the
+        # padded token count against the real one:
         #
-        # Character count is the sort key rather than token count, because obtaining true
-        # token lengths would mean tokenising everything twice. It is a proxy, but a
-        # tight one for natural text, and a proxy only costs a little packing efficiency
-        # -- it cannot make the result wrong, since each text is still encoded exactly
-        # once with its own attention mask.
+        #     natural order, 64 rows/batch                    3.83x
+        #     character-length order, 64 rows/batch           1.55x
+        #     TOKEN-length order, 64 rows/batch               1.12x
+        #     TOKEN-length order, 4096-token budget           1.04x
+        #
+        # The middle row is why this no longer sorts on character count. Doing so avoided
+        # a second tokenisation pass, but the saving was illusory: tokenising up front
+        # costs one pass either way (measured at 0.9% of the encoder's time, so it was
+        # never worth optimising around), and the character proxy was leaving 40% more
+        # padding on the table than the sort it was standing in for.
+        #
+        # On an idle machine, against the previous character-sorted fixed-64 encoder and
+        # holding the thread count equal, this is 6.90s -> 3.91s on the FHIR corpus, or
+        # 1.77x. Padded tokens only fall 1.49x, so roughly half the gain is packing and
+        # the rest is the batch-size cliff described at MAX_BATCH_TOKENS.
         #
         # NOTE: this changes which texts share a batch. The int8 ONNX encoder is not
         # batch-invariant, so embeddings can differ in the last bits from a run before
-        # this change. That was already true of any change to batch_size.
-        order = np.argsort([len(t) for t in texts], kind="stable")
+        # this change. That was already true of any change to batch_size. Measured on the
+        # FHIR corpus, P@1 went 0.2757 -> 0.2815 with 45 queries gained and 36 lost
+        # (exact McNemar p=0.37). That is churn, not a gain -- do not quote it as one.
+        encoded = self._tokenizer.encode_batch(list(texts))
+        lengths = [len(e.ids) for e in encoded]
+        order = np.argsort(lengths, kind="stable")
 
-        for start in range(0, len(texts), batch_size):
-            positions = order[start : start + batch_size]
-            chunk = [texts[i] for i in positions]
-            encoded = self._tokenizer.encode_batch(chunk)
-
-            ids = np.asarray([e.ids for e in encoded], dtype=np.int64)
-            mask = np.asarray([e.attention_mask for e in encoded], dtype=np.int64)
+        for positions in self._plan_batches(order, lengths, batch_size):
+            width = max(lengths[i] for i in positions)
+            # Pad here rather than in the tokenizer: the tokenizer would have to pad the
+            # single up-front call to the longest text in the whole input, which is the
+            # 3.83x case above with extra steps.
+            ids = np.zeros((len(positions), width), dtype=np.int64)
+            mask = np.zeros((len(positions), width), dtype=np.int64)
+            for row, i in enumerate(positions):
+                token_ids = encoded[i].ids
+                ids[row, : len(token_ids)] = token_ids
+                mask[row, : len(token_ids)] = 1
 
             feeds: dict[str, np.ndarray] = {"input_ids": ids, "attention_mask": mask}
             if "token_type_ids" in expected:
-                feeds["token_type_ids"] = np.asarray([e.type_ids for e in encoded], dtype=np.int64)
+                # Single-sequence input, so BERT's segment ids are all zero. Pinned by
+                # test_token_type_ids_are_all_zero, because if a future tokenizer.json
+                # ever emitted a second segment this shortcut would silently encode the
+                # wrong thing rather than fail.
+                feeds["token_type_ids"] = np.zeros_like(ids)
             feeds = {k: v for k, v in feeds.items() if k in expected}
 
             hidden = self._session.run(None, feeds)[0]
@@ -234,17 +353,17 @@ class BundledOnnxProvider:
 
         return out
 
-    def embed_documents(self, texts: Sequence[str], batch_size: int = 64) -> np.ndarray:
+    def embed_documents(self, texts: Sequence[str], batch_size: int = 512) -> np.ndarray:
         """Encode DICTIONARY entries. No instruction prefix -- BGE is asymmetric."""
         return self._encode(list(texts), batch_size)
 
-    def embed_queries(self, texts: Sequence[str], batch_size: int = 64) -> np.ndarray:
+    def embed_queries(self, texts: Sequence[str], batch_size: int = 512) -> np.ndarray:
         """Encode QUERIES, applying the model's query instruction."""
         return self._encode([self._query_instruction + t for t in texts], batch_size)
 
     # -- EmbeddingProvider protocol ---------------------------------------
 
-    def embed(self, texts: Sequence[str], batch_size: int = 64) -> Result:
+    def embed(self, texts: Sequence[str], batch_size: int = 512) -> Result:
         """Batch-encode as queries. This is the interface NexusMatcher calls per schema."""
         try:
             arr = self.embed_queries(list(texts), batch_size)

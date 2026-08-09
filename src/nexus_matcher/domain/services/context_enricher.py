@@ -70,6 +70,18 @@ class EnrichmentConfig:
     `include_hierarchy` is the single most valuable setting in this class: parent-path
     context is worth +20 points of P@1 on the same benchmark. Do not disable it without
     measuring.
+
+    Level-wise hierarchy dedup -- dropping a parent level whose every token the field name
+    already repeats, so `Account.subject` reads "account subject" rather than "account
+    account subject" -- was tried and REMOVED. It genuinely improved ranking (FHIR P@1
+    +0.0154, p=0.018), but it raised scores across the board and so pushed more candidates
+    past the fixed auto-approve threshold: auto-approve precision fell 0.8049 -> 0.7391,
+    auto-approvals went 41 -> 46, and of the 7 newly auto-approved 5 were WRONG, taking
+    wrong-and-unreviewed approvals from 8 to 12. This service decides whether a field
+    inherits a PII classification, so a wrong approval nobody reviews costs far more than
+    a missed match that goes to a human. Any retrieval change here must be measured on
+    auto-approve precision, not only on P@1/recall -- better retrieval lowering
+    auto-approve precision at a fixed threshold has now happened three times.
     """
 
     include_type: bool = False

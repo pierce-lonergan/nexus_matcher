@@ -21,6 +21,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import math
+import operator
 import re
 import sys
 import time
@@ -31,6 +32,7 @@ from typing import Any
 
 import numpy as np
 
+from nexus_matcher.core.fusion import fuse_linear_ids
 from nexus_matcher.domain.models.entities import (
     DictionaryEntry,
     MatchingSession,
@@ -65,6 +67,11 @@ try:  # pragma: no cover - trivial import guard
     from rapidfuzz.distance import Levenshtein as _LEVENSHTEIN
 except ImportError:  # pragma: no cover
     _LEVENSHTEIN = None  # type: ignore[assignment]
+
+# C-level sort keys. These run once per candidate per field, where a lambda's frame setup
+# is measurable against the handful of float operations it guards.
+_second = operator.itemgetter(1)
+_first = operator.itemgetter(0)
 
 
 # =============================================================================
@@ -249,6 +256,59 @@ def _tokenize_identifier(name: str) -> set[str]:
 # =============================================================================
 # SCORE NORMALIZATION
 # =============================================================================
+
+
+# The five scored signals, in weight order: semantic, lexical, edit distance, type,
+# domain. This is NOT ScoreBreakdown's field order -- that dataclass declares two reranker
+# fields between type and domain -- so widening one into the other goes through
+# `_breakdown`, never through positional expansion.
+#
+# Carried as a plain tuple on the hot path so a candidate that never reaches the result
+# list does not cost a dataclass; see _match_field.
+Signals = tuple[float, float, float, float, float]
+
+
+def _signal_weights(config: MatchingConfig) -> Signals:
+    """The configured weight of each signal, in signal order."""
+    return (
+        config.semantic_weight,
+        config.lexical_weight,
+        config.edit_distance_weight,
+        config.type_weight,
+        config.domain_weight,
+    )
+
+
+def _breakdown(signals: Signals) -> ScoreBreakdown:
+    """
+    Widen the five signals into the public ScoreBreakdown.
+
+    Keyword arguments are not stylistic here: ScoreBreakdown declares `colbert_score` and
+    `cross_encoder_score` between the type and domain fields, so positional expansion
+    would quietly land the domain score in `colbert_score` and report a reranker result
+    that never ran.
+    """
+    sem, lex, edit, type_, domain = signals
+    return ScoreBreakdown(
+        semantic_score=sem,
+        lexical_score=lex,
+        edit_distance_score=edit,
+        type_compatibility_score=type_,
+        domain_score=domain,
+    )
+
+
+def _weighted_confidence(signals: Signals, weights: Signals) -> float:
+    """
+    The final confidence: a weighted sum of the five signals, clamped to [0, 1].
+
+    One definition, two callers -- the per-candidate ranking loop, which holds signals as
+    a tuple, and `_calculate_final_confidence`, which holds them as a ScoreBreakdown.
+    """
+    sem, lex, edit, type_, domain = signals
+    w_sem, w_lex, w_edit, w_type, w_domain = weights
+    total = w_sem * sem + w_lex * lex + w_edit * edit + w_type * type_ + w_domain * domain
+    return min(max(total, 0.0), 1.0)
 
 
 def _squash_score(score: float) -> float:
@@ -887,7 +947,9 @@ class NexusMatcher:
             : max(self._config.cross_encoder_top_k, self._config.results_per_field)
         ]
 
-        scored: list[tuple[float, ScoreBreakdown, DictionaryEntry]] = []
+        weights = _signal_weights(self._config)
+
+        scored: list[tuple[float, Signals, DictionaryEntry]] = []
         for doc_id, retrieval_score in candidate_pool:
             entry = self._dictionary_entries.get(doc_id)
             if entry is None:
@@ -909,17 +971,17 @@ class NexusMatcher:
             # If a >=95% auto-approve guarantee matters more than ranking quality, set
             # dictionary_alias_count = 0: that restores 0.953 precision at 12.4% coverage
             # at the cost of ~2 points of P@1 (~4 on abbreviation-heavy schemas).
-            score_breakdown = self._calculate_scores(field, entry, query_embedding, retrieval_score)
-            final_confidence = self._calculate_final_confidence(score_breakdown)
-            scored.append((final_confidence, score_breakdown, entry))
+            signals = self._score_signals(field, entry, retrieval_score)
+            scored.append((_weighted_confidence(signals, weights), signals, entry))
 
-        # Stable sort by confidence descending; ties keep upstream retrieval order.
-        scored.sort(key=lambda x: x[0], reverse=True)
+        # Stable sort by confidence descending; ties keep upstream retrieval order, which
+        # `fuse_linear_ids` defines as dense rank rather than leaving it to string hashing.
+        scored.sort(key=_first, reverse=True)
 
         latency_ms = (time.time() - start_time) * 1000
         results: list[MatchResult] = []
 
-        for rank, (final_confidence, score_breakdown, entry) in enumerate(
+        for rank, (final_confidence, signals, entry) in enumerate(
             scored[: self._config.results_per_field], 1
         ):
             runner_up = scored[rank][0] if rank < len(scored) else None
@@ -931,7 +993,8 @@ class NexusMatcher:
                     dictionary_entry=entry,
                     rank=rank,
                     final_confidence=final_confidence,
-                    score_breakdown=score_breakdown,
+                    # Widened here, for the results that are actually returned.
+                    score_breakdown=_breakdown(signals),
                     decision=decision,
                     performance=PerformanceMetrics(
                         latency_ms=latency_ms,
@@ -954,7 +1017,9 @@ class NexusMatcher:
         Fuse dense and sparse retrieval results.
 
         Uses weighted linear combination over MIN-MAX normalized scores, delegating to
-        the shared HybridFuser so fusion lives in one place.
+        core.fusion so the arithmetic lives in one place. `fuse_linear_ids` is the same
+        fusion as `HybridFuser`/`fuse_linear` with the per-item `ScoredItem` provenance
+        left unbuilt -- this call site only ever kept the id and the score.
 
         Two deliberate choices, both measured on the combined BIRD+OMOP benchmark
         (benchmarks/exp_fusion.py, 793 labelled queries):
@@ -973,31 +1038,36 @@ class NexusMatcher:
         instead (e.g. to feed a reranker), balanced combsum scored higher R@10 (0.923
         vs 0.911) -- re-run the sweep rather than assuming.
         """
-        from nexus_matcher.core.fusion import FusionConfig, FusionMethod, HybridFuser
-
         dense_results = [(r.id, r.score) for r in dense]
-        sparse_results = sorted(sparse.items(), key=lambda x: x[1], reverse=True)
+        sparse_results = sorted(sparse.items(), key=_second, reverse=True)
 
         alpha = self._config.fusion_alpha
-        fuser = HybridFuser(
-            config=FusionConfig(
-                method=FusionMethod.LINEAR,
-                semantic_weight=alpha,
-                lexical_weight=1.0 - alpha,
-                normalize=True,
-            )
+        return fuse_linear_ids(
+            dense_results,
+            sparse_results,
+            semantic_weight=alpha,
+            lexical_weight=1.0 - alpha,
+            normalize_scores=True,
         )
 
-        return [(item.id, item.score) for item in fuser.fuse(dense_results, sparse_results)]
-
-    def _calculate_scores(
+    def _score_signals(
         self,
         field: SchemaField,
         entry: DictionaryEntry,
-        query_embedding: np.ndarray,
         retrieval_score: float,
-    ) -> ScoreBreakdown:
-        """Calculate detailed score breakdown."""
+    ) -> Signals:
+        """
+        The five raw signals for one (field, entry) pair, in `Signals` order.
+
+        Returns a tuple rather than a ScoreBreakdown because this runs for every
+        candidate in the pool while only `results_per_field` of them are ever returned to
+        a caller -- three quarters of the dataclasses built here used to be discarded
+        unread a few lines later. `_breakdown` widens the survivors.
+
+        The arithmetic is deliberately the same work, in the same order, as before that
+        change: a scoring change that silently moves rankings does not belong in a
+        refactor that was only meant to stop building objects nobody reads.
+        """
         # Semantic score from retrieval
         semantic_score = min(retrieval_score, 1.0)
 
@@ -1029,13 +1099,23 @@ class NexusMatcher:
         # Domain score using domain matcher
         domain_score = self._calculate_domain_score(field, entry)
 
-        return ScoreBreakdown(
-            semantic_score=semantic_score,
-            lexical_score=lexical_score,
-            edit_distance_score=edit_distance_score,
-            type_compatibility_score=type_score,
-            domain_score=domain_score,
+        return (
+            semantic_score,
+            lexical_score,
+            edit_distance_score,
+            type_score,
+            domain_score,
         )
+
+    def _calculate_scores(
+        self,
+        field: SchemaField,
+        entry: DictionaryEntry,
+        query_embedding: np.ndarray,
+        retrieval_score: float,
+    ) -> ScoreBreakdown:
+        """Calculate detailed score breakdown."""
+        return _breakdown(self._score_signals(field, entry, retrieval_score))
 
     def _calculate_domain_score(
         self,
@@ -1069,11 +1149,14 @@ class NexusMatcher:
         if field_domain and entry_domain:
             return self._domain_matcher.score(field_domain, entry_domain)
 
-        # If only entry has domain, give partial credit
-        if entry_domain:
-            return 0.5
-
-        # No domain info available - neutral score
+        # No usable pair -- neutral score.
+        #
+        # This used to be two branches, "only the entry has a domain" and "neither side
+        # has one", both returning 0.5. They are written as one return because the split
+        # implied a partial-credit case that never existed, not because merging them is
+        # faster: this is NOT a performance change. Both forms are one predicted branch
+        # per candidate, and the whole collapse can save at most 0.16 ms of a 7.04 s
+        # match. Do not cite it as an optimization.
         return 0.5
 
     def _infer_domain_from_path(self, path: str) -> str | None:
@@ -1183,17 +1266,16 @@ class NexusMatcher:
 
     def _calculate_final_confidence(self, scores: ScoreBreakdown) -> float:
         """Calculate weighted final confidence score."""
-        config = self._config
-
-        final = (
-            config.semantic_weight * scores.semantic_score
-            + config.lexical_weight * scores.lexical_score
-            + config.edit_distance_weight * scores.edit_distance_score
-            + config.type_weight * scores.type_compatibility_score
-            + config.domain_weight * scores.domain_score
+        return _weighted_confidence(
+            (
+                scores.semantic_score,
+                scores.lexical_score,
+                scores.edit_distance_score,
+                scores.type_compatibility_score,
+                scores.domain_score,
+            ),
+            _signal_weights(self._config),
         )
-
-        return min(max(final, 0.0), 1.0)
 
     def _determine_decision(
         self,

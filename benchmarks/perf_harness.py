@@ -224,14 +224,27 @@ def _rss_mb() -> float | None:
     return psutil.Process().memory_info().rss / 1e6
 
 
-def measure(entries_n: int, fields_n: int, warmup: bool = True) -> Measurement:
-    """Run one scale point end to end."""
+def measure(
+    entries_n: int,
+    fields_n: int,
+    warmup: bool = True,
+    matcher_factory: Any | None = None,
+) -> Measurement:
+    """
+    Run one scale point end to end.
+
+    `matcher_factory` is an optional zero-argument callable returning the matcher to
+    measure. It exists so a caller comparing two configurations can hold the timing
+    procedure fixed and vary only the matcher -- optimization_ledger.py needs that, and
+    re-implementing the timing there would give this repo two different definitions of
+    "fields per second". Omitting it keeps the previous behaviour exactly.
+    """
     from nexus_matcher.application.use_cases.match_schema import NexusMatcher
 
     entries = _make_glossary(entries_n)
     fields = _make_fields(fields_n)
 
-    matcher = NexusMatcher.from_config()
+    matcher = matcher_factory() if matcher_factory is not None else NexusMatcher.from_config()
 
     if warmup:
         # The first encode pays ONNX session setup and lazy imports. Charging that to the
