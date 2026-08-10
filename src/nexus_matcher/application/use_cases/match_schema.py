@@ -881,8 +881,41 @@ class NexusMatcher:
             # threshold no match could ever fall below, instead of returning [] and
             # reading as "nothing to review". The session is a domain object and must
             # not import MatchingConfig, so it gets the derived number, not the config.
-            minimum_achievable_confidence=self.minimum_achievable_confidence,
+            minimum_achievable_confidence=self._session_confidence_floor(results),
         )
+
+    def _session_confidence_floor(
+        self, results: Mapping[str, Sequence[MatchResult]]
+    ) -> float | None:
+        """
+        The floor for THIS session, or None when the derivation's preconditions did not
+        hold for it.
+
+        `MatchingConfig.minimum_achievable_confidence` is a bound, and a bound has
+        preconditions: no reranker, and at least two distinct dense scores so that min-max
+        normalisation maps the top candidate to 1.0 rather than to 0.0. The second one is
+        easy to violate by ordinary means -- a one-entry dictionary, `dense_top_k=1`, or a
+        perfect tie across every candidate -- and when it is violated the real confidences
+        sit around 0.13 while the config still reports 0.63.
+
+        Handing that number to the session was worse than not having it. Every threshold in
+        the range where the fields actually were got REFUSED, with a message asserting no
+        match could fall below it, on precisely the sessions where they all did. That is
+        NM-0027's own failure -- an API telling a reviewer there is nothing to see -- coming
+        back as an exception instead of an empty list.
+
+        So the bound is checked against the data it claims to bound. If any top match sits
+        below it, the precondition demonstrably did not hold and the session reports no
+        floor. A self-verifying claim cannot be wrong about its own session.
+        """
+        floor = self.minimum_achievable_confidence
+        if floor is None:
+            return None
+        tops = [matches[0].final_confidence for matches in results.values() if matches]
+        if not tops:
+            # Nothing matched, so there is nothing to bound and nothing to refuse against.
+            return None
+        return floor if min(tops) >= floor else None
 
     def _parse_schema(
         self,

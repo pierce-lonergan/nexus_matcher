@@ -311,9 +311,9 @@ def test_a_finding_quoting_a_non_ascii_document_still_renders():
     findings = [checker.verify(claim, known)[1] for claim in claims]
     findings = [finding for finding in findings if finding is not None]
     assert findings, f"no finding produced from {claims}"
-    assert any(
-        "—" in finding.metric or "≤" in finding.metric for finding in findings
-    ), "the control document's non-ASCII never reached a finding, so it proves nothing"
+    assert any("—" in finding.metric or "≤" in finding.metric for finding in findings), (
+        "the control document's non-ASCII never reached a finding, so it proves nothing"
+    )
     for finding in findings:
         for codepage in _CODEPAGES:
             finding.render().encode(codepage)  # raises if a glyph survived untranslated
@@ -345,7 +345,8 @@ def test_the_report_survives_a_legacy_windows_console(codepage, mode):
     # The verdict is NOT asserted here: this test must keep meaning something while the
     # gate is red, which is exactly when the most document text gets printed.
     assert b"UnicodeEncodeError" not in result.stderr + result.stdout, (
-        codepage, result.stderr[-800:]
+        codepage,
+        result.stderr[-800:],
     )
     assert result.stdout.strip(), "no output to check"
     result.stdout.decode(codepage)  # raises if the gate emitted something it cannot print
@@ -379,5 +380,7 @@ def test_the_report_is_deterministic_across_interpreters():
         outputs.append((seed, result.stdout))
     reference_seed, reference = outputs[0]
     for seed, output in outputs[1:]:
-        assert output == reference, f"report order differs between seeds {reference_seed} and {seed}"
+        assert output == reference, (
+            f"report order differs between seeds {reference_seed} and {seed}"
+        )
     assert reference.count("\n") >= 100, "the report is too short for ordering to prove anything"

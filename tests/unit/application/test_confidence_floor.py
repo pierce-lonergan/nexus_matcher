@@ -180,7 +180,46 @@ class TestTheFloorIsReal:
         top = session.get_top_matches()["zzz_one"]
 
         assert top.score_breakdown.fused_retrieval_score == pytest.approx(0.0)
-        assert top.final_confidence < session.minimum_achievable_confidence
+        # The SESSION reports no floor, because its own data violates the bound. This
+        # assertion used to be `top.final_confidence < session.minimum_achievable_confidence`
+        # -- it documented the session carrying a floor the session itself disproved, and
+        # stopped one line short of the consequence.
+        assert session.minimum_achievable_confidence is None
+
+    def test_a_session_that_violates_the_bound_still_answers_the_review_question(self):
+        """
+        The link the previous test stopped one line short of, and the reason it mattered.
+
+        The config-level floor is a BOUND with preconditions. When they do not hold -- a
+        one-entry dictionary, `dense_top_k=1`, a perfect tie -- confidences sit around 0.13
+        while the config still says 0.63. Handing that number to the session made
+        `get_low_confidence_fields` REFUSE every threshold in the only range where the
+        fields actually were, with a message asserting no match could fall below it, on
+        precisely the sessions where they all did.
+
+        That is NM-0027's own failure -- an API telling a reviewer there is nothing to see
+        -- coming back as an exception instead of an empty list. The fix that caused it was
+        mine.
+        """
+        session = _matcher(MatchingConfig(), entries=_ENTRIES[:1]).match_schema_session(_SCHEMA)
+        top = session.get_top_matches()["zzz_one"]
+        assert top.final_confidence < 0.63, "fixture no longer exercises the violated bound"
+
+        # Every one of these raised ValueError before the session-level check.
+        for threshold in (0.6, 0.5, 0.3):
+            assert session.get_low_confidence_fields(threshold) == ["zzz_one"]
+        assert session.get_low_confidence_fields() == ["zzz_one"]
+
+    def test_a_session_that_satisfies_the_bound_still_refuses_an_impossible_threshold(self):
+        """
+        The other half: dropping the floor where it does not hold must not drop it where it
+        does. A threshold below a floor that genuinely applies is still a request that can
+        only ever return [], and [] reads as "nothing to review".
+        """
+        session = _matcher(MatchingConfig()).match_schema_session(_SCHEMA)
+        assert session.minimum_achievable_confidence == pytest.approx(0.63)
+        with pytest.raises(ValueError, match="0.63"):
+            session.get_low_confidence_fields(0.6)
 
 
 class TestTheTwoScoresAreDifferentThings:

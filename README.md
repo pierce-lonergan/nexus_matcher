@@ -52,6 +52,26 @@ For the last ~2 points of accuracy, the transformer path is still there:
 pip install "nexus-matcher[embeddings]"   # adds torch + sentence-transformers (~800 MB)
 ```
 
+### If you cannot reach PyPI
+
+Governance tooling often runs where a package index is blocked, so there are three other
+routes — all ending with the same wheel and the same bundled encoder. Full detail in
+[docs/INSTALL.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/INSTALL.md).
+
+```bash
+# GitHub reachable, PyPI not. The encoder is committed, so it comes with the source.
+pip install "git+https://github.com/pierce-lonergan/nexus_matcher.git@v2.0.1"
+
+# Airgapped: build the bundle where there IS network, carry it over, install with no index.
+python scripts/make_offline_bundle.py
+pip install --no-index --find-links wheels nexus-matcher
+```
+
+The airgapped path is verified rather than asserted: built here, installed into a fresh
+venv with `socket.connect` and `socket.getaddrinfo` patched to raise, then a real
+governance match run to completion — **0 network connection attempts**, and no torch, no
+pandas.
+
 Or from source:
 
 ```bash
