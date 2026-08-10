@@ -73,10 +73,16 @@ experimental components under
 [What is actually implemented](#what-is-actually-implemented). `full` is everything
 except `colbert`, which has no resolvable install on Python 3.12+.
 
-`sparse` and `cli` are kept as names so existing pins keep resolving, but their contents
-are core dependencies now: `rank-bm25` because the default pipeline cannot index a
-dictionary without the sparse arm, `typer` and `rich` because the console script is
-declared unconditionally and cannot start without them.
+`sparse` and `cli` are kept as names so existing pins keep resolving. `typer` and `rich`
+moved into the core dependencies, because the console script is declared unconditionally
+and cannot start without them.
+
+`rank-bm25` did NOT: BM25 is built in. `BM25Retriever` runs on a numpy inverted index and
+imports nothing, so the lexical arm of hybrid retrieval works on a bare install with no
+extra at all. The `sparse` extra now installs only the reference implementation the tests
+compare against. (An earlier version of this paragraph said rank-bm25 was a core
+dependency — it was, until the inverted-index rewrite stopped importing it, and this text
+was not updated with the code.)
 
 ---
 
@@ -516,8 +522,12 @@ Read this before trusting the headline number.
   a BIRD-style schema will *not* have the right answer at rank 1. Recall@10 is much
   better than P@1, which is why the product surface is a ranked review list, not a
   silent auto-mapping.
-- **793-entry dictionary.** The benchmark corpus is enterprise-glossary-sized, not
-  catalogue-sized. Accuracy at 100k entries is unmeasured.
+- **793-entry dictionary for the headline numbers.** The corpus those are measured on is
+  enterprise-glossary-sized, not catalogue-sized. Accuracy at catalogue scale IS measured,
+  separately: `benchmarks/results/exp_scale_combined.json` records P@1 **0.589** (in-memory)
+  and **0.591** (HNSW) at **100,000 entries** — so it degrades with corpus size, as the
+  0.0024 gold-vs-nearest-wrong margin predicts it must. Treat the headline figures as an
+  upper bound for a glossary of a few hundred entries, not as a promise at catalogue scale.
 - **English only.** All measurement is English-language field names and definitions.
 - **Two domains.** Healthcare (OMOP) and assorted OLTP (BIRD). Your domain vocabulary is
   not represented; re-run the calibration on your own labelled sample before relying on
