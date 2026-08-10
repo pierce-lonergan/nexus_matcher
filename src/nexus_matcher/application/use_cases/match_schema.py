@@ -173,6 +173,46 @@ class MatchingConfig:
     # Do not enable it on an enterprise glossary.
     dictionary_alias_count: int = 0
 
+    @property
+    def minimum_achievable_confidence(self) -> float:
+        """
+        The structural floor: the lowest `final_confidence` a rank-1 match can carry.
+
+        For the shipped configuration this is **0.63**, and knowing it is not optional
+        trivia. `MatchingSession.get_low_confidence_fields()` shipped with a default
+        threshold of 0.6 -- below this floor -- so it returned an empty list on every
+        schema ever matched, and told a governance lead there was nothing to review on
+        a schema where nothing was trustworthy (DX-001, tests/museum/NM-0027). The floor
+        was folklore; nothing computed it, so nothing could contradict the number.
+
+        Why it exists. `fused_retrieval_score` is min-max normalised over the candidates
+        retrieved for one field, so the best candidate's dense score normalises to
+        exactly 1.0, and `fuse_linear_ids` renormalises the two arm weights to sum to 1 --
+        so that candidate's fused score is at least `fusion_alpha`. It carries
+        `semantic_weight` of the final confidence, and the other four signals cannot be
+        negative. Hence:
+
+            floor = semantic_weight * fusion_alpha = 0.70 * 0.90 = 0.63
+
+        Move `fusion_alpha` and the floor moves with it, which is the proof that this
+        score is rank-relative rather than a similarity: at fusion_alpha=0.5 the rank-1
+        fused score drops to ~0.45 for the SAME embeddings.
+
+        Two preconditions, stated because a bound that quietly does not hold is worse
+        than no bound:
+
+        1. **No reranker.** A reranker REPLACES the fused score with a squashed reranker
+           score, which has no floor. `NexusMatcher.minimum_achievable_confidence`
+           returns None when one is wired, rather than reporting a number that is wrong.
+        2. **At least two distinct dense scores.** Min-max maps a constant map to all
+           zeros, so a one-entry dictionary (or a perfect tie across every candidate)
+           produces a fused score of 0.0 and there is no floor at all.
+
+        Clamped to [0, 1] because `_weighted_confidence` clamps too: with a weight set
+        that oversums, confidences pile up at 1.0 and so does the floor.
+        """
+        return min(max(self.semantic_weight * self.fusion_alpha, 0.0), 1.0)
+
 
 def _load_matching_config(source: MatchingConfig | str | Path | None) -> MatchingConfig:
     """
@@ -258,10 +298,15 @@ def _tokenize_identifier(name: str) -> set[str]:
 # =============================================================================
 
 
-# The five scored signals, in weight order: semantic, lexical, edit distance, type,
-# domain. This is NOT ScoreBreakdown's field order -- that dataclass declares two reranker
-# fields between type and domain -- so widening one into the other goes through
+# The five scored signals, in weight order: fused retrieval, lexical, edit distance,
+# type, domain. This is NOT ScoreBreakdown's field order -- that dataclass declares two
+# reranker fields between type and domain -- so widening one into the other goes through
 # `_breakdown`, never through positional expansion.
+#
+# Signal 0 is weighted by `MatchingConfig.semantic_weight`, whose name is a survivor of
+# the same confusion as the old `ScoreBreakdown.semantic_score`: it weights the fused
+# RETRIEVAL score. The config field keeps its name because it is a calibrated knob that
+# users set in JSON/TOML files, and renaming it would break those files silently.
 #
 # Carried as a plain tuple on the hot path so a candidate that never reaches the result
 # list does not cost a dataclass; see _match_field.
@@ -279,7 +324,7 @@ def _signal_weights(config: MatchingConfig) -> Signals:
     )
 
 
-def _breakdown(signals: Signals) -> ScoreBreakdown:
+def _breakdown(signals: Signals, absolute_cosine: float | None = None) -> ScoreBreakdown:
     """
     Widen the five signals into the public ScoreBreakdown.
 
@@ -287,14 +332,19 @@ def _breakdown(signals: Signals) -> ScoreBreakdown:
     `cross_encoder_score` between the type and domain fields, so positional expansion
     would quietly land the domain score in `colbert_score` and report a reranker result
     that never ran.
+
+    `absolute_cosine` is carried ALONGSIDE the five signals and never inside them: it is
+    reported to the caller and is deliberately not an input to the weighted confidence,
+    so adding it cannot move a ranking. See `_match_field` for where it comes from.
     """
     sem, lex, edit, type_, domain = signals
     return ScoreBreakdown(
-        semantic_score=sem,
+        fused_retrieval_score=sem,
         lexical_score=lex,
         edit_distance_score=edit,
         type_compatibility_score=type_,
         domain_score=domain,
+        absolute_cosine=absolute_cosine,
     )
 
 
@@ -827,6 +877,11 @@ class NexusMatcher:
             schema=schema,
             results=results,
             total_duration_ms=duration_ms,
+            # Carried into the session so `get_low_confidence_fields()` can REFUSE a
+            # threshold no match could ever fall below, instead of returning [] and
+            # reading as "nothing to review". The session is a domain object and must
+            # not import MatchingConfig, so it gets the derived number, not the config.
+            minimum_achievable_confidence=self.minimum_achievable_confidence,
         )
 
     def _parse_schema(
@@ -940,6 +995,16 @@ class NexusMatcher:
                     )
             dense_candidates = sorted(best.values(), key=lambda r: r.score, reverse=True)
 
+        # The RAW dense score per entry, captured before fusion normalises it away.
+        #
+        # Under the shipped wiring this is the cosine similarity between the query vector
+        # and the entry vector, and it is the only number in the breakdown an auditor can
+        # compare ACROSS fields -- `fused_retrieval_score` is rescaled per field, so its
+        # 0.9 says "won this field's shortlist", not "is 90% similar". It was computed on
+        # every match and then discarded, so "how similar were they really?" had no
+        # answer anywhere in the API. Reported only; never an input to the confidence.
+        absolute_cosines = {r.id: r.score for r in dense_candidates}
+
         # Sparse retrieval (if available)
         sparse_candidates: dict[str, float] = {}
         if self._sparse_retriever:
@@ -975,7 +1040,7 @@ class NexusMatcher:
                 reranked = rerank_result.unwrap()
                 # Reranker scores are UNBOUNDED (cross-encoder logits can be negative or
                 # far above 1; ColBERT MaxSim is a sum over query tokens). They feed
-                # `semantic_score`, which carries 70% of the final confidence weight, so
+                # `fused_retrieval_score`, which carries 70% of the confidence weight, so
                 # they must be squashed into [0, 1] first. Without this, min(score, 1.0)
                 # saturated every plausible candidate to the same value and turned
                 # `final_confidence` into a sign test on the raw logit.
@@ -991,7 +1056,7 @@ class NexusMatcher:
 
         weights = _signal_weights(self._config)
 
-        scored: list[tuple[float, Signals, DictionaryEntry]] = []
+        scored: list[tuple[float, Signals, DictionaryEntry, float | None]] = []
         for doc_id, retrieval_score in candidate_pool:
             entry = self._dictionary_entries.get(doc_id)
             if entry is None:
@@ -1014,7 +1079,14 @@ class NexusMatcher:
             # dictionary_alias_count = 0: that restores 0.953 precision at 12.4% coverage
             # at the cost of ~2 points of P@1 (~4 on abbreviation-heavy schemas).
             signals = self._score_signals(field, entry, retrieval_score)
-            scored.append((_weighted_confidence(signals, weights), signals, entry))
+            scored.append(
+                (
+                    _weighted_confidence(signals, weights),
+                    signals,
+                    entry,
+                    absolute_cosines.get(doc_id),
+                )
+            )
 
         # Stable sort by confidence descending; ties keep upstream retrieval order, which
         # `fuse_linear_ids` defines as dense rank rather than leaving it to string hashing.
@@ -1023,7 +1095,7 @@ class NexusMatcher:
         latency_ms = (time.time() - start_time) * 1000
         results: list[MatchResult] = []
 
-        for rank, (final_confidence, signals, entry) in enumerate(
+        for rank, (final_confidence, signals, entry, absolute_cosine) in enumerate(
             scored[: self._config.results_per_field], 1
         ):
             runner_up = scored[rank][0] if rank < len(scored) else None
@@ -1036,7 +1108,7 @@ class NexusMatcher:
                     rank=rank,
                     final_confidence=final_confidence,
                     # Widened here, for the results that are actually returned.
-                    score_breakdown=_breakdown(signals),
+                    score_breakdown=_breakdown(signals, absolute_cosine),
                     decision=decision,
                     performance=PerformanceMetrics(
                         latency_ms=latency_ms,
@@ -1110,8 +1182,12 @@ class NexusMatcher:
         change: a scoring change that silently moves rankings does not belong in a
         refactor that was only meant to stop building objects nobody reads.
         """
-        # Semantic score from retrieval
-        semantic_score = min(retrieval_score, 1.0)
+        # The fused RETRIEVAL score, not a semantic similarity. It is min-max normalised
+        # per field, so it says how this entry placed among this field's candidates and
+        # says almost nothing about how similar the two texts are. Named for what it is:
+        # calling it `semantic_score` is what let "0.9" be read as 90% similarity for two
+        # releases (DX-003). The absolute cosine is reported separately.
+        fused_retrieval_score = min(retrieval_score, 1.0)
 
         # Lexical score (token overlap).
         # Identifiers must be split on case and digit boundaries, not just underscores:
@@ -1142,7 +1218,7 @@ class NexusMatcher:
         domain_score = self._calculate_domain_score(field, entry)
 
         return (
-            semantic_score,
+            fused_retrieval_score,
             lexical_score,
             edit_distance_score,
             type_score,
@@ -1310,7 +1386,7 @@ class NexusMatcher:
         """Calculate weighted final confidence score."""
         return _weighted_confidence(
             (
-                scores.semantic_score,
+                scores.fused_retrieval_score,
                 scores.lexical_score,
                 scores.edit_distance_score,
                 scores.type_compatibility_score,
@@ -1353,6 +1429,26 @@ class NexusMatcher:
             return MatchDecision.REVIEW
 
         return MatchDecision.REJECT
+
+    @property
+    def minimum_achievable_confidence(self) -> float | None:
+        """
+        The lowest `final_confidence` a rank-1 match can carry, for THIS matcher.
+
+        Ask this before choosing any confidence threshold. A threshold at or below it
+        selects nothing, however bad the matches are -- which is how
+        `get_low_confidence_fields()` came to answer "nothing to review" on a schema
+        where nothing was trustworthy (DX-001).
+
+        Returns None when a reranker is wired, because the reranker replaces the fused
+        retrieval score with its own squashed output and the floor no longer holds. None
+        means "unknown for this configuration", not "zero"; see
+        `MatchingConfig.minimum_achievable_confidence` for the derivation and the second
+        precondition.
+        """
+        if self._reranker is not None:
+            return None
+        return self._config.minimum_achievable_confidence
 
     @property
     def dictionary_size(self) -> int:

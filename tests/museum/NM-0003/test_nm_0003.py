@@ -26,7 +26,16 @@ from typing import ClassVar
 import pytest
 from typer.testing import CliRunner
 
+from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+from nexus_matcher.domain.models.entities import DictionaryEntry, MatchResult, SchemaField
 from nexus_matcher.presentation.cli.main import app
+from nexus_matcher.shared.types.base import (
+    DataType,
+    MatchDecision,
+    PerformanceMetrics,
+    ProtectionLevel,
+    ScoreBreakdown,
+)
 
 # Rich wraps and truncates to the terminal, so an unpinned runner makes output-dependent
 # assertions depend on the environment they run in.
@@ -35,30 +44,49 @@ runner = CliRunner(env={"COLUMNS": "200", "TERM": "dumb", "NO_COLOR": "1"})
 FIELD = "customer.email"
 BUSINESS_NAME = "Customer Email Address"
 
+# Real domain objects, not attribute stubs.
+#
+# This file used to carry hand-written stand-ins declaring exactly the attributes the JSON
+# writer happened to read -- four on the entry, three on the score breakdown. A stub that
+# omits what the code omits is a mirror, not an oracle, and it is how NM-0025 (the JSON
+# output carrying no protection_level, no definition, no domain and no weights) sat
+# unnoticed under a passing suite. Real entities cost nothing here and fail loudly when a
+# field the CLI reads is renamed.
+_CONFIG = MatchingConfig()
+# Five different signals in weight order, and a confidence that really is their weighted
+# sum: 0.7*0.9012 + 0.05*0.5 + 0.05*0.4211 + 0.05*0.8 + 0.15*0.25 = 0.754395. The JSON
+# writer now refuses to emit a document whose numbers do not reproduce its own confidence,
+# so an invented confidence would fail here for a reason that has nothing to do with
+# NM-0003.
+_SIGNALS = (0.9012, 0.5, 0.4211, 0.8, 0.25)
+_CONFIDENCE = 0.754395
 
-class _Entry:
-    id = "field_001"
-    business_name = BUSINESS_NAME
-    logical_name = "cust_email"
 
-    class data_type:
-        value = "STRING"
-
-
-class _Scores:
-    semantic_score = 0.90
-    lexical_score = 0.80
-    type_compatibility_score = 1.0
-
-
-class _Match:
-    rank = 1
-    dictionary_entry = _Entry()
-    final_confidence = 0.91
-    score_breakdown = _Scores()
-
-    class decision:
-        value = "AUTO_APPROVE"
+def _match_result() -> MatchResult:
+    sem, lex, edit, type_, domain = _SIGNALS
+    return MatchResult(
+        schema_field=SchemaField(name="email", data_type=DataType.STRING, full_path=FIELD),
+        dictionary_entry=DictionaryEntry(
+            id="field_001",
+            business_name=BUSINESS_NAME,
+            logical_name="cust_email",
+            definition="The email address used to contact a customer.",
+            data_type=DataType.STRING,
+            protection_level=ProtectionLevel.PII,
+            domain="customer",
+        ),
+        rank=1,
+        final_confidence=_CONFIDENCE,
+        score_breakdown=ScoreBreakdown(
+            fused_retrieval_score=sem,
+            lexical_score=lex,
+            edit_distance_score=edit,
+            type_compatibility_score=type_,
+            domain_score=domain,
+        ),
+        decision=MatchDecision.REVIEW,
+        performance=PerformanceMetrics(latency_ms=1.0),
+    )
 
 
 class _Stats:
@@ -76,13 +104,18 @@ class _Matcher:
 
     The defect lives entirely in the CLI's output-writing path, so stubbing retrieval
     keeps every line under test real while making the test hermetic.
+
+    `_config` is what the JSON writer reads the scoring weights off, so that the emitted
+    confidence can be recomputed from the emitted components.
     """
+
+    _config = _CONFIG
 
     def load_dictionary(self, path):
         return _Stats()
 
     def match_schema(self, path):
-        return {FIELD: [_Match()]}
+        return {FIELD: [_match_result()]}
 
 
 @pytest.fixture

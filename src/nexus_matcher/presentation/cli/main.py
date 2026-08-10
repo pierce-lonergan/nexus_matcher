@@ -47,15 +47,18 @@ console = Console()
 # =============================================================================
 
 
-def _ascii_only() -> bool:
+def _ascii_only(target: Console | None = None) -> bool:
     """
     Whether the console's code page can be trusted with non-ASCII decoration.
 
     Rich already derives this from the stream encoding and uses it to swap its
     box-drawing characters for `+---+`; it just never applies it to spinners or to text
     we hand it ourselves. Reusing its signal keeps the whole frame degrading together.
+
+    `target` because status output does not always go to stdout -- see `_status_console`.
+    The decision has to follow the stream the characters will actually be written to.
     """
-    return console.options.ascii_only
+    return (target or console).options.ascii_only
 
 
 def _glyph(fancy: str, plain: str) -> str:
@@ -63,7 +66,7 @@ def _glyph(fancy: str, plain: str) -> str:
     return plain if _ascii_only() else fancy
 
 
-def _spinner_column() -> SpinnerColumn:
+def _spinner_column(target: Console | None = None) -> SpinnerColumn:
     """
     Rich's default spinner animates with Braille (U+2838, U+283C and friends), which
     cp437, cp850 and cp1252 all refuse to encode. `match` and `sync` -- the only two
@@ -73,7 +76,33 @@ def _spinner_column() -> SpinnerColumn:
     Fall back to the ASCII `-\\|/` spinner rather than forcing UTF-8 onto the user's
     terminal or removing progress output for everyone.
     """
-    return SpinnerColumn(spinner_name="line" if _ascii_only() else "dots")
+    return SpinnerColumn(spinner_name="line" if _ascii_only(target) else "dots")
+
+
+# Formats whose output is meant to be read by a program rather than by a person.
+_MACHINE_FORMATS = frozenset({"json", "csv"})
+
+
+def _status_console(payload_on_stdout: bool) -> Console:
+    """
+    Where progress, summaries and errors go.
+
+    When there is no `--output`, the payload IS stdout, and everything else has to get
+    off it. `nexus-matcher match schema.avsc -d dict.csv -f json > results.json` used to
+    write a file that began with a spinner frame and ended with
+
+        Summary: 0/1 fields auto-approved (0.0%)
+
+    around the JSON -- so the only documented machine-readable surface produced something
+    no JSON parser accepts, in the most obvious way anyone would ever script it. Rich's
+    Progress and `rich.print` both default to stdout, and nothing here had ever said
+    otherwise.
+
+    Status goes to stderr only when it would otherwise corrupt a payload. With `--output`,
+    or with the human `table` format, stdout is nobody's data channel and the messages
+    stay exactly where users have always seen them.
+    """
+    return Console(stderr=True) if payload_on_stdout else console
 
 
 def _soften_encoding_errors() -> None:
@@ -214,12 +243,15 @@ def match(
         nexus-matcher match schema.json -d dictionary.csv -o results.json
     """
     resolved_format = _resolve_format(format, output)
+    # No --output and a machine format means stdout carries the payload; status has to
+    # move to stderr or it lands inside the document. See _status_console.
+    status = _status_console(output is None and resolved_format in _MACHINE_FORMATS)
 
     try:
         with Progress(
-            _spinner_column(),
+            _spinner_column(status),
             TextColumn("[progress.description]{task.description}"),
-            console=console,
+            console=status,
         ) as progress:
             # Initialize matcher
             task = progress.add_task("Initializing matcher...", total=None)
@@ -229,7 +261,7 @@ def match(
             progress.update(task, description="Loading dictionary...")
             stats = matcher.load_dictionary(dictionary)
             if verbose:
-                rprint(f"[dim]Loaded {stats.valid_entries} dictionary entries[/dim]")
+                status.print(f"[dim]Loaded {stats.valid_entries} dictionary entries[/dim]")
 
             # Match schema
             progress.update(task, description="Matching schema...")
@@ -239,15 +271,24 @@ def match(
         # that quietly skipped the write is what made the documented example a no-op.
         if resolved_format == "table":
             table = _build_results_table(results, top_k, threshold, verbose)
-            console.print(table)
             if output:
+                # An extension we cannot map to json or csv is STILL a request for a
+                # file. Rendering to the terminal and writing nothing is precisely
+                # NM-0003 -- `-o results.json` exiting 0 having produced nothing -- and
+                # this branch lost the write once already while two comments above it
+                # went on claiming it wrote.
                 _write_output(output, _render_table_text(table))
+            else:
+                console.print(table)
         elif resolved_format == "json":
-            json_output = _format_json(results, top_k, threshold)
+            json_output = _format_json(results, top_k, threshold, _scoring_weights(matcher))
             if output:
                 _write_output(output, json_output)
             else:
-                print(json_output)
+                # `end=""` because _format_json already terminates the document with a
+                # newline. Piping stdout to a file therefore produces the same bytes as
+                # `-o`, which is what a script that does either one has always assumed.
+                print(json_output, end="")
         elif resolved_format == "csv":
             csv_output = _format_csv(results, top_k, threshold)
             if output:
@@ -255,7 +296,7 @@ def match(
             else:
                 print(csv_output)
         else:
-            rprint(f"[red]Unknown format: {escape(resolved_format)}[/red]")
+            status.print(f"[red]Unknown format: {escape(resolved_format)}[/red]")
             raise typer.Exit(1)
 
         # Summary
@@ -270,12 +311,12 @@ def match(
             # file, or a format the parser did not recognise. Dividing by it turned that
             # into "Error: division by zero", which tells the user nothing about what to
             # do and looks like a crash in the tool rather than a problem with their input.
-            rprint(
+            status.print(
                 "\n[yellow]No fields were parsed from the schema.[/yellow] "
                 "Check the file is not empty and that --schema-format matches its contents."
             )
             raise typer.Exit(1)
-        rprint(
+        status.print(
             f"\n[bold]Summary:[/bold] {auto_approved}/{total_fields} fields auto-approved ({auto_approved / total_fields * 100:.1f}%)"
         )
 
@@ -286,9 +327,9 @@ def match(
         # said everything useful. Catching the parent covers both.
         raise
     except Exception as e:
-        rprint(f"[red]Error: {escape(str(e))}[/red]")
+        status.print(f"[red]Error: {escape(str(e))}[/red]")
         if verbose:
-            console.print_exception()
+            status.print_exception()
         raise typer.Exit(1) from e
 
 
@@ -633,33 +674,235 @@ def _build_results_table(results: dict, top_k: int, threshold: float, verbose: b
     return table
 
 
-def _format_json(results: dict, top_k: int, threshold: float) -> str:
-    """Format results as JSON."""
+# =============================================================================
+# JSON OUTPUT -- the only documented machine-readable surface
+# =============================================================================
+#
+# This is what a governance script consumes, so it has to carry the thing governance is
+# about. It used to emit four identity columns and three of the five score components:
+# `protection_level` -- the classification the whole stated use case exists to propagate,
+# "so the object inherits that entry's classification" -- was absent, and the emitted
+# numbers could not reproduce the emitted confidence, so an auditor could not check the
+# arithmetic from the file. A fresh-eyes agent given a real governance task abandoned the
+# CLI and rebuilt on the Python API. See docs/research/fresh-eyes.md, DX-002.
+
+# The five signals that produce `final_confidence`, each paired with the weight that
+# scales it. Rows are (json key, ScoreBreakdown attribute, MatchingConfig weight).
+#
+# One table rather than five inline attribute reads, for two reasons. It keeps the
+# SCORE-TO-WEIGHT PAIRING in a single visible place -- pairing a component with the wrong
+# weight would produce a file whose arithmetic is self-consistently wrong, the worst
+# possible failure for an audit artifact. And it puts every coupling to another layer's
+# field names in one place, so a rename there is one edit here rather than a hunt.
+#
+# The first key was "semantic" and is now "fused_retrieval", following the domain model:
+# the number is the min-max-normalised FUSED RETRIEVAL score, rank-relative, and the
+# rank-1 candidate sits at `fusion_alpha` whether the match is excellent or barely
+# plausible. Calling it "semantic" in a file an auditor reads claims 90% similarity and
+# delivers "ranked first among the candidates for this field". The other four keys keep
+# the names they already had. `semantic_weight` keeps its own name because that is what
+# MatchingConfig still calls it.
+_SCORE_COMPONENTS: tuple[tuple[str, str, str], ...] = (
+    ("fused_retrieval", "fused_retrieval_score", "semantic_weight"),
+    ("lexical", "lexical_score", "lexical_weight"),
+    ("edit_distance", "edit_distance_score", "edit_distance_weight"),
+    ("type", "type_compatibility_score", "type_weight"),
+    ("domain", "domain_score", "domain_weight"),
+)
+
+# Where MatchingConfig lives on the matcher. The application layer exposes no public
+# accessor, so this is a coupling to a private name -- see `_scoring_weights` for why
+# that is survivable and `_verify_reproducible` for what makes it safe.
+_MATCHER_CONFIG_ATTR = "_config"
+
+# Decimals kept for every emitted number.
+#
+# Six, not the four this used to use, because the file now has to be self-checking: an
+# auditor recomputes sum(scores[k] * weights[k]) and compares it to `confidence`. Rounding
+# to N decimals moves each term by up to 5e-(N+1), so at four decimals the recomputed sum
+# can disagree with the emitted confidence in the fourth decimal -- indistinguishable, to
+# the person checking, from the tool getting the sum wrong. At six the disagreement is
+# below 1e-5 and cannot be mistaken for an arithmetic error.
+_JSON_PRECISION = 6
+
+# How far the recomputed weighted sum may sit from the emitted confidence before the
+# document is refused. Rounding to `_JSON_PRECISION` decimals moves each of the eleven
+# terms by at most 5e-(P+1), so this is roughly two orders of magnitude of headroom over
+# the worst case -- loose enough never to reject honest rounding, tight enough that no
+# real disagreement between the components and the total can slip through.
+_REPRODUCTION_TOLERANCE = 10 ** -(_JSON_PRECISION - 1)
+
+
+def _drift(owner: str, attribute: str, consequence: str) -> RuntimeError:
+    """
+    The error for "another layer renamed something this writer reads".
+
+    Raised rather than defaulted or skipped. A JSON document that quietly omits the
+    protection level, or that carries weights which do not reproduce its own confidence,
+    is worse than no document: it looks complete and is used as evidence.
+    """
+    return RuntimeError(
+        f"{owner} has no {attribute!r}, so {consequence} The JSON output would not be "
+        f"trustworthy, so it was not written. Use --format table or --format csv "
+        f"meanwhile, and report this: the CLI's JSON writer and {owner} have drifted."
+    )
+
+
+def _scoring_weights(matcher: object) -> dict[str, float]:
+    """
+    The weights that actually produced the confidences in this run.
+
+    Read off the LIVE matcher, not off `MatchingConfig()`, so a caller who tuned the
+    weights gets a file that reproduces THEIR numbers rather than the shipped ones.
+
+    A matcher that does not expose its config is not necessarily wrong; it just cannot
+    say. Rather than refuse outright, fall back to the shipped defaults and let
+    `_verify_reproducible` decide -- weights that reproduce every emitted confidence ARE
+    the weights that produced it, whichever object they came from, and weights that do not
+    are refused there. That keeps the document's guarantee resting on arithmetic anyone
+    can check instead of on a private attribute name holding still.
+    """
+    config = getattr(matcher, _MATCHER_CONFIG_ATTR, None)
+    if config is None:
+        # Imported here, not at module scope: this pulls in the whole matching stack, and
+        # `nexus-matcher --help` should not pay for it.
+        from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+
+        config = MatchingConfig()
+
+    weights: dict[str, float] = {}
+    for key, _score_attr, weight_attr in _SCORE_COMPONENTS:
+        value = getattr(config, weight_attr, None)
+        if value is None:
+            raise _drift(
+                type(config).__name__,
+                weight_attr,
+                f"the {key!r} weight cannot be emitted and the confidence cannot be "
+                f"reproduced from the file.",
+            )
+        weights[key] = round(float(value), _JSON_PRECISION)
+    return weights
+
+
+def _score_payload(breakdown: object) -> dict[str, float]:
+    """All five components, so the weighted sum in the same record can be recomputed."""
+    scores: dict[str, float] = {}
+    for key, score_attr, _weight_attr in _SCORE_COMPONENTS:
+        value = getattr(breakdown, score_attr, None)
+        if value is None:
+            raise _drift(
+                type(breakdown).__name__,
+                score_attr,
+                f"the {key!r} component cannot be emitted and the confidence cannot be "
+                f"reproduced from the file.",
+            )
+        scores[key] = round(float(value), _JSON_PRECISION)
+    return scores
+
+
+def _verify_reproducible(document: dict, weights: dict[str, float]) -> None:
+    """
+    Do the auditor's arithmetic before handing them the file.
+
+    The whole promise of this output is that `sum(scores[k] * weights[k])` comes back to
+    `confidence`. That promise is checked here, on the emitted numbers, so a document that
+    cannot keep it is never written -- a file that looks complete and does not add up is
+    worse than no file, because it is the one that gets used as evidence.
+
+    It closes a class of drift no name-matching can: a component paired with the wrong
+    weight, a sixth weighted signal this writer knows nothing about, or a matcher whose
+    weights could not be read and whose confidences the shipped defaults do not explain.
+    All three would otherwise produce a file that is self-consistently wrong.
+
+    Clamped exactly as `_weighted_confidence` clamps, so weights that sum above 1.0 are
+    not reported as a failure of arithmetic that never happened.
+    """
+    for field_path, records in document.items():
+        for record in records:
+            scores = record["scores"]
+            total = sum(scores[key] * weight for key, weight in weights.items())
+            recomputed = min(max(total, 0.0), 1.0)
+            emitted = record["confidence"]
+            if abs(recomputed - emitted) > _REPRODUCTION_TOLERANCE:
+                raise RuntimeError(
+                    f"the JSON output for {field_path!r} rank {record['rank']} would not "
+                    f"be reproducible from its own numbers: the emitted components and "
+                    f"weights give {recomputed!r}, the emitted confidence is {emitted!r}. "
+                    f"Refusing to write a governance file whose arithmetic does not "
+                    f"close. Use --format table or --format csv meanwhile, and report "
+                    f"this: the CLI's JSON writer and the matcher's scoring have drifted."
+                )
+
+
+def _entry_payload(entry: object) -> dict[str, str]:
+    """
+    The dictionary entry as a governance record rather than as four identity columns.
+
+    `protection_level` is the field the stated use case is built on. `definition` and
+    `domain` are the two a reviewer needs to judge whether a match is right at all -- the
+    business name alone does not distinguish "Customer Email Address" in the marketing
+    domain from the same name in billing.
+    """
+    return {
+        "id": entry.id,
+        "business_name": entry.business_name,
+        "logical_name": entry.logical_name,
+        "definition": entry.definition,
+        "data_type": entry.data_type.value,
+        "protection_level": entry.protection_level.value,
+        "domain": entry.domain,
+    }
+
+
+def _format_json(
+    results: dict,
+    top_k: int,
+    threshold: float,
+    weights: dict[str, float],
+) -> str:
+    """
+    Format results as JSON: one self-contained, verifiable record per match.
+
+    `weights` is repeated inside every record rather than hoisted into an envelope. An
+    envelope would have to wrap the field paths in a container key, and every script
+    written against the current top-level `{field_path: [...]}` shape would break; a
+    sibling key alongside them would collide the first time somebody's schema contains a
+    field genuinely called "weights". Repeating five numbers also means a single record
+    lifted out with `jq` into a ticket still proves its own confidence.
+
+    `sort_keys` gives every object a key order that does not depend on the order this
+    function happens to build its dicts in, and orders the field paths lexicographically
+    rather than by schema position -- so adding one field to a schema produces a one-hunk
+    diff instead of a reordered file. The dict literals here are deliberately left in
+    reading order, not alphabetical order, so that dropping `sort_keys` shows up.
+
+    `ensure_ascii` stays at its default True. It is what makes this surface safe on the
+    legacy Windows code pages NM-0001 was about: the document is pure ASCII, so an accented
+    business name survives as an escape rather than being mangled by the console's
+    `backslashreplace` error handler on the way to stdout. json.loads gives the original
+    string back either way.
+    """
     output = {}
 
     for field_path, matches in results.items():
         output[field_path] = [
             {
                 "rank": match.rank,
-                "dictionary_entry": {
-                    "id": match.dictionary_entry.id,
-                    "business_name": match.dictionary_entry.business_name,
-                    "logical_name": match.dictionary_entry.logical_name,
-                    "data_type": match.dictionary_entry.data_type.value,
-                },
-                "confidence": round(match.final_confidence, 4),
+                "dictionary_entry": _entry_payload(match.dictionary_entry),
+                "confidence": round(match.final_confidence, _JSON_PRECISION),
                 "decision": match.decision.value,
-                "scores": {
-                    "semantic": round(match.score_breakdown.semantic_score, 4),
-                    "lexical": round(match.score_breakdown.lexical_score, 4),
-                    "type": round(match.score_breakdown.type_compatibility_score, 4),
-                },
+                "scores": _score_payload(match.score_breakdown),
+                "weights": dict(weights),
             }
             for match in matches[:top_k]
             if match.final_confidence >= threshold
         ]
 
-    return json.dumps(output, indent=2)
+    _verify_reproducible(output, weights)
+
+    # Trailing newline: a file without one is a permanent "\ No newline at end of file"
+    # in every diff of a document whose whole point is diffing cleanly.
+    return json.dumps(output, indent=2, sort_keys=True) + "\n"
 
 
 def _format_csv(results: dict, top_k: int, threshold: float) -> str:

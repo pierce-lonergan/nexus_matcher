@@ -342,6 +342,11 @@ class MatchingSession:
         started_at: Session start timestamp
         completed_at: Session completion timestamp
         metadata: Session metadata
+        minimum_achievable_confidence: The structural floor of `final_confidence` for
+            the configuration that produced this session, or None when it is unknown
+            (a reranker was wired, or the session was not built by `NexusMatcher`).
+            Supplied by `NexusMatcher.match_schema_session`; see
+            `MatchingConfig.minimum_achievable_confidence` for the derivation.
     """
 
     session_id: EntityId
@@ -349,6 +354,11 @@ class MatchingSession:
     results: dict[str, tuple[MatchResult, ...]]
     total_duration_ms: float
     metadata: Metadata = field(default_factory=Metadata)
+    # A float rather than the MatchingConfig it comes from: this is a DOMAIN object and
+    # must not import from the application layer. Defaults to None so a session built by
+    # hand -- every existing caller and test -- keeps working, at the cost of losing the
+    # threshold check below, which is the honest trade: the floor genuinely is unknown.
+    minimum_achievable_confidence: float | None = None
 
     @property
     def field_count(self) -> int:
@@ -375,10 +385,59 @@ class MatchingSession:
         """Get top match for each field."""
         return {path: matches[0] for path, matches in self.results.items() if matches}
 
-    def get_low_confidence_fields(self, threshold: float = 0.6) -> list[str]:
-        """Get fields with low confidence top matches."""
-        return [
-            path
-            for path, matches in self.results.items()
-            if matches and matches[0].final_confidence < threshold
-        ]
+    def get_low_confidence_fields(self, threshold: float | None = None) -> list[str]:
+        """
+        The fields a human still has to look at. Returns their result keys, in schema
+        order.
+
+        THE DEFAULT USED TO BE 0.6 AND SELECTED NOTHING, EVER (DX-001, museum NM-0027).
+        `final_confidence` has a structural floor of about **0.63** in the shipped
+        configuration -- `semantic_weight` 0.70 times `fusion_alpha` 0.90, because the
+        fused retrieval score is min-max normalised per field and the rank-1 candidate
+        therefore always lands at or above `fusion_alpha`. No top match could fall below
+        0.6, so the one API whose name answers "which of these should I not trust?"
+        answered "none of them" on every schema, including schemas where nothing was
+        trustworthy. Measured on a 6-field schema: default 0 flagged, 0.87 -> 6 flagged,
+        actual confidences 0.730-0.755. That is a silent governance failure, the same
+        class as NM-0005. This session's exact floor is
+        `minimum_achievable_confidence`, and it is None when a reranker was in play.
+
+        `threshold=None` (the default) means **"was not auto-approved"**: the field is
+        returned unless its top match carries `MatchDecision.AUTO_APPROVE`. That is the
+        one definition of "low confidence" that cannot silently drift away from the
+        configuration, because it reads the decision the matcher already made using the
+        calibrated `auto_approve_threshold` AND `min_confidence_gap` -- so a confident
+        but ambiguous near-tie, which the numeric comparison would clear, is correctly
+        still flagged. A session has no access to the config, so no numeric default
+        could track it.
+
+        Pass a float to ask a different question ("show me everything under 0.8"). A
+        threshold at or below `minimum_achievable_confidence` is REFUSED with a
+        ValueError naming the floor, rather than returning [] -- an empty list reads as
+        "nothing to review", which is exactly the lie this method used to tell.
+
+        A field with NO matches at all is always included. Nothing matched it, which is
+        the least trustworthy outcome there is; it used to be skipped, because
+        `matches[0]` needs a match to exist and the guard dropped the field instead of
+        flagging it.
+        """
+        floor = self.minimum_achievable_confidence
+        if threshold is not None and floor is not None and threshold <= floor:
+            raise ValueError(
+                f"threshold={threshold!r} is at or below this configuration's structural "
+                f"floor of {floor:.4f}, so no top match can fall below it and this call "
+                f"could only ever return an empty list -- which reads as 'nothing to "
+                f"review'. Use get_low_confidence_fields() with no argument to flag every "
+                f"field that was not auto-approved, or pass a threshold above {floor:.4f}."
+            )
+
+        flagged: list[str] = []
+        for path, matches in self.results.items():
+            if not matches:
+                flagged.append(path)
+            elif threshold is None:
+                if not matches[0].is_auto_approved:
+                    flagged.append(path)
+            elif matches[0].final_confidence < threshold:
+                flagged.append(path)
+        return flagged

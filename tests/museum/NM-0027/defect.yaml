@@ -1,0 +1,8 @@
+id: NM-0027
+symptom: "get_low_confidence_fields defaulted to 0.6, below the 0.63 structural floor of final_confidence, so the one API that answers 'what should I not trust?' returned an empty list on every schema ever matched"
+severity: CRITICAL
+fixed_in: unreleased
+gate_that_should_have_caught_it: "none -- no test called the method at all, and the floor it sits below was folklore: nothing in the codebase computed it, so nothing could contradict the number"
+gate_that_catches_it_now: "tests/museum/NM-0027/test_nm_0027.py, plus tests/unit/domain/test_low_confidence_fields.py and tests/unit/application/test_confidence_floor.py"
+touches:
+  - src/nexus_matcher/domain/models/entities.py

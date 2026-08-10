@@ -12,7 +12,86 @@ that it came from. Numbers without an artifact are not stated.
 
 ## [Unreleased]
 
+### Changed — BREAKING
+
+- **`ScoreBreakdown.semantic_score` is renamed to `fused_retrieval_score`.** It never was
+  a semantic similarity. It is the min-max-normalised *fused retrieval* score, rescaled
+  over the candidates retrieved for one field, so it is rank-relative: the rank-1
+  candidate lands at or just above `fusion_alpha` for essentially every field, which is
+  why the recurring value was 0.9 — **0.9 is `fusion_alpha`**. Move `fusion_alpha` to 0.5
+  and the rank-1 floor moves to ~0.45; a cosine would not move at all. Telling an auditor
+  "semantic score 0.9" claimed 90% similarity and delivered "ranked first among N
+  candidates". `semantic_score` still works for both reading and construction and emits a
+  `DeprecationWarning`; **it is removed in 3.0.**
+- **`MatchingSession.get_low_confidence_fields(threshold=...)` now defaults to `None`**,
+  meaning "was not auto-approved", and **raises `ValueError` for a threshold at or below
+  the structural floor** instead of returning an empty list. Callers relying on the old
+  `0.6` default were receiving `[]` unconditionally — see NM-0027.
+- **`nexus-matcher match -f json` changes shape.** The `dictionary_entry` object gains
+  `protection_level`, `definition` and `domain`; `scores` gains `edit_distance` and
+  `domain`, and its `semantic` key is renamed **`fused_retrieval`** to match the domain
+  model above — a key named "semantic" carrying a rank-relative number is the same claim
+  the rename exists to stop making. Each match record also gains a `weights` object.
+  Object keys are now emitted in sorted order, so the field paths are listed
+  alphabetically rather than in schema order, and the document ends with a newline.
+  Finally, when `-f json` or `-f csv` is used **without** `--output`, progress and the
+  summary line move to **stderr**, because stdout is carrying the payload — see NM-0026.
+  A script reading `["scores"]["semantic"]`, or relying on schema ordering, needs updating.
+
+### Added
+
+- **`ScoreBreakdown.absolute_cosine`** — the raw, un-normalised dense-retrieval score for
+  the candidate. Under the shipped wiring this is the actual cosine similarity, and it is
+  the only score in the breakdown that is comparable *across* fields. It was computed on
+  every match and discarded, so "how similar were they really?" had no answer anywhere in
+  the API.
+- **`MatchingConfig.minimum_achievable_confidence`** and
+  **`NexusMatcher.minimum_achievable_confidence`** — the structural floor of
+  `final_confidence`, `semantic_weight * fusion_alpha` (**0.63** as shipped), or `None`
+  when a reranker makes the bound unsound. `MatchingSession` carries the value that
+  produced it. The floor was folklore; nothing computed it, so no threshold could be
+  checked against it.
+
 ### Fixed
+
+- **NM-0027 — the review queue was empty because the bar was under the floor.**
+  `MatchingSession.get_low_confidence_fields()` defaulted to a threshold of `0.6`, and
+  `final_confidence` has a structural floor of **0.63** (`semantic_weight` 0.70 ×
+  `fusion_alpha` 0.90, because the fused retrieval score is min-max normalised per field
+  so the rank-1 candidate always lands at or above `fusion_alpha`). The one API whose name
+  answers "which of these should I not trust?" therefore returned an empty list on every
+  schema ever matched. Measured on a 6-field schema: default → 0 flagged, 0.87 → 6
+  flagged, actual top-1 confidences 0.730–0.755, six of six below the auto-approve bar. A
+  governance lead was told there was nothing to review on a schema where nothing was
+  trustworthy — the same class as NM-0005. The default is now "was not auto-approved",
+  which also catches the confident-but-ambiguous near-tie a numeric threshold clears; a
+  field that matched *nothing* is now flagged instead of skipped; and the floor is
+  exposed so the next threshold can be checked against a number.
+
+- **NM-0025 — the documented machine-readable output dropped the governance payload.**
+  `nexus-matcher match -f json` emitted the dictionary entry as
+  `{id, business_name, logical_name, data_type}`. No `protection_level`. The stated use
+  case of this library is that a matched field inherits that entry's classification, and
+  the one field that use case rests on was absent from the only interface a script can
+  consume. The `scores` block carried three of the five components and no weights, so the
+  emitted numbers could not reproduce the emitted confidence and an auditor could not check
+  the arithmetic from the file. A fresh-eyes agent given a real governance task abandoned
+  the CLI and rebuilt on the Python API (DX-002). The payload now carries the
+  classification, the definition and the domain, all five components, and the weights that
+  produced the total; the writer recomputes the weighted sum before emitting and **refuses
+  to write a document whose own numbers do not close**. It escaped because the CLI tests
+  stubbed the dictionary entry with exactly the four attributes the writer read — a stub
+  shaped like the defect cannot see it — so those doubles are real domain objects now.
+
+- **NM-0026 — the machine-readable output was not machine-readable when redirected.**
+  `match … -f json > results.json` wrote a spinner frame before the document and the
+  summary line after it, because Rich's `Progress` and `rich.print` both default to stdout
+  and nothing in the command had ever said otherwise. The most obvious way anyone would
+  script this CLI produced a file `json.loads` rejects on its first character. Status moves
+  to stderr whenever stdout is carrying a payload, and stays exactly where it was for the
+  human `table` format and for `--output`. It escaped because every CLI test asserted that
+  a substring *appeared* in the output and none had ever parsed it — `"Summary" in output`
+  passes just as happily when the summary is sitting inside a JSON document.
 
 - **NM-0024 — a vector went stale while `sync` reported the row unchanged.** `content_hash`
   hashed a hand-written list of three fields, but `DictionaryEntry.to_searchable_text()`

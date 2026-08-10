@@ -26,12 +26,18 @@ RESOLVE_BODY = (
     '    return requested if requested is not None else "table"\n'
 )
 
-# The table branch's write-through, indentation and all. `[^\n]*` over the rendering call
-# keeps this matching if the renderer's arguments change.
-TABLE_WRITE_RE = re.compile(
-    r"\n[ \t]*if output:\n[ \t]*_write_output\(output, _render_table_text\([^\n]*\)\n",
-    re.M,
-)
+# The table branch's write-through: the CALL ITSELF, and nothing around it.
+#
+# This used to also require `if output:` on the immediately preceding line. Someone added
+# an explanatory comment between the two, the anchor stopped matching, and the entry
+# reported itself as a hole -- while the docstring above claimed it was anchored on the
+# call rather than on surrounding prose. Now that claim is true.
+#
+# Replacing the write with a console print reproduces the defect exactly -- a `-o` path
+# that renders to the terminal and produces no file -- and leaves valid syntax, which
+# deleting the line would not.
+TABLE_WRITE_RE = re.compile(r"_write_output\(output, _render_table_text\([^\n]*\)\)")
+TABLE_WRITE_BROKEN = "console.print(table)  # NM-0003 replay: writes nothing"
 
 
 def apply(repo_root: pathlib.Path) -> None:
@@ -43,7 +49,7 @@ def apply(repo_root: pathlib.Path) -> None:
         raise LookupError(f"NM-0003 replay: _resolve_format signature not found in {TARGET}")
     text = text[: match.end()] + RESOLVE_BODY + text[match.end() :]
 
-    text, removed = TABLE_WRITE_RE.subn("\n", text, count=1)
+    text, removed = TABLE_WRITE_RE.subn(TABLE_WRITE_BROKEN, text, count=1)
     if removed != 1:
         raise LookupError(
             f"NM-0003 replay: the table branch no longer writes to --output in {TARGET}; "
