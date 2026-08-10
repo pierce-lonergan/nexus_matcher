@@ -41,15 +41,15 @@ SCALE = "entries=1000,fields=300"
 # =============================================================================
 
 
-def _quality():
+def _quality(n_correct: int = 20):
     n = 40
-    correct = [1] * 20 + [0] * 20
+    correct = [1] * n_correct + [0] * (n - n_correct)
     return ledger.QualityMetrics(
         benchmark="combined",
         corpus="real",
         n_queries=n,
         n_entries=4598,
-        p_at_1=0.5,
+        p_at_1=n_correct / n,
         r_at_5=1.0,
         r_at_10=1.0,
         mrr_at_10=0.75,
@@ -98,7 +98,14 @@ def _band():
     return b
 
 
-def _record(label: str, fields_per_sec: float, *, sweep=None):
+def _record(
+    label: str,
+    fields_per_sec: float,
+    *,
+    sweep=None,
+    notes: list[str] | None = None,
+    n_correct: int = 20,
+):
     return ledger.Measurement(
         record_id=label[:12].replace(" ", "-"),
         label=label,
@@ -106,17 +113,23 @@ def _record(label: str, fields_per_sec: float, *, sweep=None):
         benchmark="combined",
         corpus="real",
         provenance={"git_sha": "abc1234", "git_dirty": False, "seed": 1},
-        quality=_quality(),
+        quality=_quality(n_correct),
         cost=_cost(fields_per_sec),
         noise=_band(),
+        notes=list(notes or []),
         thread_sweep=sweep,
     )
 
 
-def _verdict(candidate_label: str, *, sweep=None) -> str:
+def _compare(candidate_label: str, *, sweep=None, notes=None, n_correct: int = 20):
+    """Baseline vs a candidate that is 2x faster, through the real `compare()`."""
     base = _record("baseline", 200.0)
-    cand = _record(candidate_label, 400.0, sweep=sweep)
-    return ledger.compare(base, cand, target="match_fields_per_sec").verdict
+    cand = _record(candidate_label, 400.0, sweep=sweep, notes=notes, n_correct=n_correct)
+    return ledger.compare(base, cand, target="match_fields_per_sec")
+
+
+def _verdict(candidate_label: str, *, sweep=None, notes=None) -> str:
+    return _compare(candidate_label, sweep=sweep, notes=notes).verdict
 
 
 def _sweep(verdict_shape: str):
@@ -194,6 +207,47 @@ def test_a_sweep_whose_env_never_arrived_is_an_error_not_a_pass():
     """The silent version of this failure: the child ignored the setting and nobody looked."""
     with pytest.raises(RuntimeError, match="did not reach the child"):
         ledger._assert_threads_took_effect({"thread_env": {"OMP_NUM_THREADS": "24"}}, 1)
+
+
+def test_a_child_that_died_is_an_error_even_though_it_printed_a_result_first():
+    """
+    A dead child is not data, and this is the shape in which that mistake is invisible.
+
+    The probe prints its JSON and only THEN falls over -- MemoryError at 30k entries, a
+    BLAS abort under a pinned thread count, a segfault in a native wheel. stdout still
+    parses, so a runner that reads the last line without checking the exit status returns
+    a perfectly well-formed observation from a run that did not finish, and that number
+    goes into a ThreadSweep and decides a WIN.
+
+    Exit status is the only thing that distinguishes the two cases, because the JSON
+    cannot.
+    """
+    code = (
+        "import json, sys\n"
+        "print(json.dumps({'values': [999.0], 'best': 999.0, 'median': 999.0,"
+        " 'thread_env': {}}))\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('MemoryError: could not allocate the 30k score matrix\\n')\n"
+        "raise SystemExit(3)\n"
+    )
+    with pytest.raises(RuntimeError) as exc:
+        ledger.run_under_threads(code, threads=1)
+
+    message = str(exc.value)
+    assert "exited 3" in message, message
+    assert "MemoryError" in message, (
+        f"the failure was raised but the child's stderr was dropped, so nobody can tell "
+        f"WHY the measurement died:\n{message}"
+    )
+
+
+def test_a_child_that_succeeds_still_returns_its_json():
+    """
+    The opposite failure. A guard that rejects every child is a sweep nobody can run, and
+    the fix for that is to delete the guard -- so the success path is pinned here too.
+    """
+    code = "import json; print(json.dumps({'best': 12.5}))"
+    assert ledger.run_under_threads(code, threads=1)["best"] == 12.5
 
 
 # =============================================================================
@@ -306,6 +360,33 @@ def test_a_threading_change_cannot_be_a_win_without_a_sweep():
     )
 
 
+def test_a_mechanism_named_only_in_the_NOTES_still_arms_the_check():
+    """
+    Labels are short and notes are where the mechanism actually gets written down.
+
+    "faster field matching" is a truthful label with no thread-sensitive word in it; the
+    BLAS switch is disclosed one field over, in the notes, which is exactly where an
+    honest author puts it. If the trigger reads only the label, that honest disclosure
+    buys nothing and the change is accepted from a single measurement -- and the label is
+    then the only thing anyone has to keep vague to skip the sweep entirely.
+    """
+    control = _verdict("faster field matching")
+    assert control == "WIN", (
+        f"the control case was judged {control!r}, so this test would pass on a ledger "
+        f"that never awards a WIN at all and proves nothing."
+    )
+
+    disclosed = _verdict(
+        "faster field matching",
+        notes=["scores the dense stage with a single BLAS matmul instead of a python loop"],
+    )
+    assert disclosed == "INCONCLUSIVE", (
+        f"a change that named its BLAS mechanism in its notes was judged {disclosed!r} "
+        f"with no thread sweep attached. H-003 is read from the change's own description "
+        f"of itself, and the notes are part of that description."
+    )
+
+
 def test_a_thread_dependent_sweep_does_not_rescue_the_win():
     """Attaching a sweep is not the requirement. PASSING it is."""
     verdict = _verdict("small-corpus fallback in search_batch", sweep=_sweep("one-only"))
@@ -318,6 +399,61 @@ def test_the_same_change_wins_once_the_sweep_shows_it_everywhere():
         f"a threading change that demonstrated its win at 1 thread AND at the library "
         f"default was still judged {verdict!r}. The rule has become unpassable, which "
         f"means it will be deleted."
+    )
+
+
+# =============================================================================
+# 3b. THE RULE RUNS ONE WAY ONLY -- into a win, never out of a loss
+# =============================================================================
+
+
+def test_a_regression_is_confirmed_regressed_before_the_thread_rule_can_touch_it():
+    """
+    The control for the two tests below. Same fixture, minus any thread-sensitive wording:
+    a 10-point P@1 drop trips a guard and the 2x speedup does not buy it back.
+    """
+    result = _compare("prune duplicate tokenisation", n_correct=16)
+    assert result.verdict == "REGRESSION", result.render()
+
+
+def test_a_failing_thread_sweep_cannot_buy_a_regression_out_of_its_loss():
+    """
+    The second half of the asymmetry, which is the half that was never tested.
+
+    "Only WIN is touched" has two consequences and they are not the same claim. That a
+    failing sweep blocks a WIN is checked above. That it cannot RESCUE a loss is checked
+    here, and it is the one an optimizer has an incentive to break: a candidate that
+    dropped 10 points of P@1 attaches a sweep that came back THREAD-DEPENDENT, and if the
+    rule rewrote every verdict rather than only WIN, that REGRESSION would be relabelled
+    INCONCLUSIVE -- "needs more investigation" instead of "this lost accuracy". Failing
+    evidence would have become a defence, and the accuracy loss would ship as an open
+    question.
+    """
+    result = _compare(
+        "small-corpus fallback in search_batch",
+        sweep=_sweep("one-only"),
+        n_correct=16,
+    )
+    assert result.verdict == "REGRESSION", (
+        f"a REGRESSION was rewritten to {result.verdict!r} by a thread sweep that FAILED. "
+        f"You must buy your way INTO a win; there is no buying your way out of a loss, "
+        f"least of all with evidence that did not pass.\n{result.render()}"
+    )
+
+
+def test_a_regression_with_no_sweep_at_all_is_still_a_regression_and_still_says_so():
+    """
+    The same asymmetry on the other branch: missing evidence, not failing evidence.
+
+    The H-003 concern is still reported -- as a warning, where it belongs -- because a
+    non-WIN verdict is not a reason to stop telling the reader the mechanism was never
+    swept. Silence here would let the rule be "fixed" by returning early on any non-WIN,
+    which passes the verdict assertion while quietly dropping the finding.
+    """
+    result = _compare("small-corpus fallback in search_batch", n_correct=16)
+    assert result.verdict == "REGRESSION", result.render()
+    assert any("No thread sweep is attached" in w for w in result.warnings), (
+        f"the missing sweep was not reported on a non-WIN verdict: {result.warnings}"
     )
 
 

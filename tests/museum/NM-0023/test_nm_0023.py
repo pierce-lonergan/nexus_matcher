@@ -73,3 +73,48 @@ def test_every_test_directory_is_executed_by_ci():
         f"these test directories are never executed by CI: {', '.join(unrun)}. "
         f"A test suite nothing runs is worth exactly nothing."
     )
+
+
+def test_every_gate_runner_is_invoked_by_something():
+    """
+    The sixth occurrence of this defect class, and the reason it earned its own check.
+
+    A gate can be unwired in more ways than a test directory. noxfile.py grew a `mutation`
+    session -- the highest-severity hole in docs/DEFENSIBILITY.md, the only mechanical way
+    to find tests invariant to the bug they claim to cover -- and `nox` appeared in no
+    workflow and no Makefile. It was written, configured, ratcheted, documented, and run by
+    nobody.
+
+    Same shape as tests/regression, tests/museum, tests/properties and tests/packaging
+    before it: real, passing, and invisible. Coverage of a subset reads exactly like
+    coverage of the whole in a green check mark.
+    """
+    noxfile = REPO / "noxfile.py"
+    if not noxfile.exists():
+        return
+
+    # Public sessions only. A leading underscore marks an internal helper that nox does
+    # not expose and nothing is expected to invoke by name.
+    sessions = {
+        name
+        for name in re.findall(
+            r"^def ([a-z_][a-z0-9_]*)\(session", noxfile.read_text(encoding="utf-8"), re.M
+        )
+        if not name.startswith("_")
+    }
+    if not sessions:
+        return
+
+    invoked = ""
+    for path in (REPO / ".github" / "workflows").glob("*.y*ml"):
+        invoked += path.read_text(encoding="utf-8")
+    makefile = REPO / "Makefile"
+    if makefile.exists():
+        invoked += makefile.read_text(encoding="utf-8")
+
+    unrun = sorted(s for s in sessions if f"nox -s {s}" not in invoked and f"-s {s}" not in invoked)
+    assert not unrun, (
+        f"these nox sessions are invoked by no workflow and no Makefile: {', '.join(unrun)}. "
+        f"A gate nothing runs is worth exactly nothing -- this is the sixth time in this "
+        f"repository."
+    )

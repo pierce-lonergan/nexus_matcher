@@ -56,6 +56,8 @@ from hypothesis import strategies as st
 
 from nexus_matcher.application.use_cases.match_schema import _tokenize_identifier
 from nexus_matcher.domain.models.entities import DictionaryEntry
+from nexus_matcher.domain.ports.vector_store import SearchResult
+from nexus_matcher.shared.types.base import DataType
 from tests.properties._support import (
     PROPERTY_SETTINGS,
     build_matcher,
@@ -416,6 +418,32 @@ class TestIrrelevantAddition:
             )
 
             fused_before = base._fuse_results(dense_before, {})
+
+            # NON-VACUITY, and it was missing. Everything below compares one fused list
+            # against another fused list, so it is satisfied by ANY function of the dense
+            # list that preserves order -- including `return [(r.id, r.score) for r in
+            # dense]`, which is fusion deleted outright. VERIFIED: this test stayed green
+            # under exactly that one-line replacement before this assertion landed, while
+            # its docstring claimed to cover fused ordering.
+            #
+            # With the lexical arm empty, min-max maps the best cosine to 1.0 and the worst
+            # to 0.0, so the fused endpoints are `fusion_alpha` and exactly 0.0 -- values a
+            # pass-through cannot produce, because they no longer depend on the cosines.
+            # Guarded on two distinct cosines: a constant arm normalizes to all-zeros by
+            # design, and that case is pinned in TestFusionActuallyFuses instead.
+            if len({r.score for r in dense_before}) > 1:
+                alpha = base._config.fusion_alpha
+                assert abs(fused_before[0][1] - alpha) <= FLOAT32_REASSOCIATION, (
+                    f"the top fused score is {fused_before[0][1]!r}, not the "
+                    f"{alpha!r} min-max normalization guarantees -- the candidate list "
+                    f"reaching confidence scoring was never fused"
+                )
+                assert fused_before[-1][1] == 0.0, (
+                    f"the last fused score is {fused_before[-1][1]!r}, not 0.0 -- the "
+                    f"worst candidate did not normalize to the floor, so these scores are "
+                    f"raw cosines wearing a fused list's shape"
+                )
+
             fused_after = [
                 (i, s) for i, s in after._fuse_results(dense_after, {}) if i in original_ids
             ]
@@ -424,6 +452,118 @@ class TestIrrelevantAddition:
                 [s for _, s in fused_before],
                 [i for i, _ in fused_after],
                 "an irrelevant entry re-ordered the fused candidate list",
+            )
+
+
+def _tiny_matcher():
+    """A matcher built only so `_fuse_results` can be called; its glossary is irrelevant."""
+    return build_matcher(
+        [
+            DictionaryEntry(
+                id="d0",
+                business_name="Customer Email",
+                logical_name="cust_email",
+                definition="",
+                data_type=DataType.STRING,
+            ),
+            DictionaryEntry(
+                id="d1",
+                business_name="Account Balance",
+                logical_name="acct_bal",
+                definition="",
+                data_type=DataType.DOUBLE,
+            ),
+        ]
+    )
+
+
+class TestFusionActuallyFuses:
+    """
+    An ABSOLUTE pin on `_fuse_results`, because no metamorphic relation can supply one.
+
+    A relation compares two runs, so every relation in this file is satisfied by any
+    implementation that is a consistent function of its input. Fusion deleted -- `return
+    [(r.id, r.score) for r in dense]` -- is exactly that, and it survived the whole file.
+    The fix is not a better relation; a relation structurally cannot catch it. It is a
+    hand-computed expected value, which is what H-004 prescribes.
+
+    The arithmetic, from `core.fusion`: min-max normalize each arm over its own candidates,
+    weight the dense arm by `fusion_alpha` and the lexical arm by the remainder, then sort
+    descending. `alpha` is read from config rather than written as 0.9 because it is a
+    TUNED retrieval parameter -- re-sweeping it is a legitimate change and must not redden
+    a test about fusion's shape.
+    """
+
+    def test_it_sorts_by_the_fused_score_instead_of_passing_dense_order_through(self):
+        """
+        Dense input handed over deliberately OUT of score order.
+
+        In production the store returns candidates already sorted, so a pass-through and a
+        real fusion are indistinguishable from their ordering alone -- which is precisely
+        why every relation missed this. Feeding an unsorted list separates them: sorting is
+        `fuse_linear_ids`'s documented job, not an accident of its caller.
+        """
+        matcher = _tiny_matcher()
+        alpha = matcher._config.fusion_alpha
+        dense = [
+            SearchResult(id="low", score=0.4),
+            SearchResult(id="high", score=0.8),
+            SearchResult(id="mid", score=0.6),
+        ]
+
+        fused = matcher._fuse_results(dense, {})
+
+        assert [i for i, _ in fused] == ["high", "mid", "low"], (
+            f"fused order is {[i for i, _ in fused]!r}: the candidate list was returned in "
+            f"the order it arrived, so nothing fused it and the confidence scoring below "
+            f"is reading raw retrieval scores"
+        )
+        # min 0.4, max 0.8, span 0.4 -> normalized 1.0, 0.5, 0.0 -> weighted by alpha.
+        for (entry_id, score), expected in zip(fused, (alpha, alpha * 0.5, 0.0), strict=True):
+            assert abs(score - expected) <= FLOAT32_REASSOCIATION, (
+                f"fused score for {entry_id!r} is {score!r}, not the {expected!r} that "
+                f"min-max normalization at alpha={alpha!r} gives"
+            )
+
+    def test_a_candidate_only_the_lexical_arm_found_still_reaches_the_list(self):
+        """
+        The sparse arm is CONSULTED, not decorative.
+
+        `_fuse_results` receiving a sparse map and dropping it costs the 0.542-P@1 lexical
+        arm outright, and silently: dense-only answers still look like answers. A
+        lexical-only candidate is the one observation that cannot be produced without
+        reading the sparse map at all.
+        """
+        matcher = _tiny_matcher()
+        alpha = matcher._config.fusion_alpha
+        dense = [SearchResult(id="high", score=0.8), SearchResult(id="low", score=0.4)]
+
+        fused = matcher._fuse_results(dense, {"lexical_only": 10.0, "low": 5.0})
+
+        # Lexical min-max: low -> 0.0, lexical_only -> 1.0. So high = alpha, low = 0.0,
+        # lexical_only = 1 - alpha, which orders it above `low` and below `high`.
+        assert [i for i, _ in fused] == ["high", "lexical_only", "low"], (
+            f"fused order is {[i for i, _ in fused]!r}: a candidate the lexical arm found "
+            f"was dropped or misplaced, so the sparse retriever's contribution is lost"
+        )
+        assert abs(dict(fused)["lexical_only"] - (1.0 - alpha)) <= FLOAT32_REASSOCIATION
+
+    def test_equal_scores_are_emitted_in_dense_retrieval_order(self):
+        """
+        The tie-break `fuse_linear_ids` documents, pinned in both directions.
+
+        H-005 was ranking that moved with `PYTHONHASHSEED`, and the fix was to walk the
+        dense list in rank order rather than a set. Asserting BOTH input orders is what
+        makes this a statement about the tie-break rather than about one lucky arrangement.
+        """
+        matcher = _tiny_matcher()
+        for order in (("a", "b", "c"), ("c", "b", "a")):
+            dense = [SearchResult(id=i, score=0.5) for i in order]
+            fused = matcher._fuse_results(dense, {})
+            assert [i for i, _ in fused] == list(order), (
+                f"tied candidates came back as {[i for i, _ in fused]!r} from dense order "
+                f"{list(order)!r} -- a tie is being settled by something other than dense "
+                f"rank, which is where H-005's hash-seed dependence lived"
             )
 
 

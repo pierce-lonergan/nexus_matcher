@@ -265,10 +265,25 @@ def test_the_scripts_exit_code_actually_goes_to_1_on_a_drifted_tree(tmp_path: Pa
 # VERSION COHERENCE -- the tree, the wheel, the changelog, the museum
 # =============================================================================
 
+
+def _declared_backend() -> str:
+    """
+    The build backend from `[build-system]`, read rather than hardcoded.
+
+    Hardcoding `hatchling.build` here would mean that switching backends leaves these tests
+    interrogating a backend the project no longer builds with -- still green, and describing
+    an artifact nobody ships.
+    """
+    text = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    match = re.search(r'^\s*build-backend\s*=\s*"([^"]+)"', text, re.M)
+    assert match, "pyproject.toml declares no [build-system].build-backend"
+    return match.group(1)
+
+
 _ASK_THE_BACKEND = r"""
-import json, tempfile, pathlib
+import importlib, json, tempfile, pathlib
 from email.parser import Parser
-import hatchling.build as backend
+backend = importlib.import_module("__BACKEND__")  # substituted from [build-system]
 directory = tempfile.mkdtemp()
 dist_info = backend.prepare_metadata_for_build_wheel(directory)
 text = (pathlib.Path(directory) / dist_info / "METADATA").read_text(encoding="utf-8")
@@ -289,14 +304,35 @@ def _wheel_metadata() -> dict:
     Asked of the real backend named in [build-system], so this cannot agree with a
     hand-written model of hatchling's behaviour -- there is no second implementation for
     it to be wrong alongside.
+
+    A missing backend is a FAILURE, not a skip. It was `pytest.importorskip("hatchling")`,
+    which deleted the three version-coherence tests below -- the only checks in the repo
+    that look at the artifact a user installs rather than at the source it is built from --
+    on any machine without the backend importable, silently and with the count still
+    reading twenty. There is no honest substitute: every fallback is either a second
+    implementation of hatchling's metadata rules or a restatement of the derivation tests
+    above, and both are new gates that cannot fail. So the absence is reported, with the
+    one command that fixes it.
+
+    NOTE, and it is the whole reason this was invisible: PEP 517 build isolation installs
+    the backend into a throwaway environment, so `pip install -e ".[full,dev]"` -- what CI
+    runs on all four matrix legs -- does NOT leave hatchling importable in the environment
+    the tests then run in. These three assertions have therefore been skipping on CI while
+    passing on developer machines that happen to have hatch installed. Making that visible
+    is the point; the remedy is one `pip install hatchling` in the packaging job.
     """
-    pytest.importorskip(
-        "hatchling",
-        reason="the build backend from [build-system].requires; without it there is no "
-        "wheel metadata to compare against",
-    )
+    backend = _declared_backend()
+    module = backend.partition(":")[0].partition(".")[0]
+    if importlib.util.find_spec(module) is None:
+        pytest.fail(
+            f"the build backend '{module}', declared in [build-system] and required to "
+            f"build this package at all, is not importable, so nothing here can compare "
+            f"the tree against the metadata a wheel would carry. Deliberately a failure "
+            f"rather than a skip: the version-drift defect these tests exist for (H-006) "
+            f"is invisible without them. Fix: pip install '{module}'"
+        )
     proc = subprocess.run(
-        [sys.executable, "-c", _ASK_THE_BACKEND],
+        [sys.executable, "-c", _ASK_THE_BACKEND.replace("__BACKEND__", backend)],
         cwd=REPO,
         capture_output=True,
         text=True,

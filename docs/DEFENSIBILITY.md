@@ -64,17 +64,17 @@ That result is the system working. A first pass writes gates; only a second, adv
 pass discovers which of them are decoration. Recording the gap is the point — an unlisted
 hole is indistinguishable from a closed one.
 
-### Toothless spots found, and still open
+### Toothless spots found — third round
 
 | Where | What cannot fail | Severity |
 |---|---|---|
-| `tests/properties/` — the `content_hash` oracle | Widening `content_hash` to cover `protection_level`, so every governance edit forces a re-embed, **survives the entire suite**. Both sides of the oracle use the same hash, so it is invisible — **this is H-004 recurring inside the code written to prevent H-004** | **HIGH** |
-| `tests/properties/test_sync_state_machine.py` | Cannot detect `sync` ceasing to be incremental: replacing it with a full re-embed of every row survives | **HIGH** |
-| `benchmarks/optimization_ledger.py` | Six spots: the WIN-only thread asymmetry, the `mechanism_needs_thread_sweep` trigger reading only the label, the `CorpusIdentity` benchmark-name branch, the `corpus_digest` entry-id contribution, the `--shape` CLI exit code, and the `run_under_threads` non-zero-exit guard — each deletable with all 74 tests still green | MEDIUM |
-| `setup.cfg` mutation ratchets | `score_floor` and `survivors_documented` are **not pinned to a scope**, so shrinking `paths_to_mutate` satisfies both. A ratchet you can satisfy by measuring less is not a ratchet | MEDIUM |
-| `noxfile.py` stall detector | Fires on healthy runs and truncates them silently; `_undecided_count()` cannot distinguish an incomplete run from a finished one | MEDIUM |
-| `tests/museum/NM-0009` | `test_the_message_says_the_schema_produced_no_fields` passes under a broken implementation of the property it advertises | LOW |
-| `tests/museum/NM-0001` | `test_the_chosen_code_pages_really_reject_the_glyphs` asserts stdlib codec facts; no change to this package can turn it red. It is a premise guard, not a gate, and should say so | LOW |
+| ~~`tests/properties/` — the `content_hash` oracle~~ | **CLOSED.** Now pins the documented contract absolutely — a governance-only edit must encode zero texts — instead of deriving its expectation from the hash it is testing. Proven: the mutation that survived now goes red | ~~HIGH~~ |
+| ~~`test_sync_state_machine.py`~~ | **CLOSED.** A full re-embed produces an identical final state, so no state comparison could see it. The machine now counts WORK DONE — the multiset of texts actually encoded — and asserts `report.embedded` matches | ~~HIGH~~ |
+| ~~`benchmarks/optimization_ledger.py`~~ | **CLOSED, 7/7 reproduced.** Two narrower spots remain: the WARNING (not the verdict) on the thread-rule path, and two message-text assertions in the cross-benchmark refusal | MEDIUM |
+| ~~`setup.cfg` mutation ratchets~~ | **CLOSED.** Scope is now pinned alongside the score. One narrower hole remains: a three-way consistent shrink (paths + group paths + scope pin together) still satisfies it | MEDIUM |
+| ~~`noxfile.py` stall detector~~ | **CLOSED.** A truncated run is now reported as TRUNCATED rather than scored | MEDIUM |
+| ~~`tests/museum/NM-0009`~~ | **CLOSED.** Assertion now checks what the docstring promised | ~~LOW~~ |
+| ~~`tests/museum/NM-0001`~~ | **CLOSED.** Renamed and documented as a premise guard, not a gate | ~~LOW~~ |
 
 ### Vacuous-pass risks found
 
@@ -99,6 +99,50 @@ Tests that silently do not run are worse than absent ones, because the count loo
   coherence check the packaging lane wrote. Now recorded.
 - One out-of-lane edit (`requirements.txt`), disclosed by the lane itself with
   justification and verified byte-identical to the generated output.
+
+## Fourth round — closing the toothless gates
+
+All five lanes came back **CLOSED**, and every closure was reproduced independently by a
+separate confirmer re-applying the mutation that used to survive: 3/3, 5/5, 7/7, 3/3.
+
+### One real defect found by the new gates — NM-0024
+
+Closing the `content_hash` oracle immediately exposed a live bug it had been hiding.
+`content_hash` hashed a hand-written list of three fields; `to_searchable_text()` embedded
+those three **and `synonyms`**. Editing an entry's synonyms changed the encoded text while
+leaving the hash untouched, so `sync()` skipped the row and the stored vector silently
+stopped matching its entry — no error, report says "unchanged".
+
+It escaped because the property suite compared incremental sync against a full rebuild and
+**both sides used the same hash**. H-004 again.
+
+Fixed structurally rather than by adding `synonyms` to the list: the hash is now derived
+*from* the embedded text, so the two cannot drift. Two hand-maintained lists of "the fields
+that matter" are kept in step by discipline, and discipline is what failed. Museum entry
+NM-0024, replay proven red. The audit-field guarantee is preserved and now follows from the
+definition: a column that never reaches `to_searchable_text()` cannot reach the hash.
+
+### The sixth "gate that nothing runs"
+
+`noxfile.py` grew the `mutation` session — the highest-severity hole in this document — and
+`nox` appeared in **no workflow and no Makefile**. Written, configured, ratcheted,
+documented, and invoked by nobody.
+
+That is the sixth occurrence: `tests/regression`, `tests/museum`, `tests/properties`,
+`tests/packaging`, the CI lint scope, and now this. The scope detector has been extended to
+nox sessions, and the mutation job is wired weekly and on demand — deliberately not on every
+push, because a gate that makes every push painful is a gate people route around.
+
+### Still open after this round
+
+| Hole | Severity |
+|---|---|
+| A three-way consistent shrink of the mutation scope (paths + group paths + scope pin) still satisfies the ratchet | MEDIUM |
+| `tests/packaging/conftest.py::pytest_runtest_logreport` has no test that can kill it, and the AST scanner matches attribute chains only — so `from pytest import importorskip` reopens the original finding | MEDIUM |
+| Two ledger spots: the WARNING on the thread-rule path, and two message-text assertions in cross-benchmark refusal | LOW |
+| `_expand()` drops `__init__.py` from a directory scope | LOW |
+| `_STDLIB_REMOVED_BY_3_13` is hand-maintained and nothing fails when it goes stale | LOW |
+| `TestFusionActuallyFuses::test_equal_scores_are_emitted_in_dense_retrieval_order` cannot fail under the mutation its class was written to close — it guards a different one (H-005 tie-break) | LOW |
 
 ## The protocol
 

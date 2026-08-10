@@ -216,6 +216,73 @@ def test_one_scale_is_refused_rather_than_reported():
 
 
 # =============================================================================
+# 2b. THE CLI IS A GATE, NOT A REPORT
+# =============================================================================
+
+
+def _run_shape_cli(monkeypatch, report) -> int:
+    """`python -m optimization_ledger --shape` with the measurement stubbed out."""
+    monkeypatch.setattr(ledger, "measure_shape", lambda **_kw: report)
+    monkeypatch.setattr(sys, "argv", ["optimization_ledger.py", "--shape"])
+    with pytest.raises(SystemExit) as exc:
+        ledger.main()
+    return exc.value.code
+
+
+@pytest.mark.parametrize(
+    ("case", "cost"),
+    [
+        ("linear scan", [(550.0, 3.6, 1100.0), (49.7, 44.0, 1000.0)]),
+        ("latency blowup", [(423.0, 3.6, 1100.0), (360.0, 36.0, 1000.0)]),
+        ("quadratic index", [(423.0, 3.6, 1100.0), (360.0, 5.9, 36.0)]),
+    ],
+)
+def test_the_shape_cli_exits_nonzero_on_a_broken_shape(monkeypatch, capsys, case, cost):
+    """
+    A gate that only prints is a decoration.
+
+    Every consumer of this command -- a CI step, a nox session, a shell `&&` -- reads the
+    exit status and nothing else. `shape_report` computing SHAPE-BROKEN correctly and the
+    process then exiting 0 is a green pipeline over the O(|q| x N) scan, which is worse
+    than not running the check: the printed FAIL is now evidence that somebody looked.
+
+    Parametrized over all three defects because the exit status is derived from
+    `report.failures`, and a hard-coded 0 must go red no matter which metric broke.
+    """
+    small, large = cost
+    report = ledger.shape_report(
+        [
+            _scale(1000, fields_per_sec=small[0], p95=small[1], entries_per_sec=small[2]),
+            _scale(30000, fields_per_sec=large[0], p95=large[1], entries_per_sec=large[2]),
+        ]
+    )
+    assert report.verdict == "SHAPE-BROKEN", f"{case} fixture is not broken: {report.render()}"
+
+    code = _run_shape_cli(monkeypatch, report)
+    assert code == 1, (
+        f"`--shape` printed SHAPE-BROKEN for the {case} defect and then exited {code!r}. "
+        f"CI reads the exit status, so this run is green."
+    )
+    assert "SHAPE-BROKEN" in capsys.readouterr().out, (
+        "the CLI exited non-zero without printing the report, so the failure says nothing "
+        "about which ratio broke."
+    )
+
+
+def test_the_shape_cli_exits_zero_on_a_healthy_tree(monkeypatch, capsys):
+    """
+    The other direction, and the reason the assertion above cannot be satisfied by pinning
+    the exit code to 1: a gate that always fails is a gate that gets removed from CI.
+    """
+    report = ledger.shape_report(_healthy())
+    assert report.verdict == "SHAPE-OK", report.render()
+
+    code = _run_shape_cli(monkeypatch, report)
+    assert code == 0, f"`--shape` failed a healthy tree with exit {code!r}: {report.render()}"
+    assert "SHAPE-OK" in capsys.readouterr().out
+
+
+# =============================================================================
 # 3. THE MEASUREMENT PROCEDURE ITSELF
 # =============================================================================
 

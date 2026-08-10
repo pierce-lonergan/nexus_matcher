@@ -10,6 +10,11 @@ on:
   pull_request:
     branches: [main, develop]
   workflow_dispatch:
+  schedule:
+    # Weekly, for the mutation job below. Mutation testing is the only mechanical
+    # way to find tests that are invariant to the bug they claim to cover, and it is
+    # far too slow to gate every push.
+    - cron: "0 4 * * 1"
 
 env:
   PYTHON_VERSION: "3.11"
@@ -292,3 +297,25 @@ jobs:
   # missing an entire subpackage. One publish path, with verification, is safer than two.
   #
   # To release: create a GitHub Release (or run publish.yml manually against testpypi).
+
+  mutation:
+    name: Mutation testing
+    # Weekly and on demand, never on every push: a full run is tens of minutes, and a gate
+    # that makes every push painful is a gate people learn to route around. It stayed
+    # unwired entirely until the scope detector in tests/museum/NM-0023 caught it -- the
+    # sixth gate in this repo that existed and ran nowhere.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" nox
+      - name: nox -s mutation
+        run: nox -s mutation
+      - name: nox -s verify_mutation_scope
+        run: nox -s verify_mutation_scope

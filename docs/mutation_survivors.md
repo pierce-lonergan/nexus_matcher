@@ -18,6 +18,7 @@ looked.
 ```
 nox -s mutation                  # the full scoped run, then the ratchets
 nox -s mutation -- bm25          # one group (no ratchet: partial scope)
+nox -s mutation -- --score-only  # re-check the ratchets against the cached verdicts
 nox -s verify-mutation-scope     # prove no group's test command is missing a killer
 ```
 
@@ -34,7 +35,7 @@ times in a row.
 | | |
 |---|---|
 | mutated | `domain/services/` (5 modules), `application/use_cases/match_schema.py`, `infrastructure/adapters/sparse_retrievers/bm25.py` |
-| mutants | 1607, all decided; nothing skipped, nothing sampled |
+| mutants | 1607, all decided; nothing skipped, nothing sampled. Pinned per file in `setup.cfg` `scope_mutants`, so a later run that decides fewer cannot be scored at all |
 | **excluded** | every other file in `src/`. This is a scoped run, not a repo-wide one: the whole package is roughly ten times this size and would not finish. |
 | test command | per group, in `setup.cfg` — the smallest subset that reaches every line of that group's targets |
 
@@ -45,6 +46,42 @@ gap on its first run: five lines of `match_schema.py` (251, 794, 1129, 1207, 124
 only `tests/properties/test_conservation.py` reaches. Without that test in the command,
 mutants on those lines would have "survived" for no reason except the wrong command. It is
 green now.
+
+It also refuses to compare against **nothing**. The check used to subtract the group's
+covered lines from the whole suite's covered lines and pass when the difference was empty
+— which it also is when the target is simply missing from the coverage map. A renamed
+path, a typo in `setup.cfg`, or a file coverage never measures (anything in
+`[tool.coverage.run] omit`, such as an `__init__.py`) printed `OK  0 line(s)` and the
+session went green over a file nothing had looked at. "No gap" and "no data" now report
+differently, and only the first one passes.
+
+## Why the scope is pinned, and what happens to a run that stops early
+
+Adjudication found that neither ratchet below was attached to anything. `score_floor` is a
+fraction and `survivors_documented` is a count, so **both improve when the scope shrinks**:
+deleting one path from `paths_to_mutate` is enough. Take the per-file table below and drop
+`alias_generation.py`, the worst-scoring file: 1439 mutants, 776 killed — the headline
+score goes from 49.5% to **53.9%** and the survivors from 811 to **663**. Both ratchets
+pass, by measuring less. Nothing in the gate noticed the denominator had changed. A ratchet
+you satisfy that way is worse than no ratchet, because it reports a safety it does not
+provide.
+
+So `setup.cfg` now pins the **population** as well: `scope_mutants` records every file that
+must be mutated and how many mutants it generated. Three descriptions of the scope have to
+agree before the session will start — each group's `paths` (what `nox -s mutation` runs),
+`[mutmut] paths_to_mutate` (what a bare `mutmut run` would run) and `scope_mutants` (what
+was measured) — and widening the scope stops there too, so a new file's count and both
+ratchets get re-measured in the same edit.
+
+The same pin is what tells a finished run from a truncated one. It used to be told by
+mutmut's own count of `untested` rows, which cannot answer the question: mutmut writes
+those rows only when it registers a file and skips registration when the file's hash has
+not changed, so on every resumed run the count reads 0 from the first second whether or not
+there is work left. The watchdog watched exactly that number, saw it never move, decided a
+healthy run had deadlocked, killed it — and then read the same 0 as "complete" and scored
+the truncated population. A run that ends short now prints **TRUNCATED** and no number at
+all, and the deadlock watchdog is only armed while pinned mutants are actually outstanding.
+A partial score is the worst output this gate can produce: it looks exactly like evidence.
 
 ## The numbers
 

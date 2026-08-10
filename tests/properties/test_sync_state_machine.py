@@ -14,6 +14,23 @@ So the invariant is the strongest one available: after ANY sequence of edits and
 the incremental index must equal a full rebuild from the same source. Bit-identical
 vectors, identical content hashes, identical entry objects.
 
+## The second dimension: WORK DONE
+
+"Incremental == full rebuild" is, on its own, an invariant that a full rebuild satisfies
+perfectly. Replacing `sync` with a re-embed of every row on every call survived this
+machine in its first form, and it had to: the final state of a correct full rebuild IS the
+final state the invariant demands. Correct, and useless -- a glossary sync that re-embeds
+100k rows to apply one edit costs about three minutes instead of milliseconds, which is
+the whole reason `sync` exists.
+
+So every sync here also asserts WHAT WAS ENCODED, against the texts of the rows whose
+embedded text actually moved. The expectation is built from `to_searchable_text` -- the
+text `sync` really hands the provider -- and never from `content_hash`, because `sync`
+decides with `content_hash` and an oracle that re-derives with the same hash is blind to
+any change in what that hash covers. That blindness is H-004, and it is what let a
+`content_hash` widened to cover `protection_level` pass this file unnoticed. See
+`test_incremental_work.py` for the absolute, hand-written pins of the same contract.
+
 ## Why a state machine and not a table of cases
 
 The bugs live in the INTERACTIONS. `sync` removes ids, then re-embeds, then appends new
@@ -47,12 +64,14 @@ be stale. That is reported rather than papered over.
 
 from __future__ import annotations
 
+from collections import Counter
+
 from hypothesis import settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, invariant, precondition, rule
 
 from nexus_matcher.application import ingest
-from tests.properties._support import BagOfTokensProvider
+from tests.properties._support import BagOfTokensProvider, CountingProvider
 
 # An explicit mapping rather than the inferred one.
 #
@@ -92,9 +111,19 @@ class GlossarySyncMachine(RuleBasedStateMachine):
 
     def __init__(self) -> None:
         super().__init__()
-        self.provider = BagOfTokensProvider()
+        # Two providers, on purpose. The index gets the counting one so that everything it
+        # encodes is attributable to `sync`; the rebuild oracle gets a plain one, because a
+        # rebuild legitimately encodes every row and would otherwise drown the count. Both
+        # wrap the same `encode`, so the vectors stay bit-comparable.
+        self.provider = CountingProvider()
+        self.rebuild_provider = BagOfTokensProvider()
         self.rows: list[dict] = [_row("Customer Email", "cust_email", "the email", "PII")]
         self.index = ingest.build_index(list(self.rows), provider=self.provider, columns=COLUMNS)
+        # id -> the text last embedded for it. The model of what the index's vectors were
+        # computed from, and the only basis on which "this sync owed N embeddings" can be
+        # stated without asking `content_hash`, which is the thing under test.
+        self.embedded: dict[str, str] = {}
+        self._record_work_done()
 
     # -- edits -------------------------------------------------------------------------
 
@@ -150,12 +179,66 @@ class GlossarySyncMachine(RuleBasedStateMachine):
         index = at % len(self.rows)
         self.rows.insert(0, self.rows.pop(index))
 
+    # -- work accounting ---------------------------------------------------------------
+
+    def _current_entries(self):
+        """The entries `sync` is about to see, loaded exactly the way `sync` loads them."""
+        return ingest.load_entries(list(self.rows), columns=COLUMNS)
+
+    def _record_work_done(self) -> None:
+        """Reset the model to the state a correct sync has just left the index in."""
+        self.provider.take()
+        self.embedded = {e.id: e.to_searchable_text() for e in self._current_entries()}
+
+    def _sync_and_check_work(self):
+        """
+        One sync, plus the assertion the final-state invariant structurally cannot make.
+
+        `owed` is the set of texts whose EMBEDDED FORM moved since the last sync -- derived
+        from `to_searchable_text`, which is the string the provider is actually handed, and
+        never from `content_hash`. That distinction is the whole point: `sync` decides what
+        to recompute using `content_hash`, so an expectation re-derived from `content_hash`
+        agrees with `sync` by construction and cannot notice the hash growing to cover a
+        governance column. It did not notice, which is how a widened hash shipped past this
+        file.
+        """
+        entries = self._current_entries()
+        owed = sorted(
+            entry.to_searchable_text()
+            for entry in entries
+            if self.embedded.get(entry.id) != entry.to_searchable_text()
+        )
+        assert self.provider.take() == [], "something other than `sync` encoded text"
+
+        report = ingest.sync(self.index, list(self.rows), columns=COLUMNS)
+        done = sorted(self.provider.take())
+
+        assert done == owed, (
+            f"`sync` encoded {len(done)} texts for {len(owed)} changed rows. "
+            f"Encoded but not owed: {_multiset_difference(done, owed)!r}; "
+            f"owed but not encoded: {_multiset_difference(owed, done)!r}. "
+            f"Encoding a row whose text did not move is the full-rebuild cost `sync` "
+            f"exists to avoid -- minutes instead of milliseconds on every daily sync; "
+            f"failing to encode one that did move leaves a stale vector behind an entry "
+            f"that looks freshly synced."
+        )
+        assert report.embedded == len(done), (
+            f"the report says {report.embedded} embeddings, {len(done)} were computed. A "
+            f"caller reading this number to decide the sync was cheap cannot see a sync "
+            f"that quietly rebuilt."
+        )
+
+        self.embedded = {entry.id: entry.to_searchable_text() for entry in entries}
+        return report
+
     # -- the sync itself ---------------------------------------------------------------
 
     @rule()
     def sync_and_compare(self):
-        report = ingest.sync(self.index, list(self.rows), columns=COLUMNS)
-        rebuilt = ingest.build_index(list(self.rows), provider=self.provider, columns=COLUMNS)
+        report = self._sync_and_check_work()
+        rebuilt = ingest.build_index(
+            list(self.rows), provider=self.rebuild_provider, columns=COLUMNS
+        )
         _assert_indistinguishable(self.index, rebuilt)
         _assert_report_adds_up(report, self.index)
 
@@ -188,10 +271,19 @@ class GlossarySyncMachine(RuleBasedStateMachine):
         assert index.vectors.dtype.name == "float32"
 
     def teardown(self):
-        """One last sync, so a run that ended on an edit still gets compared."""
-        ingest.sync(self.index, list(self.rows), columns=COLUMNS)
-        rebuilt = ingest.build_index(list(self.rows), provider=self.provider, columns=COLUMNS)
+        """One last sync, so a run that ended on an edit still gets compared -- and
+        counted, since a run whose final step was an edit is exactly where an over-eager
+        re-embed would otherwise go unobserved."""
+        self._sync_and_check_work()
+        rebuilt = ingest.build_index(
+            list(self.rows), provider=self.rebuild_provider, columns=COLUMNS
+        )
         _assert_indistinguishable(self.index, rebuilt)
+
+
+def _multiset_difference(a: list[str], b: list[str]) -> list[str]:
+    """`a` minus `b`, counting duplicates -- two rows can legitimately share a text."""
+    return sorted((Counter(a) - Counter(b)).elements())
 
 
 def _assert_indistinguishable(incremental, rebuilt) -> None:

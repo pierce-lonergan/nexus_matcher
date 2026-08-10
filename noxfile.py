@@ -25,10 +25,20 @@ directory outside the repository and mutates that. The consequence for you: `nox
 mutation` is safe to start while other work is in flight, and it can never leave a mutated
 file behind in your checkout.
 
+## Why the population is pinned, not just the score
+A mutation score is a fraction, and both ratchets in setup.cfg are satisfied by shrinking
+the denominator: a smaller scope still has a score, and it has strictly fewer survivors.
+So `scope_mutants` pins the file list AND the per-file mutant count that was measured, and
+this session refuses to start when the configured paths no longer expand to that list and
+refuses to score when the run did not reach a verdict on those counts. The consequence for
+you: "the score went up" can never mean "we measured less", and a run cut short reports
+TRUNCATED instead of a number.
+
 ## Sessions
     nox -s mutation                  the full scoped run, then the ratchets
     nox -s mutation -- bm25          one group only (no ratchet -- partial scope)
     nox -s mutation -- --clean       discard the cached results and re-run everything
+    nox -s mutation -- --score-only  re-check the ratchets against the cached verdicts
     nox -s verify-mutation-scope     prove each group's test list is not missing a killer
 """
 
@@ -36,6 +46,7 @@ from __future__ import annotations
 
 import ast
 import configparser
+import hashlib
 import json
 import os
 import re
@@ -104,7 +115,134 @@ class Group:
         return f"{base} {' '.join(self.tests)}"
 
 
-def _load_config() -> tuple[configparser.ConfigParser, list[Group], float, int]:
+class Scope:
+    """
+    Everything [mutmut.scope] pins: the groups, the two ratchets, and the POPULATION.
+
+    `mutants` is the third ratchet and the one that makes the other two mean anything --
+    {source file: how many mutants the pinned run decided}. Without it, `score_floor` and
+    `survivors_documented` are both satisfied by deleting a path from the scope, because a
+    smaller population still has a score and has fewer survivors.
+    """
+
+    def __init__(
+        self,
+        cfg: configparser.ConfigParser,
+        groups: list[Group],
+        floor: float,
+        budget: int,
+        mutants: dict[str, int],
+    ) -> None:
+        self.cfg = cfg
+        self.groups = groups
+        self.floor = floor
+        self.budget = budget
+        self.mutants = mutants
+
+    @property
+    def files(self) -> list[str]:
+        """Every file that must be mutated, pinned in setup.cfg."""
+        return sorted(self.mutants)
+
+    @property
+    def total_mutants(self) -> int:
+        return sum(self.mutants.values())
+
+    def pinned_for(self, groups: list[Group]) -> dict[str, int]:
+        """
+        The pinned counts for just these groups' files.
+
+        Normalises through `_scope_files`, the same way `_assert_scope_pinned` built the
+        list it checked `mutants` against -- so this cannot raise KeyError for a path
+        spelled with a trailing slash or a backslash in setup.cfg.
+        """
+        return {f: self.mutants[f] for group in groups for f in _scope_files(group.paths)}
+
+
+def _scope_files(paths: list[str]) -> list[str]:
+    """The configured paths (files or directories) as a sorted, normalised file list."""
+    return sorted({p.replace("\\", "/").rstrip("/") for p in _expand(paths)})
+
+
+def _pinned_mutants(cfg: configparser.ConfigParser) -> dict[str, int]:
+    """Parse [mutmut.scope] scope_mutants -- one `<count> <path>` per line."""
+    pinned: dict[str, int] = {}
+    for raw in cfg.get("mutmut.scope", "scope_mutants").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        count, _, path = line.partition(" ")
+        path = path.strip().replace("\\", "/")
+        if not count.isdigit() or not path:
+            raise RuntimeError(f"scope_mutants line {raw.strip()!r} is not '<count> <path>'")
+        pinned[path] = int(count)
+    if not pinned:
+        raise RuntimeError(
+            "[mutmut.scope] scope_mutants is empty, so the population is unpinned and the "
+            "score could be computed over anything at all."
+        )
+    return pinned
+
+
+def _assert_scope_pinned(cfg: configparser.ConfigParser, groups: list[Group]) -> dict[str, int]:
+    """
+    Refuse to run at all unless the scope is exactly the population that was measured.
+
+    This is the fix for a ratchet that could be satisfied by measuring less. `score_floor`
+    and `survivors_documented` are both fractions of, or counts within, whatever happened
+    to be mutated -- delete a path and both improve. Three descriptions of the scope have
+    to agree before anything runs:
+
+      * each group's `paths`            -- what `nox -s mutation` actually mutates
+      * [mutmut] `paths_to_mutate`      -- what a bare `mutmut run` would mutate
+      * [mutmut.scope] `scope_mutants`  -- what was measured when the ratchets were set
+
+    Growing the scope fails here too, on purpose: the new file's mutant count and both
+    ratchets have to be re-measured in the same edit or the three numbers stop describing
+    the same population.
+    """
+    pinned = _pinned_mutants(cfg)
+    grouped = _scope_files([p for group in groups for p in group.paths])
+    native = _scope_files(cfg.get("mutmut", "paths_to_mutate").split(":"))
+
+    problems = []
+    if native != grouped:
+        problems.append(
+            "[mutmut] paths_to_mutate and the union of the group paths do not name the "
+            "same files. A bare `mutmut run` uses the first, this session uses the second."
+            f"\n      only in paths_to_mutate: {sorted(set(native) - set(grouped))}"
+            f"\n      only in the groups:      {sorted(set(grouped) - set(native))}"
+        )
+    dropped = sorted(set(pinned) - set(grouped))
+    if dropped:
+        problems.append(
+            f"the scope SHRANK -- {dropped} is pinned in scope_mutants but is no longer "
+            "mutated. Measuring less is not a way to satisfy score_floor or "
+            "survivors_documented; both of them improve when the scope shrinks."
+        )
+    added = sorted(set(grouped) - set(pinned))
+    if added:
+        problems.append(
+            f"the scope grew -- {added} is mutated but not pinned in scope_mutants. "
+            "Widening is a good change and it still stops here: record the new file's "
+            "mutant count, and re-measure score_floor and survivors_documented in the "
+            "same edit, so all three keep describing the same population."
+        )
+    absent = sorted(f for f in pinned if not (REPO / f).exists())
+    if absent:
+        problems.append(
+            f"pinned scope file(s) do not exist: {absent}. A path that resolves to nothing "
+            "generates no mutants and would otherwise read as a clean run."
+        )
+    if problems:
+        raise RuntimeError(
+            "the mutation scope no longer matches the population pinned in setup.cfg "
+            "[mutmut.scope]:\n    - " + "\n    - ".join(problems)
+        )
+    return pinned
+
+
+def _load_config() -> Scope:
     """
     Read the scope out of setup.cfg, and refuse to run if mutmut would not read it too.
 
@@ -112,6 +250,9 @@ def _load_config() -> tuple[configparser.ConfigParser, list[Group], float, int]:
     that section is absent. If someone adds it, every value in setup.cfg stops applying
     to a bare `mutmut run` while this session keeps honouring it -- two tools with two
     different ideas of the scope, and no error. Fail loudly instead.
+
+    Every session goes through here, so the scope pin below is not something a caller can
+    forget to ask for.
     """
     if not SETUP_CFG.exists():
         raise RuntimeError(f"{SETUP_CFG} is missing; mutation scope is defined there")
@@ -138,9 +279,13 @@ def _load_config() -> tuple[configparser.ConfigParser, list[Group], float, int]:
             )
         )
 
-    floor = cfg.getfloat("mutmut.scope", "score_floor")
-    budget = cfg.getint("mutmut.scope", "survivors_documented")
-    return cfg, groups, floor, budget
+    return Scope(
+        cfg=cfg,
+        groups=groups,
+        floor=cfg.getfloat("mutmut.scope", "score_floor"),
+        budget=cfg.getint("mutmut.scope", "survivors_documented"),
+        mutants=_assert_scope_pinned(cfg, groups),
+    )
 
 
 # =============================================================================
@@ -405,16 +550,113 @@ def _documented_keys() -> set[str]:
 # =============================================================================
 
 
-def _undecided_count() -> int:
-    """How many generated mutants mutmut has not reached a verdict on yet."""
+def _decided_by_file() -> dict[str, int]:
+    """
+    How many mutants the cache holds a VERDICT for, per source file.
+
+    Completeness is measured against the pinned counts in setup.cfg, not against mutmut's
+    own `untested` rows, because those rows cannot answer the question. mutmut writes them
+    only when it (re)registers a file, and it skips registration entirely when the file's
+    hash has not changed -- so on every resumed run the untested count reads 0 from the
+    first second, whether or not there is work left to do. The old watchdog watched exactly
+    that number: it never moved, so it declared healthy runs deadlocked, killed them, saw
+    "0 undecided", and scored the truncated population as if it were the whole thing. A
+    silently partial mutation score is the worst output this session can produce, because
+    it looks like evidence.
+
+    (The query it used also said `status = "untested"`. SQLite resolves a double-quoted
+    token as an IDENTIFIER first and only falls back to a string literal when no column of
+    that name exists, so that comparison would have silently become a column reference the
+    day the schema grew one. There is no status literal in SQL here at all now -- the
+    tally is done in Python against the DECIDED tuple this module already defines.)
+    """
     cache = _cache_path()
     if not cache.exists():
-        return 0
+        return {}
     connection = sqlite3.connect(cache)
     try:
-        return connection.execute(
-            'SELECT count(*) FROM Mutant WHERE status = "untested"'
-        ).fetchone()[0]
+        rows = connection.execute(
+            """
+            SELECT SourceFile.filename, Mutant.status
+            FROM Mutant
+            JOIN Line ON Line.id = Mutant.line
+            JOIN SourceFile ON SourceFile.id = Line.sourcefile
+            """
+        ).fetchall()
+    finally:
+        connection.close()
+
+    decided: dict[str, int] = {}
+    for filename, status in rows:
+        if status in DECIDED:
+            name = filename.replace("\\", "/")
+            decided[name] = decided.get(name, 0) + 1
+    return decided
+
+
+def _missing_verdicts(pinned: dict[str, int]) -> dict[str, tuple[int, int]]:
+    """{file: (decided, pinned)} for every pinned file the cache is short on."""
+    decided = _decided_by_file()
+    return {
+        filename: (decided.get(filename, 0), expected)
+        for filename, expected in pinned.items()
+        if decided.get(filename, 0) < expected
+    }
+
+
+def _stale_sources(files: list[str]) -> list[str]:
+    """
+    Pinned files whose cached verdicts were recorded against different source bytes.
+
+    mutmut stores sha256 of each file it registered. A normal run syncs the repository
+    into the workspace before it starts, so this is a no-op there. It is the guard that
+    stops `--score-only` from being a way around measuring: a cache full of verdicts about
+    yesterday's source has the right SHAPE -- every pinned mutant decided -- and says
+    nothing about the code in the tree today.
+    """
+    cache = _cache_path()
+    if not cache.exists():
+        return []
+    connection = sqlite3.connect(cache)
+    try:
+        recorded = {
+            filename.replace("\\", "/"): digest
+            for filename, digest in connection.execute("SELECT filename, hash FROM SourceFile")
+        }
+    finally:
+        connection.close()
+    stale = []
+    for filename in files:
+        source = REPO / filename
+        if filename not in recorded or not source.exists():
+            continue  # absence is reported by the completeness check, with a better message
+        if hashlib.sha256(source.read_bytes()).hexdigest() != recorded[filename]:
+            stale.append(filename)
+    return stale
+
+
+def _verdict_fingerprint() -> str:
+    """
+    A value that changes the moment mutmut records ANY verdict, for any mutant.
+
+    This is the liveness signal for the deadlock watchdog, and it has to move in every
+    case where real work is happening. A count of decided mutants is not enough: when the
+    TESTS change but the source does not, mutmut re-tests the entire population and the
+    count never moves, even over hours. `tested_against_hash` is rewritten on every
+    re-test, so folding it in covers that case. Under the actual deadlock -- both mutmut
+    processes at 0% CPU with no pytest child -- nothing is written and this stands still.
+    """
+    cache = _cache_path()
+    if not cache.exists():
+        return "no-cache"
+    connection = sqlite3.connect(cache)
+    try:
+        digest = hashlib.blake2b(digest_size=16)
+        for pk, status, tested_against in connection.execute(
+            "SELECT id, status, tested_against_hash FROM Mutant ORDER BY id"
+        ):
+            digest.update(f"{pk}\0{status}\0{tested_against}\n".encode())
+        return digest.hexdigest()
     finally:
         connection.close()
 
@@ -433,6 +675,7 @@ def _run_group(
     tests_dir: str,
     base_runner: str,
     env: dict[str, str],
+    pinned: dict[str, int],
     stall_minutes: float,
     max_restarts: int,
 ) -> None:
@@ -442,12 +685,22 @@ def _run_group(
     Restarts on a STALL rather than on a clock. mutmut 2.4.5 deadlocks on Windows: both of
     its processes drop to 0% CPU with no pytest child running and never recover -- seen
     once in a 1600-mutant run, 245 mutants from the end. A wall-clock timeout would have to
-    be set long enough for a legitimate slow run and would therefore be useless; "no mutant
-    has been decided in N minutes" is the actual symptom. Every verdict is already in the
-    cache, so a restarted mutmut resumes where the wedged one stopped.
+    be set long enough for a legitimate slow run and would therefore be useless; "nothing
+    has been written to the cache in N minutes" is the actual symptom. Every verdict is
+    already in the cache, so a restarted mutmut resumes where the wedged one stopped.
 
-    A stall is REPORTED, not swallowed. If a restart makes no progress at all the session
-    fails rather than looping.
+    Two things make that safe, and neither was true before:
+
+    * The watchdog is only ARMED while this group still has mutants without a verdict. If
+      the pinned population is already complete, mutmut is walking cached results and has
+      nothing to write -- silence there is not a deadlock, and killing it is what used to
+      cut healthy runs short.
+    * "Done" means every pinned mutant has a verdict, not "mutmut's untested count is
+      zero". That count is zero from the first second of any resumed run, so it agreed
+      with every truncated run that it had finished.
+
+    A run that ends short is REPORTED as TRUNCATED and the session fails; it is never
+    handed on to be scored.
     """
     command = [
         sys.executable,
@@ -463,31 +716,54 @@ def _run_group(
         "--simple-output",
         "--no-progress",
     ]
+
+    def outstanding() -> int:
+        """Pinned mutants in this group that still have no verdict."""
+        return sum(want - got for got, want in _missing_verdicts(pinned).values())
+
     for attempt in range(max_restarts + 1):
-        undecided_at_start = _undecided_count()
+        outstanding_at_start = outstanding()
         process = subprocess.Popen(command, cwd=WORKSPACE, env=env)
-        last_seen = _undecided_count()
+        fingerprint = _verdict_fingerprint()
         last_change = time.monotonic()
         stalled = False
+        warned_idle = False
         while process.poll() is None:
             time.sleep(30)
-            current = _undecided_count()
-            if current != last_seen:
-                last_seen, last_change = current, time.monotonic()
-            elif time.monotonic() - last_change > stall_minutes * 60:
-                session.warn(
-                    f"{group.name}: mutmut has decided nothing for {stall_minutes} minutes "
-                    f"with {current} mutants left. This is the known mutmut 2.4.5 Windows "
-                    "deadlock; killing it and resuming from the cache."
-                )
-                _kill_tree(process.pid)
-                stalled = True
-                break
+            current = _verdict_fingerprint()
+            if current != fingerprint:
+                fingerprint, last_change = current, time.monotonic()
+                continue
+            if time.monotonic() - last_change <= stall_minutes * 60:
+                continue
+            if not outstanding():
+                # Every pinned mutant already has a verdict, so mutmut is replaying the
+                # cache and has nothing to write. Silence here is normal. Killing it was
+                # what silently truncated healthy runs, so wait it out instead -- and say
+                # so, because a run that sits here for long really has wedged.
+                if not warned_idle:
+                    session.warn(
+                        f"{group.name}: nothing written to the cache for {stall_minutes} "
+                        "minutes, but every pinned mutant already has a verdict -- mutmut "
+                        "is replaying cached results, not deadlocked. Waiting."
+                    )
+                    warned_idle = True
+                last_change = time.monotonic()
+                continue
+            session.warn(
+                f"{group.name}: nothing written to the cache for {stall_minutes} minutes "
+                f"with {outstanding()} pinned mutants still undecided. This is the known "
+                "mutmut 2.4.5 Windows deadlock; killing it and resuming from the cache."
+            )
+            _kill_tree(process.pid)
+            stalled = True
+            break
         process.wait()
 
         if not stalled and process.returncode & 1:
             session.error(f"mutmut failed while running group {group.name!r}")
-        if _undecided_count() == 0:
+        left = outstanding()
+        if left == 0:
             # mutmut's exit code is a bit field: 1 fatal, 2 survivors, 4 timeout, 8 slow.
             # Survivors are the POINT of the run, so only the fatal bit is an error; the
             # ratchets decide whether the survivors are acceptable.
@@ -499,26 +775,41 @@ def _run_group(
             # them. Retrying is right -- a normal partial run finishes them -- and the
             # no-progress check below is what stops it looping on the corrupt case.
             session.warn(
-                f"{group.name}: mutmut exited cleanly with {_undecided_count()} mutants "
-                "still undecided. Retrying; if the count does not move, the cache is stale "
-                "for this file and needs `nox -s mutation -- --clean`."
+                f"{group.name}: mutmut exited cleanly with {left} pinned mutants still "
+                "undecided. Retrying; if the count does not move, the cache is stale for "
+                "this file and needs `nox -s mutation -- --clean`."
             )
-        if attempt and _undecided_count() == undecided_at_start:
+        if attempt and left == outstanding_at_start:
             session.error(
-                f"{group.name}: a restart decided nothing at all, with "
-                f"{_undecided_count()} mutants left. That is not the deadlock -- the cache "
-                "no longer matches the source. Re-run with `-- --clean`."
+                f"TRUNCATED: {group.name} -- a restart decided nothing at all, with {left} "
+                "pinned mutants left. That is not the deadlock: either the cache no longer "
+                "matches the source (re-run with `-- --clean`) or scope_mutants in "
+                "setup.cfg pins more mutants than this source now generates."
             )
         session.warn(f"{group.name}: restart {attempt + 1} of {max_restarts}")
     session.error(
-        f"{group.name}: still {_undecided_count()} undecided mutants after "
-        f"{max_restarts} restarts. Scoring a partial group would understate the tests."
+        f"TRUNCATED: {group.name} still has {outstanding()} of its pinned "
+        f"{sum(pinned.values())} mutants without a verdict after {max_restarts} restarts. "
+        "Refusing to score a partial population -- a mutation score computed over less "
+        "than the scope is not a weaker result, it is a misleading one."
     )
 
 
-def _ratchet_failures(score: float, floor: float, survivors: list[dict], budget: int) -> list[str]:
+def _ratchet_failures(score: float, survivors: list[dict], decided: int, scope: Scope) -> list[str]:
     """Every ratchet this run breaks. Empty means the run passes."""
+    floor, budget = scope.floor, scope.budget
     failures = []
+    # The population ratchet, checked first because the other two are meaningless without
+    # it: both of them improve when the scope shrinks, so a score over fewer mutants than
+    # were pinned is not a smaller measurement, it is a different one wearing the same
+    # number. (Per-file completeness is asserted before anything is scored; this is the
+    # same fact stated where a reader looks for the ratchets.)
+    if decided != scope.total_mutants:
+        failures.append(
+            f"{decided} mutants decided, but setup.cfg pins {scope.total_mutants} for this "
+            "scope. score_floor and survivors_documented are both satisfied by measuring "
+            "less, so the population is pinned too; re-measure all three together."
+        )
     if score < floor:
         failures.append(
             f"mutation score {score:.1f}% is below the ratchet floor {floor}%. "
@@ -548,9 +839,8 @@ def _ratchet_failures(score: float, floor: float, survivors: list[dict], budget:
     return failures
 
 
-@nox.session(python=False, name="mutation")
-def mutation(session: nox.Session) -> None:
-    """Run the scoped mutation suite and enforce the ratchets."""
+def _assert_tools_present(session: nox.Session) -> None:
+    """Refuse to measure anything with a toolchain that would fake a perfect score."""
     try:
         import mutmut  # noqa: F401
     except ImportError:
@@ -571,7 +861,45 @@ def mutation(session: nox.Session) -> None:
             "`pip install pytest-timeout`."
         )
 
-    cfg, groups, floor, budget = _load_config()
+
+def _assert_verdicts_are_evidence(session: nox.Session, pinned: dict[str, int]) -> None:
+    """
+    Refuse to score until the cached verdicts are about the whole scope and today's source.
+
+    A partial run is not a weaker result than a complete one, it is a misleading one: it
+    prints a percentage that looks exactly like evidence and is computed over an unstated
+    subset. So is a complete-looking run whose verdicts describe source that has since
+    changed. This runs for partial-scope invocations too -- the ratchets are skipped there,
+    but the number printed still has to cover the whole of what was asked for.
+    """
+    stale = _stale_sources(sorted(pinned))
+    if stale:
+        session.error(
+            "STALE -- refusing to score. The cached verdicts for these files were recorded "
+            "against different source bytes than the ones in the tree now:\n  "
+            + "\n  ".join(stale)
+            + "\n  Run `nox -s mutation` so they are re-tested."
+        )
+    short = _missing_verdicts(pinned)
+    if not short:
+        return
+    lines = "\n  ".join(
+        f"{filename}: {got} of {want} decided" for filename, (got, want) in sorted(short.items())
+    )
+    session.error(
+        "TRUNCATED -- refusing to score. These files have fewer verdicts in the cache "
+        f"than setup.cfg pins:\n  {lines}\n  Re-run `nox -s mutation`; if the shortfall "
+        "does not close, the cache is stale (`-- --clean`) or scope_mutants no longer "
+        "matches the source."
+    )
+
+
+@nox.session(python=False, name="mutation")
+def mutation(session: nox.Session) -> None:
+    """Run the scoped mutation suite and enforce the ratchets."""
+    _assert_tools_present(session)
+    scope = _load_config()
+    cfg, groups = scope.cfg, scope.groups
     base_runner = cfg.get("mutmut", "runner").replace(
         "python -m pytest", f'"{sys.executable}" -m pytest', 1
     )
@@ -580,37 +908,53 @@ def mutation(session: nox.Session) -> None:
     clean = "--clean" in posargs
     if clean:
         posargs.remove("--clean")
+    # Re-check the ratchets against the verdicts already in the cache, without running
+    # mutmut again. This is not a way to pass without measuring: the completeness check
+    # below holds the cache to the population pinned in setup.cfg, so the only cache that
+    # can be scored is one a real run produced.
+    score_only = "--score-only" in posargs
+    if score_only:
+        posargs.remove("--score-only")
+    if clean and score_only:
+        session.error("--clean deletes the verdicts that --score-only exists to read")
     selected = [g for g in groups if g.name in posargs] if posargs else groups
     if posargs and not selected:
         session.error(f"no such group(s): {' '.join(posargs)}")
 
-    _sync_workspace(session)
-    env = _workspace_env()
-    _assert_workspace_isolated(session, env)
-    if clean and _cache_path().exists():
-        _cache_path().unlink()
-
     started = time.monotonic()
-    for group in selected:
-        session.log(f"--- {group.name}: {len(group.paths)} path(s) ---")
-        _run_group(
-            session,
-            group,
-            cfg.get("mutmut", "tests_dir"),
-            base_runner,
-            env,
-            stall_minutes=cfg.getfloat("mutmut.scope", "stall_minutes"),
-            max_restarts=cfg.getint("mutmut.scope", "max_restarts"),
+    if score_only:
+        session.warn(
+            f"--score-only: mutmut is NOT being run. Scoring the verdicts already in "
+            f"{_cache_path()}."
         )
+    else:
+        _sync_workspace(session)
+        env = _workspace_env()
+        _assert_workspace_isolated(session, env)
+        if clean and _cache_path().exists():
+            _cache_path().unlink()
+
+        for group in selected:
+            session.log(f"--- {group.name}: {len(group.paths)} path(s) ---")
+            _run_group(
+                session,
+                group,
+                cfg.get("mutmut", "tests_dir"),
+                base_runner,
+                env,
+                scope.pinned_for([group]),
+                stall_minutes=cfg.getfloat("mutmut.scope", "stall_minutes"),
+                max_restarts=cfg.getint("mutmut.scope", "max_restarts"),
+            )
     elapsed = time.monotonic() - started
+
+    _assert_verdicts_are_evidence(session, scope.pinned_for(selected))
 
     # Only the groups just run. The cache is shared and persistent, so an unfiltered read
     # after `nox -s mutation -- bm25` would quietly fold in whatever the last full run
     # left behind and report it as this run's score.
     wanted = tuple(p.rstrip("/") for group in selected for p in group.paths)
     mutants = [m for m in _read_results() if m["filename"].startswith(wanted)]
-    if not mutants:
-        session.error("no mutants were decided -- the run produced nothing to score")
     score, counts = _score(mutants)
     survivors = sorted(
         (m for m in mutants if m["status"] not in KILLED_STATUSES),
@@ -630,16 +974,19 @@ def mutation(session: nox.Session) -> None:
         session.warn("partial scope -- ratchets NOT enforced. Only a full run scores the ratchet.")
         return
 
-    failures = _ratchet_failures(score, floor, survivors, budget)
+    failures = _ratchet_failures(score, survivors, len(mutants), scope)
     if failures:
         session.error("\n".join(failures))
 
-    if score > floor + 2.0:
+    if score > scope.floor + 2.0:
         session.warn(
-            f"score {score:.1f}% is well above the floor {floor}% -- raise score_floor in "
-            "setup.cfg so the gain cannot be given back silently."
+            f"score {score:.1f}% is well above the floor {scope.floor}% -- raise score_floor "
+            "in setup.cfg so the gain cannot be given back silently."
         )
-    session.log(f"mutation score {score:.1f}% >= floor {floor}%; all survivors triaged")
+    session.log(
+        f"mutation score {score:.1f}% >= floor {scope.floor}% over the pinned "
+        f"{scope.total_mutants} mutants; all survivors triaged"
+    )
 
 
 @nox.session(python=False, name="verify-mutation-scope")
@@ -659,33 +1006,64 @@ def verify_mutation_scope(session: nox.Session) -> None:
     CI) which cannot collect anywhere else. Coverage data files are still written to the
     workspace so the checkout stays clean.
     """
-    _, groups, _, _ = _load_config()
+    scope = _load_config()
     WORKSPACE.mkdir(parents=True, exist_ok=True)
 
-    targets = sorted({p for group in groups for p in _expand(group.paths)})
+    # The PINNED file list, not whatever the paths happen to expand to today. If the two
+    # disagree _load_config has already refused to run.
+    targets = scope.files
     whole = _executed_lines(session, "whole", ["tests"], targets, must_be_green=False)
 
     problems = []
-    for group in groups:
-        mine = _expand(group.paths)
+    for group in scope.groups:
         got = _executed_lines(session, group.name, group.tests, targets)
-        for target in mine:
-            only_whole = whole.get(target, set()) - got.get(target, set())
-            marker = "OK  " if not only_whole else "GAP "
-            print(
-                f"  {marker}{group.name:<16} {target}: {len(only_whole)} line(s) reached "
-                f"only by the full suite"
-            )
-            if only_whole:
-                print(f"        {sorted(only_whole)}")
-                problems.append(f"{group.name} / {target}")
+        for target in _scope_files(group.paths):
+            marker, detail = _reachability(target, whole, got)
+            print(f"  {marker:<6} {group.name:<16} {target}: {detail}")
+            if marker != "OK":
+                problems.append(f"{group.name} / {target} ({marker})")
 
     if problems:
         session.error(
             "these groups run a test command that does not reach every covered line of "
-            "their own targets, so their survivors are not trustworthy: " + ", ".join(problems)
+            "their own targets, or were not measured at all, so their survivors are not "
+            "trustworthy: " + ", ".join(problems)
         )
     session.log("every group's command reaches every line the full suite reaches")
+
+
+def _reachability(
+    target: str, whole: dict[str, set[int]], got: dict[str, set[int]]
+) -> tuple[str, str]:
+    """
+    One target's verdict: OK, GAP, or NODATA.
+
+    ABSENCE IS NOT AGREEMENT. The comparison used to be
+    `whole.get(target, set()) - got.get(target, set())`, which is the empty set when the
+    target is simply missing from the coverage map -- so a renamed path, a typo in
+    setup.cfg, or a file coverage never measured printed `OK  0 line(s)` and the session
+    passed. That is the same defect this whole session exists to prevent, one level up:
+    a check that reports "no gap" when what it actually has is "no data". Every way of
+    having nothing to compare is a failure now.
+    """
+    if target not in whole:
+        return "NODATA", (
+            "the whole-suite coverage run has no rows for this file at all -- it is not "
+            "under --source=nexus_matcher, or the path in setup.cfg does not exist"
+        )
+    if not whole[target]:
+        return "NODATA", (
+            "the whole suite executes no line of this file, so there is no reference set "
+            "to compare against and every mutant in it survives for lack of coverage"
+        )
+    if target not in got:
+        return "NODATA", "this group's own coverage run has no rows for this file at all"
+    only_whole = whole[target] - got[target]
+    if only_whole:
+        return "GAP", (
+            f"{len(only_whole)} line(s) reached only by the full suite: {sorted(only_whole)}"
+        )
+    return "OK", f"0 of {len(whole[target])} covered line(s) reached only by the full suite"
 
 
 def _expand(paths: list[str]) -> list[str]:
@@ -787,7 +1165,18 @@ def _executed_lines(
         capture_output=True,
         text=True,
     )
-    report = json.loads(json_file.read_text(encoding="utf-8"))
+    return _executed_from_report(json.loads(json_file.read_text(encoding="utf-8")), targets)
+
+
+def _executed_from_report(report: dict, targets: list[str]) -> dict[str, set[int]]:
+    """
+    {target: lines coverage recorded as executed}, for the targets the report mentions.
+
+    A target the report does not mention is ABSENT from the result rather than present
+    with an empty set, and `_reachability` treats those two as different things -- see the
+    note there. Split out from the run so the comparison can be exercised against a saved
+    report without spending a whole test suite to produce one.
+    """
     executed: dict[str, set[int]] = {}
     for filename, info in report["files"].items():
         normalised = filename.replace("\\", "/")

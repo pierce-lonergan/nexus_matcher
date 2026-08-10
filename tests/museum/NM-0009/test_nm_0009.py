@@ -86,13 +86,21 @@ def test_an_empty_schema_is_not_reported_as_arithmetic(result):
     assert "ZeroDivisionError" not in result.output, result.output
 
 
-# Ways of saying "your schema parsed to nothing". A set rather than one literal because
-# the exact wording is not the contract; SAYING IT is. Add to this list if the message is
+# Ways of NAMING THE COUNT as zero. A set rather than one literal because the exact
+# wording is not the contract; stating the count is. Add to this list if the message is
 # reworded -- do not delete the check.
-_SAYS_THERE_WERE_NO_FIELDS = ("no fields", "0 fields", "zero fields", "empty")
+#
+# "empty" was in this list and has been removed: it is a word about the FILE, not a
+# statement of the field count, and it appears in the follow-up advice ("check the file is
+# not empty") independently of whether the count is ever reported. With it present, a
+# message rewritten to "Nothing to match. Check the file is not empty..." -- which never
+# tells the user how many fields came out of their schema -- passed this test while the
+# docstring below claimed the count was what was being checked. Every phrase here must be
+# a count, so that losing the count loses the test.
+_NAMES_THE_FIELD_COUNT_AS_ZERO = ("no fields", "0 fields", "zero fields")
 
 
-def test_the_message_says_the_schema_produced_no_fields(result):
+def test_the_message_names_the_field_count_as_zero(result):
     """
     A guard that swallows the error silently would pass the test above and help nobody.
 
@@ -100,10 +108,11 @@ def test_the_message_says_the_schema_produced_no_fields(result):
     progress spinner prints "Matching schema..." on the way past -- so that assertion is
     satisfied even by `Error: division by zero`, which is precisely the useless message
     this entry exists to keep out. The discriminating fact is the field COUNT, because
-    that is the one thing the user can go and check.
+    that is the one thing the user can go and check, and it is what this test asserts:
+    the output has to state, in some wording, that the count was zero.
     """
     lowered = result.output.lower()
-    assert any(phrase in lowered for phrase in _SAYS_THERE_WERE_NO_FIELDS), (
+    assert any(phrase in lowered for phrase in _NAMES_THE_FIELD_COUNT_AS_ZERO), (
         f"the output never tells the user their schema parsed to zero fields, so there is "
         f"nothing in it to act on:\n{result.output}"
     )

@@ -180,6 +180,52 @@ class BagOfTokensProvider:
         return _stack(texts)
 
 
+class CountingProvider(BagOfTokensProvider):
+    """
+    The same encoder, plus a record of every text it was actually asked to encode.
+
+    ## Why the result of a sync cannot tell you whether the sync was incremental
+
+    `sync()` exists for exactly one reason: to not recompute vectors that did not change.
+    A `sync` that re-embedded all 100k rows to apply one edit would produce an index that
+    is CORRECT -- same entries, same hashes, bit-identical vectors -- and therefore
+    indistinguishable, by any assertion about the resulting index, from the sync we want.
+    `test_sync_state_machine`'s "incremental == full rebuild" invariant is precisely the
+    invariant a full rebuild satisfies best. The missing dimension is WORK DONE, and this
+    is the only place it is observable.
+
+    What a user feels when this breaks: a daily glossary sync that took milliseconds now
+    takes minutes, because the first edit to any column turned it into a full re-embed.
+
+    This counts CALLS AND TEXTS, never elapsed time. Wall-clock here would be void --
+    other agents run concurrently and H-007 measured a 30.6% throughput band on identical
+    code under load. A count of texts encoded is exact, deterministic, and contention-immune.
+    """
+
+    def __init__(self) -> None:
+        self.embedded: list[str] = []
+
+    def embed(self, texts: Any) -> Result:
+        recorded = list(texts)
+        self.embedded.extend(recorded)
+        return super().embed(recorded)
+
+    def embed_single(self, text: str) -> Result:
+        self.embedded.append(text)
+        return super().embed_single(text)
+
+    def embed_documents(self, texts: Any) -> np.ndarray:
+        recorded = list(texts)
+        self.embedded.extend(recorded)
+        return super().embed_documents(recorded)
+
+    def take(self) -> list[str]:
+        """Everything encoded since the last `take`, in call order, and reset."""
+        taken = self.embedded
+        self.embedded = []
+        return taken
+
+
 def _stack(texts: Any) -> np.ndarray:
     rows = [encode(t) for t in texts]
     if not rows:

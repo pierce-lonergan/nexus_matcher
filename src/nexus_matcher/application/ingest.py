@@ -743,8 +743,26 @@ def content_hash(entry: DictionaryEntry) -> str:
     audit field like `last_reviewed_by` would invalidate the vector and the first such
     edit would turn an incremental sync into a full re-embed -- the exact cost this
     exists to avoid. Only fields that change the embedding belong here.
+
+    DERIVED FROM THE EMBEDDED TEXT ITSELF, not from a hand-listed subset of fields.
+
+    It used to join business_name, logical_name and definition -- but
+    `to_searchable_text()` ALSO embeds `synonyms`. So editing an entry's synonyms changed
+    the text that got encoded while leaving this hash untouched, and `sync()` reported
+    success over a vector that no longer matched its entry. A stale vector is the worst
+    outcome this function can produce: nothing errors, the report says the row is
+    unchanged, and the entry quietly stops matching what it says it matches.
+
+    Two hand-maintained lists of "the fields that matter" cannot be kept in step by
+    discipline; they diverge the first time somebody adds a field to one of them. Hashing
+    the embedded string means the question "does this field affect the embedding?" has
+    exactly one answer, in exactly one place.
+
+    The audit-field guarantee is unchanged and now stronger, because it follows from the
+    definition rather than from remembering to exclude things: a column that does not
+    reach `to_searchable_text()` cannot reach this hash.
     """
-    payload = "\x1f".join((entry.business_name, entry.logical_name, entry.definition))
+    payload = entry.to_searchable_text()
     return hashlib.blake2b(payload.encode("utf-8"), digest_size=16).hexdigest()
 
 

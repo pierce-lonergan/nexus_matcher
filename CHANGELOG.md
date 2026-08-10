@@ -14,6 +14,15 @@ that it came from. Numbers without an artifact are not stated.
 
 ### Fixed
 
+- **NM-0024 — a vector went stale while `sync` reported the row unchanged.** `content_hash`
+  hashed a hand-written list of three fields, but `DictionaryEntry.to_searchable_text()`
+  embedded those three *and* `synonyms`. Editing an entry's synonyms changed the text that
+  got encoded while leaving the hash untouched, so the row was skipped and its stored vector
+  silently stopped matching it — no error, and the report said "unchanged". The hash is now
+  derived *from* the embedded text, so the two cannot drift; a field that never reaches
+  `to_searchable_text()` still cannot invalidate a vector, which is the guarantee that keeps
+  an audit-column edit from turning every incremental sync into a full re-embed.
+
 - **NM-0020 — ranking depended on `PYTHONHASHSEED`.** Fusion iterated a set, so the order
   of tied candidates changed with how the interpreter was started. With a measured margin
   of 0.0024 cosine between the correct entry and the nearest wrong one, ties are the normal

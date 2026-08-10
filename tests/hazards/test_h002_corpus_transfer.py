@@ -43,10 +43,17 @@ ledger = pytest.importorskip("optimization_ledger", reason="benchmarks/ not impo
 # =============================================================================
 
 
-def _quality(*, n_entries: int, n_queries: int = 40, digest: str = "d0", corpus: str = "real"):
+def _quality(
+    *,
+    n_entries: int,
+    n_queries: int = 40,
+    digest: str = "d0",
+    corpus: str = "real",
+    benchmark: str = "combined",
+):
     correct = [1] * (n_queries // 2) + [0] * (n_queries - n_queries // 2)
     return ledger.QualityMetrics(
-        benchmark="combined",
+        benchmark=benchmark,
         corpus=corpus,
         n_queries=n_queries,
         n_entries=n_entries,
@@ -202,6 +209,34 @@ def test_the_digest_notices_a_relabelled_corpus_of_the_same_shape():
     )
 
 
+def test_the_digest_notices_a_different_entry_SET_behind_identical_queries():
+    """
+    The other half of the fingerprint, and the half the query loop cannot stand in for.
+
+    Only an ENTRY id moves here: the query set, including every gold_id, is left exactly
+    as it was. A digest built from queries and gold ids alone therefore cannot see this,
+    and two glossaries that share a query set but index different columns -- the ordinary
+    result of re-exporting a dictionary -- would compare as the same corpus and their P@1s
+    would be diffed. The searchable content is what P@1 is a property of; the questions
+    are not.
+    """
+    ds = ledger._synthetic_dataset(30)
+    before = ledger.corpus_digest(ds)
+    gold_ids_before = sorted(str(q.gold_id) for q in ds.queries)
+
+    ds.entries[0] = dataclasses.replace(ds.entries[0], id=str(ds.entries[0].id) + "::reexport")
+
+    assert sorted(str(q.gold_id) for q in ds.queries) == gold_ids_before, (
+        "the fixture perturbed the queries too, so this test would also pass on a digest "
+        "that ignores entries entirely. It has to isolate the entry contribution."
+    )
+    assert ledger.corpus_digest(ds) != before, (
+        "the digest is blind to WHICH ENTRIES the corpus contains. Two corpora with "
+        "identical queries and different entries fingerprint the same, so compare() would "
+        "diff a 4598-column glossary against a re-exported one and call the delta a result."
+    )
+
+
 # =============================================================================
 # 2. A CROSS-CORPUS COMPARISON IS REFUSED
 # =============================================================================
@@ -226,6 +261,36 @@ def test_comparing_688_entries_against_30000_is_refused():
     assert "688" in message and "30000" in message, (
         f"the refusal does not say WHICH corpora were involved, so the reader cannot act "
         f"on it:\n{message}"
+    )
+
+
+@pytest.mark.parametrize("other", ["omop", "bird"])
+def test_a_result_from_one_benchmark_is_refused_against_another(other):
+    """
+    Different corpus, same shape: the case the SIZE check structurally cannot reach.
+
+    fhir, omop and bird are three different vocabularies. Nothing stops two of them from
+    happening to agree on entry count and query count -- `--limit` alone will arrange
+    that -- and at that point the benchmark NAME is the only field left that knows these
+    are different tasks. Both records here carry an empty digest, which is what every
+    record written before that field existed carries, so the name is not merely the first
+    line of defence, it is the last one.
+
+    Concretely: `auto_approve_threshold = 0.87` was calibrated on fhir. Diffing an fhir
+    baseline against an omop candidate reports the corpus change as if it were the code
+    change, and the threshold travels.
+    """
+    fhir = _record("0.87 calibrated on fhir", n_entries=4598, benchmark="fhir", digest="")
+    rival = _record(f"same threshold on {other}", n_entries=4598, benchmark=other, digest="")
+
+    with pytest.raises(ledger.CorpusMismatch) as exc:
+        ledger.compare(fhir, rival, target="p_at_1")
+
+    message = str(exc.value)
+    assert "benchmark" in message, message
+    assert "fhir" in message and other in message, (
+        f"the refusal does not name the two benchmarks, so a reader cannot tell which "
+        f"corpora were crossed:\n{message}"
     )
 
 

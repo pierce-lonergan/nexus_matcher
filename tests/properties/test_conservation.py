@@ -137,7 +137,12 @@ def test_every_field_produces_exactly_one_result(names, shapes, entries):
         f"the result dict inherits no protection level and nothing raised. "
         f"Names: {[f.source_metadata.get('flattened_name', f.name) for f in fields]!r}"
     )
-    assert len(set(results)) == len(fields), "two fields share one output key"
+    # There is deliberately no separate "keys are unique" assertion here. `_match_fields`
+    # returns a dict, so its keys are unique by construction and `len(set(results)) ==
+    # len(fields)` would be re-stating the line above -- a tautology that reads as a third
+    # of this test's coverage while being incapable of failing. Key COLLISION is what the
+    # count above detects (two fields landing on one key leave one result short); key
+    # ADDRESSABILITY is `test_every_key_is_the_callers_own_name`.
 
     for (key, matches), field in zip(results.items(), fields, strict=True):
         for match in matches:

@@ -23,6 +23,13 @@ going missing is a real regression:
 Symptom 2 matters on its own: the error-handler backstop turns an unencodable character
 into visible escape text rather than an exception, so losing the glyph fallback alone
 would not crash -- it would just print gibberish, pass symptom 1, and look fine.
+
+One test here is NOT a regression gate, and its name says so: the `test_premise_guard_*`
+test asserts stdlib codec facts, so no change to `nexus_matcher` can make it fail. Nobody
+should count it as coverage of the fix. It guards the PREMISE the real gates rest on --
+that the code pages they run under genuinely cannot encode the glyphs -- and it fails on
+an edit to THIS FILE that would otherwise make every gate in it pass without exercising
+the fix at all.
 """
 
 from __future__ import annotations
@@ -98,6 +105,16 @@ cli.app()
 """
 
 
+# The code pages every test in this file runs the CLI under. These are the ONLY literals:
+# the premise guard below and the parametrized gates read the same names, so re-pointing
+# the tests at a code page that can encode the glyphs -- which would make every gate here
+# pass while exercising none of the fix -- turns the premise guard red instead of quietly
+# going green. Before this was shared, the guard held its own private copy and saw nothing.
+_CP437 = "cp437"  # the DOS default: no Braille spinner frames, no U+2022 bullet
+_DOS_CODE_PAGES = (_CP437, "cp850")  # true DOS pages -- U+2022 is absent from both
+_LEGACY_CODE_PAGES = (*_DOS_CODE_PAGES, "cp1252")  # + Windows ANSI, which does carry U+2022
+
+
 @pytest.fixture(scope="module")
 def child_script(tmp_path_factory):
     script = tmp_path_factory.mktemp("nm0001") / "legacy_console_child.py"
@@ -116,8 +133,15 @@ def cli_inputs(tmp_path_factory):
     return schema, dictionary
 
 
-def _run(child_script, argv, encoding="cp437", columns="80", field_path=None):
+def _run(child_script, argv, encoding=_CP437, columns="80", field_path=None):
     """Run the shipped CLI in a child whose stdout genuinely uses `encoding`."""
+    # A code page the premise guard never checked could turn out to encode the glyphs, and
+    # then this run proves nothing while still reporting a pass. Refuse rather than let a
+    # gate go quietly vacuous; adding a code page means adding it to the guarded tuple.
+    assert encoding in _LEGACY_CODE_PAGES, (
+        f"{encoding} is not covered by the premise guard -- add it to _LEGACY_CODE_PAGES "
+        f"so the guard proves it really rejects the glyphs before any gate runs under it"
+    )
     env = dict(os.environ)
     env["PYTHONIOENCODING"] = encoding
     env["PYTHONUTF8"] = "0"  # UTF-8 mode would hand the child a utf-8 stdout regardless
@@ -146,21 +170,33 @@ def _assert_no_codec_failure(code, text):
     assert code == 0, f"the command exited {code} on a legacy code page:\n{text}"
 
 
-def test_the_chosen_code_pages_really_reject_the_glyphs():
+def test_premise_guard_the_code_pages_under_test_reject_the_glyphs():
     """
-    Guards the guards. If cp437 ever gained a Braille spinner frame, every test below
-    would start passing for a reason that has nothing to do with the fix.
+    PREMISE GUARD, NOT A REGRESSION GATE. Nothing in `nexus_matcher` can turn this red.
+
+    It asserts a fact about the stdlib codecs -- that every code page the tests below run
+    under really cannot encode the glyphs -- and it is here because every one of those
+    tests is worthless if that stops being true. Do not count it as coverage of NM-0001;
+    the gates are the `*_completes_on_a_legacy_code_page` tests and the escape-text test.
+
+    What it WOULD catch, and the reason it exists: an edit to this file that re-points the
+    code page tuples above at something that can encode the glyphs -- `utf-8`, or a future
+    code page that gained a Braille frame. Every gate below would then run on a stream that
+    never had the problem, pass without exercising a single line of the fix, and report the
+    same green as today. That edit makes this test fail, which is the only warning anyone
+    would get. It reads the SAME tuples the gates are parametrized from, deliberately: when
+    it kept a private copy of the code page names, the swap sailed straight past it.
     """
-    for encoding in ("cp437", "cp850", "cp1252"):
+    for encoding in _LEGACY_CODE_PAGES:
         codecs.lookup(encoding)
         with pytest.raises(UnicodeEncodeError):
             "⠋".encode(encoding)  # frame 0 of Rich's default "dots" spinner
-    for encoding in ("cp437", "cp850"):
+    for encoding in _DOS_CODE_PAGES:
         with pytest.raises(UnicodeEncodeError):
             "•".encode(encoding)  # the bullet `info` prints
 
 
-@pytest.mark.parametrize("encoding", ["cp437", "cp850", "cp1252"])
+@pytest.mark.parametrize("encoding", _LEGACY_CODE_PAGES)
 def test_match_completes_on_a_legacy_code_page(child_script, cli_inputs, encoding):
     """The headline symptom: results, not a codec error, on a real DOS/ANSI console."""
     schema, dictionary = cli_inputs
@@ -171,7 +207,7 @@ def test_match_completes_on_a_legacy_code_page(child_script, cli_inputs, encodin
     assert "Summary" in text, text
 
 
-@pytest.mark.parametrize("encoding", ["cp437", "cp850", "cp1252"])
+@pytest.mark.parametrize("encoding", _LEGACY_CODE_PAGES)
 def test_sync_completes_on_a_legacy_code_page(child_script, cli_inputs, encoding):
     """`sync` additionally signs off with U+2713, which all three code pages reject."""
     _, dictionary = cli_inputs
@@ -180,7 +216,7 @@ def test_sync_completes_on_a_legacy_code_page(child_script, cli_inputs, encoding
     assert "Sync Statistics" in text, text
 
 
-@pytest.mark.parametrize("encoding", ["cp437", "cp850"])
+@pytest.mark.parametrize("encoding", _DOS_CODE_PAGES)
 def test_info_completes_on_a_dos_code_page(child_script, encoding):
     """
     `info` was first reported as unaffected. That is only true on cp1252, which happens
@@ -200,7 +236,7 @@ def test_info_prints_readable_text_not_escape_sequences(child_script):
     kept only the error handler and dropped the glyph fallback would still exit 0 while
     showing the user escape codes where the panel used to be.
     """
-    code, text = _run(child_script, ["info"], encoding="cp437")
+    code, text = _run(child_script, ["info"], encoding=_CP437)
     _assert_no_codec_failure(code, text)
     assert "\\u" not in text, (
         f"`info` rendered unencodable characters as escape text instead of choosing "
@@ -221,7 +257,7 @@ def test_match_survives_truncation_on_a_narrow_legacy_console(child_script, cli_
     code, text = _run(
         child_script,
         ["match", str(schema), "-d", str(dictionary)],
-        encoding="cp437",
+        encoding=_CP437,
         columns="40",
         field_path="customer.contact.preferences.email_address_primary",
     )
