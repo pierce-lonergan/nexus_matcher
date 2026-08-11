@@ -566,20 +566,37 @@ Being explicit, because earlier versions of this document were not.
 **CLI** (`nexus-matcher`, entry point `nexus_matcher.presentation.cli.main:app`) — four
 commands: `match`, `sync`, `api`, `info`.
 
-**REST API** (`nexus_matcher.presentation.api.app:create_app`) — health and
-introspection endpoints **only**:
+**REST API** (`nexus_matcher.presentation.api.app:create_app`) — the complete route
+table, enumerated from a live app:
 
-| Method | Path |
-|---|---|
-| GET | `/` |
-| GET | `/health` |
-| GET | `/health/live` |
-| GET | `/health/ready` |
-| GET | `/health/startup` |
-| GET | `/docs`, `/redoc`, `/openapi.json` |
+| Method | Path | What it serves |
+|---|---|---|
+| POST | `/api/v1/match` | Up to 100 schema fields; returns the ranked dictionary entries and the protection class each field would inherit |
+| POST | `/api/v1/match/batch` | The same contract with a 250-field cap, for chunked clients |
+| POST | `/api/v1/feedback` | Appends a reviewer's verdict to an audit log. Recorded, never fed back into ranking |
+| GET | `/` | Service identity |
+| GET | `/health` | Health check |
+| GET | `/health/live` | Kubernetes liveness probe |
+| GET | `/health/ready` | Readiness probe (503 if a registered component is not ready) |
+| GET | `/health/startup` | Startup probe (503 while starting) |
+| GET | `/docs`, `/redoc`, `/openapi.json` | Generated OpenAPI documentation |
 
-There is **no** HTTP matching endpoint, no dictionary CRUD endpoint, no cache endpoint,
-and no `/metrics` endpoint. Matching over HTTP is not implemented. See
+The two match routes answer **503** until a dictionary is loaded, and `/api/v1/feedback`
+answers **503** until a feedback file is configured; each 503 names the setting to change.
+Both shipped ways to start the server call `create_app()` with no arguments, so the wiring
+is environment-driven: `NEXUS_API_DICTIONARY` and `NEXUS_API_GOVERNANCE` for matching,
+`NEXUS_API_FEEDBACK_PATH` for recording. The wire contract, an operator's start command and
+a verified request and response are in
+[docs/GOVERNANCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/GOVERNANCE.md#matching-over-http);
+[examples/governance/serve.sh](https://github.com/pierce-lonergan/nexus_matcher/blob/main/examples/governance/serve.sh)
+starts a server over the example pack in one command.
+
+There are still no dictionary CRUD endpoints, no cache endpoints and no `/metrics`
+endpoint. Earlier revisions of this section denied that the three `/api/v1` routes
+existed, in nine places across the documentation, while `create_app()` registered them;
+that claim is retracted and
+[tests/packaging/test_documented_routes.py](https://github.com/pierce-lonergan/nexus_matcher/blob/main/tests/packaging/test_documented_routes.py)
+now fails the build in both directions. See
 [docs/API_REFERENCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/API_REFERENCE.md).
 
 **Schema parsers**: Avro, JSON Schema, SQL DDL. (`from_config()` registers Avro only;
@@ -644,7 +661,8 @@ observed to fail intermittently under load.
 ## Documentation
 
 - [QUICKSTART.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/QUICKSTART.md) — the verified five-minute path
-- [docs/API_REFERENCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/API_REFERENCE.md) — Python, CLI, and the (health-only) REST surface
+- [docs/API_REFERENCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/API_REFERENCE.md) — the Python, CLI and REST surfaces
+- [docs/GOVERNANCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/GOVERNANCE.md) — governance inheritance, and the matching endpoint's wire contract
 - [docs/BENCHMARK_REGISTRY.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/BENCHMARK_REGISTRY.md) — every benchmark run, with its artifact or an explicit note that it has none
 - [docs/ARCHITECTURE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/ARCHITECTURE.md) — hexagonal layering and component wiring
 - [docs/ENHANCEMENT_JOURNEY.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/ENHANCEMENT_JOURNEY.md) — what was changed and what it measured

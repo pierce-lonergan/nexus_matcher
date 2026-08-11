@@ -68,9 +68,21 @@ ENV NEXUS_ENV=production \
     NEXUS_SERVER_HOST=0.0.0.0 \
     NEXUS_SERVER_PORT=8000
 
-# Health check
+# Health check.
+#
+# /health/ready, NOT /health. `/health` answers HTTP 200 with `status: "degraded"` when
+# the dictionary failed to load, so `curl -f` passes and the container reports healthy
+# while every POST /api/v1/match answers 503 - which is how a bad deploy gets through a
+# rollout gate. /health/ready returns 503 for that state and names the red component in
+# the body.
+#
+# A container with no NEXUS_API_DICTIONARY is therefore unhealthy, deliberately: it
+# serves the matching routes and cannot answer them. A health-and-introspection
+# deployment sets NEXUS_API_MATCHING_OPTIONAL=true to say so. That variable is NOT set
+# here - defaulting the image to the exemption would put every deployment back where it
+# started.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/health/ready || exit 1
 
 # Expose port
 EXPOSE 8000

@@ -10,9 +10,10 @@ Structural reference for the layering, ports, adapters and wiring.
 >
 > Two specific corrections to keep in mind while reading:
 >
-> - **There is no `POST /match` endpoint.** The REST app serves health and
->   introspection routes only. The "request flow" in §4.1 describes the in-process
->   library call path; the client/API columns are aspirational.
+> - **The matching endpoints are `/api/v1/match`, `/api/v1/match/batch` and
+>   `/api/v1/feedback`**, not the `POST /match` and `POST /batch` earlier revisions of
+>   this document described and then denied. §4.1 is the shipped flow. The `/dictionary`
+>   CRUD routes still do not exist.
 > - **The multi-layer cache is not wired into the matching pipeline.** L1/L2/L3 cache
 >   adapters exist and are unit-tested, but `NexusMatcher` does not consult them. §6.1
 >   is a design sketch.
@@ -140,14 +141,17 @@ def create_app() -> FastAPI:
     return app
 ```
 
-> The factory sketch above is **not** the shipped `create_app()`. The real one registers
-> a health router only, adds request-ID middleware, CORS and exception handlers, and does
-> not use the DI container.
+> The factory sketch above is **not** the shipped `create_app()`. The real one registers a
+> health router, a matching router and a feedback router, adds request-ID middleware, CORS
+> and exception handlers, and does not use the DI container.
 
 **Endpoints that exist** (enumerated from a live `create_app()`):
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|
+| `/api/v1/match` | POST | Match schema fields; each candidate carries the protection class it would confer |
+| `/api/v1/match/batch` | POST | The same service and the same projection, at a higher field cap |
+| `/api/v1/feedback` | POST | Append a reviewer's verdict to an audit log |
 | `/` | GET | Service identity |
 | `/health` | GET | Health check |
 | `/health/live` | GET | Kubernetes liveness probe |
@@ -155,9 +159,12 @@ def create_app() -> FastAPI:
 | `/health/startup` | GET | Startup probe (503 while starting) |
 | `/docs`, `/redoc`, `/openapi.json` | GET | Generated OpenAPI docs |
 
-**Endpoints that do NOT exist**, despite appearing in earlier revisions of this table:
-`POST /match`, `POST /batch`, and all `/dictionary` CRUD routes. Matching over HTTP is
-not implemented — the planned request flow is kept in §4.1 as a design target.
+The matching routes live in `presentation/api/matching.py` and share one `MatchService`, so
+the two cannot drift apart; admission control and the server-side deadline
+(`presentation/api/limits.py`) sit between the handler and the matcher's thread pool.
+
+The `/dictionary` CRUD routes appearing in earlier revisions of this table still do not
+exist. `POST /match` and `POST /batch` do — under `/api/v1`.
 
 #### 2.1.2 CLI (`presentation/cli/`)
 
@@ -943,40 +950,40 @@ class ColBERTMaxSimReranker:
 
 ## 4. Data Flow
 
-### 4.1 Match Request Flow (DESIGN TARGET — no HTTP matching endpoint exists today)
+### 4.1 Match Request Flow
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────┐
-│                              REQUEST FLOW                                     │
+│                              REQUEST FLOW                                    │
 │                                                                              │
 │   Client                API Layer              Application Layer             │
 │     │                      │                         │                       │
-│     │  POST /match         │                         │                       │
+│     │  POST /api/v1/match  │                         │                       │
 │     │─────────────────────▶│                         │                       │
 │     │                      │                         │                       │
 │     │                      │  Validate Request       │                       │
 │     │                      │──────────────────────┐  │                       │
 │     │                      │◀─────────────────────┘  │                       │
 │     │                      │                         │                       │
-│     │                      │  MatchSchemaUseCase    │                       │
+│     │                      │  MatchService.match     │                       │
 │     │                      │────────────────────────▶│                       │
 │     │                      │                         │                       │
-│     │                      │                         │  Parse Schema         │
+│     │                      │                         │  Match every field    │
 │     │                      │                         │───────────────┐       │
 │     │                      │                         │◀──────────────┘       │
 │     │                      │                         │                       │
 │     │                      │                         │  For each field:      │
 │     │                      │                         │  ┌─────────────────┐  │
 │     │                      │                         │  │ 1. Enrich query │  │
-│     │                      │                         │  │ 2. Check cache  │  │
-│     │                      │                         │  │ 3. Embed query  │  │
-│     │                      │                         │  │ 4. Search       │  │
-│     │                      │                         │  │ 5. Rerank       │  │
-│     │                      │                         │  │ 6. Score        │  │
-│     │                      │                         │  │ 7. Cache result │  │
+│     │                      │                         │  │ 2. Embed query  │  │
+│     │                      │                         │  │ 3. Retrieve     │  │
+│     │                      │                         │  │ 4. Fuse + score │  │
+│     │                      │                         │  │ 5. Rerank (opt) │  │
+│     │                      │                         │  │ 6. Governance   │  │
+│     │                      │                         │  │ 7. Decide       │  │
 │     │                      │                         │  └─────────────────┘  │
 │     │                      │                         │                       │
-│     │                      │  MatchResponse          │                       │
+│     │                      │  MatchResult tuples     │                       │
 │     │                      │◀────────────────────────│                       │
 │     │                      │                         │                       │
 │     │  JSON Response       │                         │                       │
@@ -984,6 +991,22 @@ class ColBERTMaxSimReranker:
 │                                                                              │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
+
+Three things the boxes flatten, all of them load-bearing:
+
+- **Nothing is parsed here.** The caller sends fields, not a schema file; `FieldSpec` is
+  the wire type and `_to_schema_field` builds the domain object. Schema parsing is the
+  CLI's and the library's path, not the endpoint's.
+- **The matcher does not run on the event loop.** `run_bounded` admits the call into a
+  bounded thread pool or sheds it with a **503**, and answers **504** if the server-side
+  deadline fires first. Matching is CPU-bound, so without this a single large request
+  would block `/health/live` in the same process.
+- **The response is checked before it is sent.** `_project_results` asserts one result key
+  per input field, each computed for the field it is keyed by, and refuses the response
+  rather than returning it short — a field missing from the map would inherit no
+  governance and nothing would say so.
+
+No cache is consulted anywhere in this path; see the note at the top of this document.
 
 ### 4.2 Indexing Flow
 

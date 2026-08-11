@@ -1,0 +1,8 @@
+id: NM-0028
+symptom: "a glossary row whose stated tier contradicts its own protection code is indexed anyway, so a field inherits a classification its code disowns"
+severity: CRITICAL
+fixed_in: 2.1.0
+gate_that_should_have_caught_it: "none -- the tier was free text, so there was nothing for a row to contradict and no check could exist"
+gate_that_catches_it_now: "tests/museum/NM-0028/test_nm_0028.py, plus tests/unit/domain/test_governance.py and tests/unit/application/test_governance_ingest.py"
+touches:
+  - src/nexus_matcher/domain/governance.py

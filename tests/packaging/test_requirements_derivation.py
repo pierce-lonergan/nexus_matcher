@@ -482,6 +482,27 @@ def test_there_are_museum_entries_to_check():
     )
 
 
+def _staged_section() -> str:
+    """`[Unreleased]` plus the newest version section -- everything not yet published.
+
+    Both are "staged": collecting Unreleased into a version heading to cut a release does
+    not publish it, and until it is published its entries are still defects whose record
+    is being written. Reading only `[Unreleased]` is what made the check below vacuous.
+    """
+    text = _changelog()
+    newest = re.search(r"^##\s*\[?([0-9]+\.[0-9]+\.[0-9]+)\]?", text, re.M)
+    if newest is None:
+        return _unreleased_section()
+    body = text[newest.end() :]
+    end = re.search(r"^##\s", body, re.M)
+    return _unreleased_section() + (body if end is None else body[: end.start()])
+
+
+def _staged_versions() -> set[str]:
+    newest = re.search(r"^##\s*\[?([0-9]+\.[0-9]+\.[0-9]+)\]?", _changelog(), re.M)
+    return {"unreleased"} | ({newest.group(1).lower()} if newest else set())
+
+
 def test_every_defect_fixed_since_the_last_release_is_in_the_changelog():
     """
     A museum entry is a defect that reached a user. If it was fixed after the last
@@ -491,18 +512,34 @@ def test_every_defect_fixed_since_the_last_release_is_in_the_changelog():
 
     The check is on the ID, deliberately. Prose can describe a fix without being
     traceable back to the replay that proves it stays fixed; an id is checkable.
+
+    "Since the last release" is computed, not spelled. The first cut matched the literal
+    string `unreleased`, which was correct only while staged work sat under
+    `[Unreleased]`. Collecting ten entries into `## [2.1.0]` to cut the release changed
+    every `fixed_in` to a version, the filter matched nothing, and the gate went green
+    over an EMPTY LIST -- passing not because the record was complete but because it had
+    stopped looking. The non-vacuity assertion below is the part that would have caught
+    that, and it is why it is an assertion rather than a comment.
     """
-    unreleased_ids = sorted(
+    staged = _staged_versions()
+    staged_ids = sorted(
         museum_id
         for museum_id, fixed_in in _museum_entries().items()
-        if fixed_in.lower() == "unreleased"
+        if fixed_in.strip().strip('"').lower() in staged
     )
-    section = _unreleased_section()
-    undocumented = [museum_id for museum_id in unreleased_ids if museum_id not in section]
+
+    assert staged_ids, (
+        "this check just ran over zero museum entries, so it asserted nothing. Either no "
+        "defect was fixed for the staged release -- unlikely -- or `fixed_in` no longer "
+        f"uses any of {sorted(staged)}. Fix the scoping rule; do not delete this assertion."
+    )
+
+    section = _staged_section()
+    undocumented = [museum_id for museum_id in staged_ids if museum_id not in section]
     assert not undocumented, (
         "these defects were fixed since the last release and appear nowhere in the "
-        f"CHANGELOG's Unreleased section: {undocumented}\n"
-        "Add a line naming each id under `## [Unreleased]`, in the form\n"
+        f"CHANGELOG's staged section: {undocumented}\n"
+        "Add a line naming each id, in the form\n"
         f"  - **{undocumented[0]}** -- <the symptom, from its defect.yaml>."
     )
 

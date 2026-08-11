@@ -385,6 +385,96 @@ def check_readme_links(report: Report) -> None:
         report.ok("README has no relative links")
 
 
+def check_no_confidential_terms_in_artifacts(wheel: Path, report: Report) -> None:
+    """
+    Confidential vocabulary must not be inside the distributed artifact.
+
+    tests/meta/test_no_confidential_terms.py scans the working tree, which is the right
+    place to stop a leak being committed. It is the wrong place to stop one being
+    *published*: what reaches PyPI is the wheel, and the wheel's contents are decided by
+    packaging config, not by what the tree happens to contain. A file can be excluded
+    from git and still be built in.
+
+    That distinction is not hypothetical here. The comment naming the employer and
+    business unit above DEFAULT_HIERARCHY_DATA shipped inside the 2.0.0 and 2.0.1
+    wheels. Once a wheel is on PyPI it cannot be edited -- only yanked, which leaves the
+    files downloadable. So this runs on the built artifact, before upload, where the
+    finding is still free.
+
+    The sdist is checked as well as the wheel, and not as an afterthought: it carries
+    tests/ and docs/, which the wheel does not, so it is a strictly larger surface. The
+    first run of this check found four real terms that the tree scan could not see --
+    they were in the scanner's own docstrings, under a path exemption the scanner
+    granted itself. Two artifacts with different contents are two chances to notice.
+    """
+    import tarfile
+    import zipfile
+
+    label = "Artifacts have no confidential terms"
+
+    sys.path.insert(0, str(REPO / "tests" / "meta"))
+    try:
+        from test_no_confidential_terms import (  # type: ignore
+            _blocklist,
+            _blocklist_for,
+            scan_text,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        report.fail(label, f"scanner unavailable: {exc}")
+        return
+    finally:
+        sys.path.pop(0)
+
+    if not _blocklist():
+        report.fail(label, "blocklist empty; check is vacuous")
+        return
+
+    text_like = (".py", ".md", ".txt", ".json", ".yaml", ".yml", ".cfg", ".toml", ".rst")
+    skip_names = ("tokenizer.json", "vocab.txt", "tokenizer_config.json", "special_tokens_map.json")
+
+    def wanted(name: str) -> bool:
+        return name.lower().endswith(text_like) and Path(name).name not in skip_names
+
+    def repo_relative(name: str, is_sdist: bool) -> str:
+        """Map an archive member back to its repo path, so exemptions line up."""
+        return name.split("/", 1)[-1] if is_sdist and "/" in name else name
+
+    def members(artifact: Path):
+        """Yield (archive_name, text) for every text member of a wheel or sdist."""
+        if artifact.suffix == ".whl":
+            with zipfile.ZipFile(artifact) as zf:
+                for info in zf.infolist():
+                    if wanted(info.filename):
+                        yield info.filename, zf.read(info).decode("utf-8", "ignore")
+        else:
+            with tarfile.open(artifact) as tf:
+                for m in tf.getmembers():
+                    if m.isfile() and wanted(m.name):
+                        fh = tf.extractfile(m)
+                        if fh is not None:
+                            yield m.name, fh.read().decode("utf-8", "ignore")
+
+    artifacts = [wheel]
+    sdists = sorted(wheel.parent.glob("*.tar.gz"))
+    artifacts.extend(sdists)
+    if not sdists:
+        report.skip(f"{label} (sdist)", "no sdist built; wheel checked alone")
+
+    findings, scanned = [], 0
+    for artifact in artifacts:
+        is_sdist = artifact.suffix != ".whl"
+        for name, body in members(artifact):
+            scanned += 1
+            blocked = _blocklist_for(repo_relative(name, is_sdist))
+            for line_no, digest in scan_text(body, blocked):
+                findings.append(f"{artifact.name}::{name}:{line_no} (digest {digest})")
+
+    if findings:
+        report.fail(label, f"{len(findings)} hit(s): " + "; ".join(findings[:5]))
+    else:
+        report.ok(f"{label} ({scanned} files across {len(artifacts)} artifact(s))")
+
+
 def check_project_urls(report: Report, skip_network: bool) -> None:
     if skip_network:
         report.skip("Project-URLs resolve", "--skip-network")
@@ -436,6 +526,7 @@ def main() -> int:
         return 1
 
     check_readme_links(report)
+    check_no_confidential_terms_in_artifacts(wheel, report)
     check_project_urls(report, args.skip_network)
 
     # A short temp root: a deep venv path plus numpy's f2py fixtures exceeds MAX_PATH on

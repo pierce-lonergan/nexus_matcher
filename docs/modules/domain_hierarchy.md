@@ -38,7 +38,13 @@ Manage business domain hierarchies and compute domain-based matching scores. Dom
   - get_path(domain: str) → DomainPath
   - find_common_ancestor(d1: str, d2: str) → Domain | None
 
-## Domain Hierarchy (JPMorgan CCB Context)
+## Default Domain Hierarchy (illustrative)
+
+The bundled hierarchy is a generic retail-banking example, not a recommended
+taxonomy. Replace it with your own via `DomainHierarchy.from_dict()` -- domain
+scoring is only meaningful against a hierarchy that reflects your actual data
+model.
+
 
 ```
 ROOT
@@ -96,7 +102,7 @@ ROOT
 - [x] DomainMatch result class
 - [x] DomainHierarchy entity
 - [x] DomainMatcher service
-- [x] Default hierarchy (50+ CCB domains)
+- [x] Default hierarchy (50+ illustrative retail-banking domains)
 - [x] Integration with scoring
 - [x] Unit tests (37 tests)
 - [x] Integration tests (13 tests)

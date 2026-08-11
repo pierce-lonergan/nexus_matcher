@@ -172,3 +172,55 @@ entries/sec, so the 715 originally recorded was the outlier, not the 520.
 **The check:** the ledger measures its own noise floor at run time and refuses to record a
 timing above a CPU-busy threshold, marking it UNMEASURABLE rather than writing down noise.
 Quality metrics measured **0.0%** spread and are exempt.
+
+---
+
+## H-008 — A gate's own exemption list is where its blind spot lives
+
+**Status:** guarded — `tests/meta/test_no_confidential_terms.py::test_exempt_files_are_exempt_for_the_canary_only`, `::test_no_path_is_exempt_from_everything`
+
+The confidentiality gate was written with a blanket `SKIP_PATHS` entry for itself, on the
+reasoning that a file explaining the gate must be able to discuss the terms. Within the
+same hour, four real confidential terms were written into that file's docstrings as
+worked examples — invisible to the gate, by the gate's own exemption, in the one file
+whose entire purpose was to prevent that.
+
+The reasoning was not wrong; the scope was. The file needed to name **one** term, the
+public canary, to be testable at all. It was granted **all** of them.
+
+This generalises past confidentiality. Every exemption is a claim that a rule does not
+apply somewhere, and the place a rule is felt to be inconvenient is disproportionately the
+place it is needed. The session that produced this ledger found "gate that nothing runs"
+six times and toothless CI steps in five of six lanes; a self-exemption is the same defect
+wearing a justification.
+
+**The check:** exemptions subtract a named term, never a path. A test asserts the exempt
+set differs from the full blocklist by exactly one digest, and a second asserts no blanket
+path skip has been reintroduced.
+
+---
+
+## H-009 — `git ls-files` scans the index, and a leak arrives in the working tree
+
+**Status:** guarded — `tests/meta/test_no_confidential_terms.py::test_scan_covers_untracked_files`
+
+The same gate enumerated files with `git ls-files`, which lists **tracked** files only. A
+newly created file is invisible to it until `git add`. So the gate returned green on a
+working tree that contained a blocked term, and would have kept returning green until the
+author committed — at which point the term is in history, where removal means a rewrite
+rather than an edit.
+
+The window this misses is the worst possible one. A file is most likely to contain a
+pasted term in the minutes after it is written, and that is exactly when it is untracked.
+
+It was caught by accident: the sdist packages the working tree rather than the index, so
+`release_preflight.py` saw a file the tree scan could not. Two scanners over two different
+notions of "the project" disagreed, and the disagreement was the finding — which is the
+argument for keeping both rather than deduplicating them.
+
+**The check:** the scan unions `git ls-files` with `git ls-files --others
+--exclude-standard`, and a test plants an untracked file and asserts it is enumerated.
+
+**Wider read:** any tool that reasons about "the files in this project" has to choose
+between the index, the working tree and the build manifest, and they differ. Check which
+one you got.

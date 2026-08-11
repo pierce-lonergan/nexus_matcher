@@ -1,0 +1,517 @@
+{
+  "environment": {
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "cpu_count": 32,
+    "python": "3.13.4",
+    "numpy": "2.3.5",
+    "onnxruntime": "1.28.0",
+    "measured_utc": "2026-08-11T09:43:39+00:00"
+  },
+  "benchmark": "fhir",
+  "structure": [
+    {
+      "batch_size": 16,
+      "n_batches": 386,
+      "padded_tokens": 254742,
+      "real_tokens": 252168,
+      "padding_ratio": 1.0102074807271344,
+      "rows_per_batch_median": 16,
+      "rows_per_batch_max": 16,
+      "batches_capped_by_rows": 383
+    },
+    {
+      "batch_size": 32,
+      "n_batches": 196,
+      "padded_tokens": 255979,
+      "real_tokens": 252168,
+      "padding_ratio": 1.0151129405792962,
+      "rows_per_batch_median": 32,
+      "rows_per_batch_max": 32,
+      "batches_capped_by_rows": 187
+    },
+    {
+      "batch_size": 64,
+      "n_batches": 107,
+      "padded_tokens": 257095,
+      "real_tokens": 252168,
+      "padding_ratio": 1.0195385615938581,
+      "rows_per_batch_median": 64,
+      "rows_per_batch_max": 64,
+      "batches_capped_by_rows": 82
+    },
+    {
+      "batch_size": 128,
+      "n_batches": 72,
+      "padded_tokens": 258547,
+      "real_tokens": 252168,
+      "padding_ratio": 1.0252966276450621,
+      "rows_per_batch_median": 90,
+      "rows_per_batch_max": 128,
+      "batches_capped_by_rows": 25
+    },
+    {
+      "batch_size": 256,
+      "n_batches": 65,
+      "padded_tokens": 259518,
+      "real_tokens": 252168,
+      "padding_ratio": 1.029147235176549,
+      "rows_per_batch_median": 78,
+      "rows_per_batch_max": 256,
+      "batches_capped_by_rows": 2
+    },
+    {
+      "batch_size": 512,
+      "n_batches": 65,
+      "padded_tokens": 259281,
+      "real_tokens": 252168,
+      "padding_ratio": 1.028207385552489,
+      "rows_per_batch_median": 78,
+      "rows_per_batch_max": 315,
+      "batches_capped_by_rows": 0
+    },
+    {
+      "batch_size": 1024,
+      "n_batches": 65,
+      "padded_tokens": 259281,
+      "real_tokens": 252168,
+      "padding_ratio": 1.028207385552489,
+      "rows_per_batch_median": 78,
+      "rows_per_batch_max": 315,
+      "batches_capped_by_rows": 0
+    },
+    {
+      "batch_size": 4096,
+      "n_batches": 65,
+      "padded_tokens": 259281,
+      "real_tokens": 252168,
+      "padding_ratio": 1.028207385552489,
+      "rows_per_batch_median": 78,
+      "rows_per_batch_max": 315,
+      "batches_capped_by_rows": 0
+    }
+  ],
+  "accuracy": {
+    "n_queries": 1556,
+    "n_entries": 4598,
+    "rows": [
+      {
+        "batch_size": 16,
+        "p_at_1": 0.2879177377892031,
+        "r_at_5": 0.5372750642673522,
+        "mrr": 0.4049421179987957,
+        "identical_ranking_vs_incumbent": false,
+        "queries_with_moved_rank": 883,
+        "gained_at_1": 47,
+        "lost_at_1": 37,
+        "mcnemar_p": 0.32613417119198296
+      },
+      {
+        "batch_size": 32,
+        "p_at_1": 0.2795629820051414,
+        "r_at_5": 0.5392030848329049,
+        "mrr": 0.4004663548152928,
+        "identical_ranking_vs_incumbent": false,
+        "queries_with_moved_rank": 886,
+        "gained_at_1": 45,
+        "lost_at_1": 48,
+        "mcnemar_p": 0.8358461346314852
+      },
+      {
+        "batch_size": 64,
+        "p_at_1": 0.2763496143958869,
+        "r_at_5": 0.5424164524421594,
+        "mrr": 0.3976881444404164,
+        "identical_ranking_vs_incumbent": false,
+        "queries_with_moved_rank": 882,
+        "gained_at_1": 35,
+        "lost_at_1": 43,
+        "mcnemar_p": 0.4282070357175808
+      },
+      {
+        "batch_size": 128,
+        "p_at_1": 0.2782776349614396,
+        "r_at_5": 0.5398457583547558,
+        "mrr": 0.4010248651246458,
+        "identical_ranking_vs_incumbent": false,
+        "queries_with_moved_rank": 879,
+        "gained_at_1": 38,
+        "lost_at_1": 43,
+        "mcnemar_p": 0.6569924675863579
+      },
+      {
+        "batch_size": 256,
+        "p_at_1": 0.2847043701799486,
+        "r_at_5": 0.538560411311054,
+        "mrr": 0.4023903486249206,
+        "identical_ranking_vs_incumbent": false,
+        "queries_with_moved_rank": 840,
+        "gained_at_1": 38,
+        "lost_at_1": 33,
+        "mcnemar_p": 0.6353076420876662
+      },
+      {
+        "batch_size": 512,
+        "p_at_1": 0.2814910025706941,
+        "r_at_5": 0.5334190231362468,
+        "mrr": 0.3996362091202694,
+        "identical_ranking_vs_incumbent": true,
+        "queries_with_moved_rank": 0,
+        "gained_at_1": 0,
+        "lost_at_1": 0,
+        "mcnemar_p": 1.0
+      },
+      {
+        "batch_size": 1024,
+        "p_at_1": 0.2814910025706941,
+        "r_at_5": 0.5334190231362468,
+        "mrr": 0.3996362091202694,
+        "identical_ranking_vs_incumbent": true,
+        "queries_with_moved_rank": 0,
+        "gained_at_1": 0,
+        "lost_at_1": 0,
+        "mcnemar_p": 1.0
+      },
+      {
+        "batch_size": 4096,
+        "p_at_1": 0.2814910025706941,
+        "r_at_5": 0.5334190231362468,
+        "mrr": 0.3996362091202694,
+        "identical_ranking_vs_incumbent": true,
+        "queries_with_moved_rank": 0,
+        "gained_at_1": 0,
+        "lost_at_1": 0,
+        "mcnemar_p": 1.0
+      }
+    ]
+  },
+  "cost": {
+    "threads": {
+      "1": {
+        "noise_band_relative": 0.007288443480013724,
+        "noise_samples": [
+          26.077424999995856,
+          26.26796860000468,
+          26.15847070000018,
+          26.128029299987247
+        ],
+        "cpu_busy_before": 11.7,
+        "cpu_busy_after": 7.2,
+        "rows": [
+          {
+            "batch_size": 16,
+            "best_seconds": 24.297727999975905,
+            "median_seconds": 24.309162499994272,
+            "spread_relative": 0.005090274089546109,
+            "speedup_vs_incumbent": 1.074133725590491,
+            "samples": [
+              24.42146829998819,
+              24.297727999975905,
+              24.309162499994272
+            ]
+          },
+          {
+            "batch_size": 32,
+            "best_seconds": 24.71917569998186,
+            "median_seconds": 24.81796640000539,
+            "spread_relative": 0.012547611475325997,
+            "speedup_vs_incumbent": 1.0558203645932118,
+            "samples": [
+              25.030581899976823,
+              24.81796640000539,
+              24.71917569998186
+            ]
+          },
+          {
+            "batch_size": 64,
+            "best_seconds": 25.34602399999858,
+            "median_seconds": 25.544961699983105,
+            "spread_relative": 0.012087788724627697,
+            "speedup_vs_incumbent": 1.0297082138011064,
+            "samples": [
+              25.544961699983105,
+              25.65480610000668,
+              25.34602399999858
+            ]
+          },
+          {
+            "batch_size": 512,
+            "best_seconds": 26.09900909999851,
+            "median_seconds": 26.17245370001183,
+            "spread_relative": 0.0031419675421104167,
+            "speedup_vs_incumbent": 1.0,
+            "samples": [
+              26.09900909999851,
+              26.181242100021336,
+              26.17245370001183
+            ]
+          }
+        ]
+      },
+      "8": {
+        "noise_band_relative": 0.06241174720686839,
+        "noise_samples": [
+          8.274636499991175,
+          8.521863200003281,
+          8.814390400017146,
+          8.774685100011993
+        ],
+        "cpu_busy_before": 7.8,
+        "cpu_busy_after": 25.3,
+        "rows": [
+          {
+            "batch_size": 16,
+            "best_seconds": 7.969595699978527,
+            "median_seconds": 8.885519500006922,
+            "spread_relative": 0.13328261786226353,
+            "speedup_vs_incumbent": 1.2743254341013661,
+            "samples": [
+              7.969595699978527,
+              8.885519500006922,
+              9.15388100000564
+            ]
+          },
+          {
+            "batch_size": 32,
+            "best_seconds": 7.326588899974013,
+            "median_seconds": 7.37485569997807,
+            "spread_relative": 0.11418996307159125,
+            "speedup_vs_incumbent": 1.3861646447808118,
+            "samples": [
+              7.37485569997807,
+              8.168723400012823,
+              7.326588899974013
+            ]
+          },
+          {
+            "batch_size": 64,
+            "best_seconds": 7.849779799988028,
+            "median_seconds": 9.203946399997221,
+            "spread_relative": 0.21652252342669215,
+            "speedup_vs_incumbent": 1.2937762279654017,
+            "samples": [
+              9.203946399997221,
+              9.842641499999445,
+              7.849779799988028
+            ]
+          },
+          {
+            "batch_size": 512,
+            "best_seconds": 10.155858499987517,
+            "median_seconds": 10.51419860002352,
+            "spread_relative": 0.050541921474369075,
+            "speedup_vs_incumbent": 1.0,
+            "samples": [
+              10.155858499987517,
+              10.687266299995827,
+              10.51419860002352
+            ]
+          }
+        ]
+      }
+    },
+    "trials": 3,
+    "noise_repeats": 4,
+    "_measurable": true,
+    "_machine_state": "taken 11.7%% -> 25.3%% CPU busy; bands 0.7%% (1 thread) and 6.2%% (8 threads) over 4 runs of identical code. Below the 25%% busy threshold at which benchmarks/optimization_ledger.py flags a row, so these are the numbers the decision rests on."
+  },
+  "cost_UNMEASURABLE_busy_machine": {
+    "_why_kept": "H-007: this repo has recorded a false regression from machine state and then got the direction wrong while correcting it, so the discarded run is kept rather than deleted. Taken earlier the same day at 36%-88% CPU busy while another agent was working. Every comparison here is INCONCLUSIVE against its own band, including ones the quiet run resolves cleanly. The point estimates agree in direction with the quiet run (32 fastest, 512/4096 slowest at all three thread counts) but this run certifies NOTHING and no number in it may be quoted.",
+    "_environment": {
+      "platform": "Windows-11-10.0.26200-SP0",
+      "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+      "cpu_count": 32,
+      "python": "3.13.4",
+      "numpy": "2.3.5",
+      "onnxruntime": "1.28.0",
+      "measured_utc": "2026-08-11T09:18:57+00:00"
+    },
+    "threads": {
+      "1": {
+        "noise_band_relative": 0.15313395587263307,
+        "noise_samples": [
+          38.19892809999874,
+          41.40705759997945,
+          39.11706319998484,
+          35.48720579998917
+        ],
+        "cpu_busy_before": 36.0,
+        "cpu_busy_after": 34.0,
+        "rows": [
+          {
+            "batch_size": 32,
+            "best_seconds": 26.16347540001152,
+            "median_seconds": 26.70244249998359,
+            "spread_relative": 0.08825533469419339,
+            "speedup_vs_incumbent": 1.0676962319762011,
+            "samples": [
+              28.520108400000026,
+              26.16347540001152,
+              26.70244249998359
+            ]
+          },
+          {
+            "batch_size": 64,
+            "best_seconds": 27.180311900010565,
+            "median_seconds": 27.41635940002743,
+            "spread_relative": 0.2979354071334456,
+            "speedup_vs_incumbent": 1.0277528897666355,
+            "samples": [
+              27.41635940002743,
+              27.180311900010565,
+              35.348616099974606
+            ]
+          },
+          {
+            "batch_size": 512,
+            "best_seconds": 27.93464409999433,
+            "median_seconds": 28.220169000007445,
+            "spread_relative": 0.28963561486754225,
+            "speedup_vs_incumbent": 1.0,
+            "samples": [
+              28.220169000007445,
+              27.93464409999433,
+              36.10821009997744
+            ]
+          },
+          {
+            "batch_size": 4096,
+            "best_seconds": 28.05683049999061,
+            "median_seconds": 28.269327400019392,
+            "spread_relative": 0.27087250756389414,
+            "speedup_vs_incumbent": 0.9956450390931961,
+            "samples": [
+              28.05683049999061,
+              28.269327400019392,
+              35.71421409997856
+            ]
+          }
+        ]
+      },
+      "8": {
+        "noise_band_relative": 0.16444793229566215,
+        "noise_samples": [
+          13.902206099999603,
+          14.506503799988423,
+          14.139756699994905,
+          12.200782400002936
+        ],
+        "cpu_busy_before": 36.3,
+        "cpu_busy_after": 27.5,
+        "rows": [
+          {
+            "batch_size": 32,
+            "best_seconds": 8.281947500014212,
+            "median_seconds": 8.718841699999757,
+            "spread_relative": 0.1670385643061933,
+            "speedup_vs_incumbent": 1.106257797455518,
+            "samples": [
+              8.281947500014212,
+              8.718841699999757,
+              9.738330299995141
+            ]
+          },
+          {
+            "batch_size": 64,
+            "best_seconds": 8.38444600001094,
+            "median_seconds": 8.558430500008399,
+            "spread_relative": 0.02475414154655502,
+            "speedup_vs_incumbent": 1.0927339743133897,
+            "samples": [
+              8.558430500008399,
+              8.5963026000245,
+              8.38444600001094
+            ]
+          },
+          {
+            "batch_size": 512,
+            "best_seconds": 9.161969000007957,
+            "median_seconds": 9.578523400006816,
+            "spread_relative": 0.13418224775694249,
+            "speedup_vs_incumbent": 1.0,
+            "samples": [
+              9.161969000007957,
+              10.447236800013343,
+              9.578523400006816
+            ]
+          },
+          {
+            "batch_size": 4096,
+            "best_seconds": 9.365594100003364,
+            "median_seconds": 11.590026099991519,
+            "spread_relative": 0.2021379744789728,
+            "speedup_vs_incumbent": 0.9782581758486274,
+            "samples": [
+              11.708378500014078,
+              11.590026099991519,
+              9.365594100003364
+            ]
+          }
+        ]
+      },
+      "32": {
+        "noise_band_relative": 0.48113808145522036,
+        "noise_samples": [
+          20.606490500009386,
+          32.554977699997835,
+          25.49571210000431,
+          24.171889200020814
+        ],
+        "cpu_busy_before": 11.2,
+        "cpu_busy_after": 88.1,
+        "rows": [
+          {
+            "batch_size": 32,
+            "best_seconds": 26.989813699998194,
+            "median_seconds": 34.00011910000467,
+            "spread_relative": 0.8706844676907781,
+            "speedup_vs_incumbent": 1.2561247653222856,
+            "samples": [
+              34.00011910000467,
+              26.989813699998194,
+              56.59318930000882
+            ]
+          },
+          {
+            "batch_size": 64,
+            "best_seconds": 22.171595399995567,
+            "median_seconds": 25.437501399981556,
+            "spread_relative": 1.3502700858822194,
+            "speedup_vs_incumbent": 1.5290994079753601,
+            "samples": [
+              22.171595399995567,
+              25.437501399981556,
+              56.51909259997774
+            ]
+          },
+          {
+            "batch_size": 512,
+            "best_seconds": 33.90257340000244,
+            "median_seconds": 59.04710460000206,
+            "spread_relative": 0.43271562209661313,
+            "speedup_vs_incumbent": 1.0,
+            "samples": [
+              33.90257340000244,
+              59.453177999996115,
+              59.04710460000206
+            ]
+          },
+          {
+            "batch_size": 4096,
+            "best_seconds": 24.276746899995487,
+            "median_seconds": 54.02882440001122,
+            "spread_relative": 0.7789936643520257,
+            "speedup_vs_incumbent": 1.3965039689897143,
+            "samples": [
+              24.276746899995487,
+              66.36485879999236,
+              54.02882440001122
+            ]
+          }
+        ]
+      }
+    },
+    "trials": 3,
+    "noise_repeats": 4
+  }
+}

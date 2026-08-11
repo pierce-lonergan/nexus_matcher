@@ -5,20 +5,26 @@ Docker, Kubernetes and cloud deployment patterns for the service.
 > **Read this before following the rest of the guide.** Several things this document
 > assumes are not implemented today:
 >
-> - **The deployed HTTP service does not match schemas.** The FastAPI app serves `/`,
->   `/health`, `/health/live`, `/health/ready`, `/health/startup`, `/docs`, `/redoc` and
->   `/openapi.json` — nothing else. Deploying it gives you health probes, not a matching
->   service. Matching runs in-process via the Python API or the CLI. See
->   [API_REFERENCE.md](API_REFERENCE.md).
+> - **A deployment that sets no dictionary answers 503 on every match.** The FastAPI app
+>   serves `POST /api/v1/match`, `/api/v1/match/batch` and `/api/v1/feedback` alongside
+>   `/`, `/health`, `/health/live`, `/health/ready`, `/health/startup`, `/docs`, `/redoc`
+>   and `/openapi.json` — but the matching routes need `NEXUS_API_DICTIONARY` and
+>   `NEXUS_API_GOVERNANCE`, which are §2 below and are **not** the `NEXUS_*` settings
+>   classes. An earlier revision of this box said the service did not match schemas at
+>   all; that is retracted. See [API_REFERENCE.md](API_REFERENCE.md).
 > - **YAML config files shown below do not configure matching.** `NexusMatcher.from_config()`
 >   ignores its `config_path`, and the `NEXUS_*` settings classes are read only by the
 >   logging setup. Treat the config examples here as a target design.
 > - **`/metrics` is not routed.** A `PrometheusMetrics` backend class exists in
 >   `nexus_matcher.shared.metrics`, but no endpoint exposes it, so the Prometheus scrape
 >   config and Grafana dashboard below have nothing to read yet.
-> - **`/health/ready` does not probe dependencies.** It reports hardcoded `True` for
->   `vector_store` and `cache`. It tells you the process started, not that Qdrant or
->   Redis are reachable — do not use it as a dependency gate.
+> - **`/health/ready` does not probe dependencies.** It reports `api`, `config` and
+>   `matcher`, and only the last of those is a real check — the first two are set
+>   unconditionally at startup. It tells you the process started and whether a dictionary
+>   loaded, not that Qdrant or Redis are reachable. `vector_store` and `cache` used to
+>   appear in that map, each set `True` inside a `try:` block whose body was a comment, so
+>   neither could ever be `False`; they were removed rather than left as a claim a rollout
+>   gate reads. See §5 "Probe targets".
 > - **The multi-layer cache is not consulted by the matching pipeline.** Cache tuning
 >   parameters below have no effect on matching today.
 
@@ -94,18 +100,98 @@ NEXUS_CACHE_L2_REDIS_URL=redis://localhost:6379/0
 NEXUS_CACHE_L3_ENABLED=true
 NEXUS_CACHE_L3_MAX_SIZE=10000
 
-# API Settings
-NEXUS_API_HOST=0.0.0.0
-NEXUS_API_PORT=8000
-NEXUS_API_WORKERS=4
-NEXUS_API_TIMEOUT=30
-NEXUS_API_CORS_ORIGINS=["*"]
+# API Settings -- ten of the thirteen variables create_app() actually reads
+NEXUS_API_DICTIONARY=/srv/glossary.csv          # REQUIRED for matching (.csv / .xlsx)
+NEXUS_API_GOVERNANCE=/srv/protection_classes.json  # REQUIRED for matching
+NEXUS_API_MATCHING_CONFIG=/srv/matching.json    # optional MatchingConfig JSON/TOML
+NEXUS_API_FEEDBACK_PATH=/var/lib/nexus/feedback.jsonl  # POST /api/v1/feedback 503s without it
+NEXUS_API_DEADLINE_SECONDS=25.0  # answer 504 rather than let a caller hang
+NEXUS_API_MAX_WORKERS=4          # threads running matches
+NEXUS_API_MAX_QUEUED=32          # work admitted beyond the workers; over this, shed with 503
+NEXUS_API_MAX_FIELDS=100         # cap for POST /api/v1/match
+NEXUS_API_MAX_BATCH_FIELDS=250   # cap for POST /api/v1/match/batch
+NEXUS_API_MAX_BODY_BYTES=        # raw request-body cap; UNSET (the default) derives it
 
-# Rate Limiting
-NEXUS_RATE_LIMIT_ENABLED=true
-NEXUS_RATE_LIMIT_REQUESTS=100
-NEXUS_RATE_LIMIT_WINDOW=60       # seconds
+# Three more, documented where they are used: NEXUS_API_CORS_ORIGINS and
+# NEXUS_API_CORS_ALLOW_CREDENTIALS in §9, NEXUS_API_MATCHING_OPTIONAL in §5.
 ```
+
+Thirteen is the whole set, measured by handing `create_app()` an environment mapping that
+records every key it looks up and driving a full startup through it — not by grepping,
+because three of the thirteen are read inside the lifespan handler and one is read only
+when another is non-empty.
+
+**Both `NEXUS_API_DICTIONARY` and `NEXUS_API_GOVERNANCE` are required for matching**, and
+the second one is the trap: with a dictionary and no vocabulary, a server would answer 200
+and return `"governance": null` on every field — indistinguishable, to the caller, from a
+glossary that carries no protection classes at all. The bootstrap therefore refuses to bring
+the matcher up when the glossary plainly has a protection-code column and nothing was
+configured to read it: the process starts, `/health/ready` returns 503, and every match
+returns 503 naming the column. It cannot see the case where your codes live under a column
+name it does not recognise.
+
+#### `NEXUS_API_MAX_BODY_BYTES`, and the one way it stops the process starting
+
+Leave it unset unless you have a reason. Unset, the cap is **derived** from
+`NEXUS_API_MAX_BATCH_FIELDS` and the per-field `max_length`s the request schema publishes:
+250 fields × (9,856 characters × 4 bytes for UTF-8 + 64 bytes of JSON framing) + 1,024 =
+**9,873,024 bytes, 9.42 MiB**. Deriving it is what keeps the two caps in step — raise the
+field cap and the byte cap rises with it, so an operator cannot end up with a 413 that
+names a limit the schema says is fine.
+
+Setting it is therefore an escape hatch, and it is validated **against the field cap rather
+than on its own**, in `MatchServiceLimits.__post_init__`. A value below the floor above is
+refused at construction:
+
+```text
+$ NEXUS_API_MAX_BODY_BYTES=1048576 uvicorn nexus_matcher.presentation.api.app:app
+Traceback (most recent call last):
+  ...
+ValueError: NEXUS_API_MAX_BODY_BYTES=1048576 is below the 9873024 bytes a
+max_batch_fields=250 request may legitimately carry, so this server would answer 413 to
+bodies every other limit it publishes accepts. Unset it to derive the cap, or lower
+NEXUS_API_MAX_BATCH_FIELDS to match.
+```
+
+The process does not start — and `nexus-matcher api` refuses with the same message, because
+both entry points build the same limits object. That is deliberate and it is the cheaper
+failure: the alternative is a server that comes up healthy, passes every probe, and answers
+413 to batches its own `/openapi.json` declares valid — which the caller reads as a bug in
+their client, because their client was generated from that document. The refusal names both
+ways out, and the second one really does work: `NEXUS_API_MAX_BODY_BYTES=1048576` alongside
+`NEXUS_API_MAX_BATCH_FIELDS=20` starts, because 20 fields put the floor at 790,784 bytes.
+
+One 413 the cap cannot avoid: a client that escapes every character as `\uXXXX` spends six
+bytes per character on the wire, so a body inside its declared field bounds can still cross
+a derived cap. Raise this variable for that — the validation only refuses values *below* the
+floor, never above it.
+
+**What a refusal costs you, which is not zero.** A refused body *within twice the cap* is
+read and discarded before the 413 is sent — up to **2 × the cap in read bandwidth** (19.7 MB
+at the default) and up to **2.0 seconds of connection time**, per refused request. Beyond
+twice the cap nothing is read and the refusal is immediate.
+
+That is a deliberate trade, and it is worth understanding before you size a rate limit or a
+front proxy in front of this service. Refusing a body the client is still writing closes the
+socket with bytes unread; that is an RST, and an RST discards the 413 already sent, so the
+caller sees an opaque transport error instead of the two numbers telling it to re-chunk.
+Draining **discards** each chunk, so this costs bandwidth and time, never memory — eight
+concurrent 198 MB bodies still move server RSS by about 1 MiB.
+
+Both bounds are derived or fixed in code and are **not** environment-settable today: the
+byte bound scales with whatever `NEXUS_API_MAX_BODY_BYTES` resolves to, and the time bound
+is 2.0 s, chosen to sit under uvicorn's own 5 s `timeout_keep_alive` so it does not widen
+the slow-loris window. If you need them tunable, that is a change to `body_limit.py`, not a
+variable you are missing.
+
+This block was previously `NEXUS_API_HOST`, `NEXUS_API_PORT`, `NEXUS_API_WORKERS`,
+`NEXUS_API_TIMEOUT` and `NEXUS_API_CORS_ORIGINS`. **No code read any of those five**
+(verified by grep over `src/`), and an operator who configured a deployment from that list
+got a server that 503s every match. Host, port and worker count are flags on
+`nexus-matcher api`, not environment variables. `NEXUS_API_CORS_ORIGINS` is the exception:
+it is now read, in comma-separated form, and it is documented in §9 with the rest of the
+security surface. The rate-limit block that used to sit here was deleted rather than
+implemented — see §9 for why.
 
 ### Configuration File
 
@@ -286,9 +372,9 @@ RUN pip install --no-cache-dir .
 RUN useradd -m -u 1000 nexus
 USER nexus
 
-# Health check
+# Health check -- /health/ready, not /health. See "Probe targets" in §5.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8000/health || exit 1
+    CMD curl -f http://localhost:8000/health/ready || exit 1
 
 # Expose port
 EXPOSE 8000
@@ -553,9 +639,10 @@ spec:
           limits:
             cpu: "4000m"
             memory: "8Gi"
+        # /health/ready and /health/live, NOT /health. See "Probe targets" below.
         readinessProbe:
           httpGet:
-            path: /health
+            path: /health/ready
             port: 8000
           initialDelaySeconds: 10
           periodSeconds: 5
@@ -564,7 +651,7 @@ spec:
           failureThreshold: 3
         livenessProbe:
           httpGet:
-            path: /health
+            path: /health/live
             port: 8000
           initialDelaySeconds: 30
           periodSeconds: 10
@@ -594,6 +681,46 @@ spec:
           matchLabels:
             app: nexus-matcher
 ```
+
+### Probe targets
+
+**Do not point a probe at `/health`.** Every probe this repository shipped did — the two
+manifests above, `docker/Dockerfile`'s `HEALTHCHECK` and `docker/docker-compose.yml` —
+and `/health` answers **HTTP 200 with `status: "degraded"`** when the dictionary failed to
+load. `curl -f` passes on it, `httpGet` passes on it, and the pod goes into service
+answering 503 to every `POST /api/v1/match`. That is a rollout gate that cannot fail.
+
+| Probe | Path | Answers 503 when |
+|---|---|---|
+| `readinessProbe` | `/health/ready` | any component that gates readiness is red — today, `matcher` |
+| `livenessProbe` | `/health/live` | never; it says the process is running, which is what liveness means |
+| `startupProbe` | `/health/startup` | startup has not finished |
+| — | `/health` | never — it is a human-readable summary, not a gate |
+
+The readiness 503 carries the whole component map in `error.details.components`, so
+`kubectl describe` plus one `curl` tells you which component is red rather than only that
+one is:
+
+```json
+{"error": {"code": "NEXUS-8000",
+           "message": "The service is not ready: matcher not healthy.",
+           "details": {"status_code": 503, "components": {"api": true, "config": true, "matcher": false}}}}
+```
+
+**A deployment that sets no `NEXUS_API_DICTIONARY` is now NOT READY.** This is a
+behaviour change and it is deliberate: readiness previously aggregated only components
+that had registered, and a missing dictionary registered nothing, so `all(())` reported
+ready — the state a Helm value that fails to resolve produces. If this deployment really
+serves only health and introspection, say so:
+
+```yaml
+- name: NEXUS_API_MATCHING_OPTIONAL
+  value: "true"
+```
+
+That exemption is opt-*out*, not opt-in, on purpose: a knob whose default is the unsafe
+value protects only the operators who remembered to set it, who are not the ones with a
+misconfigured rollout. Do not bake it into a base image or a shared ConfigMap.
 
 ### Service and Ingress
 
@@ -785,7 +912,7 @@ redis:
         }
       },
       "healthCheck": {
-        "command": ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"],
+        "command": ["CMD-SHELL", "curl -f http://localhost:8000/health/ready || exit 1"],
         "interval": 30,
         "timeout": 5,
         "retries": 3,
@@ -986,13 +1113,54 @@ groups:
 
 ### API Security
 
-```python
-# Enable in production
-NEXUS_API_CORS_ORIGINS=["https://your-domain.com"]
-NEXUS_RATE_LIMIT_ENABLED=true
-NEXUS_RATE_LIMIT_REQUESTS=100
-NEXUS_RATE_LIMIT_WINDOW=60
+**This service authenticates nobody.** There is no API key, no OAuth and no rate limiting
+in the application, and there is no environment variable that turns any of them on. Put it
+behind your own gateway and authenticate there; the network policy below is the other half
+of that, not a substitute for it.
+
+This section used to instruct operators to set four variables. **No code read any of
+them**, so hardening by the book produced a server whose CORS policy was still
+`allow_origins=["*"]` with credentials enabled, and whose request rate was still
+unlimited. Both claims are retracted:
+
+| Was documented here | Status |
+|---|---|
+| `NEXUS_API_CORS_ORIGINS` in JSON-list syntax | **now read** — comma-separated, see below |
+| `NEXUS_RATE_LIMIT_ENABLED` | **deleted.** Not implemented, and not planned |
+| `NEXUS_RATE_LIMIT_REQUESTS` | **deleted.** Not implemented, and not planned |
+| `NEXUS_RATE_LIMIT_WINDOW` | **deleted.** Not implemented, and not planned |
+
+Rate limiting was deleted rather than implemented because the load protection that matters
+already exists and is real: `NEXUS_API_MAX_WORKERS` + `NEXUS_API_MAX_QUEUED` bound the
+in-flight work and shed the excess with 503 immediately, and `NEXUS_API_DEADLINE_SECONDS`
+answers 504 rather than letting a caller hang. A second overlapping mechanism is surface
+for no gain. Per-client quotas belong on the gateway, which is the only component that
+knows who the clients are.
+
+#### Cross-origin access (browsers)
+
+Closed by default — with no `NEXUS_API_CORS_ORIGINS`, no CORS middleware is mounted at
+all and a browser on another origin can read nothing. Server-to-server callers, including
+the Java pipeline this endpoint was built for, never send an `Origin` and are unaffected.
+
+```bash
+# Comma-separated origins. NOT the JSON-list syntax this document used to show; the
+# application parses one spelling, so the other silently meant nothing.
+NEXUS_API_CORS_ORIGINS=https://console.your-domain.example,https://ops.your-domain.example
+
+# Cookies cross-origin. Default false, and REFUSED AT STARTUP together with `*`:
+# Starlette reflects the requesting origin rather than sending `*` when credentials are
+# on, so "allow every origin" silently becomes "allow this origin, with cookies".
+NEXUS_API_CORS_ALLOW_CREDENTIALS=false
 ```
+
+Allowed methods are `GET`, `POST` and `OPTIONS`. There is no setting for that list: it is
+the set of verbs the service serves.
+
+Until this was fixed, a preflight from any origin came back with that origin reflected and
+`access-control-allow-credentials: true`, so any page anywhere could read a match response
+and could `POST /api/v1/feedback` — which fsyncs a reviewer verdict into the audit trail
+this library treats as evidence.
 
 ### Network Security
 

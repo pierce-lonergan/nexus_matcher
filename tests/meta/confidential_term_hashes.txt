@@ -1,0 +1,61 @@
+# Salted digests of terms that must never appear in this repository.
+#
+# WHY HASHES AND NOT WORDS
+# A blocklist of confidential vocabulary, written out in full, is itself a
+# disclosure of that vocabulary -- and it would be committed, pushed, published in
+# the sdist and indexed. So the terms are stored as keyed digests. The gate can
+# recognise a term without the repository ever containing it.
+#
+# WHAT THIS DOES AND DOES NOT PROTECT
+# This defeats reading, grepping and search indexing. It does NOT defeat a
+# determined offline guess: the candidate space for a short word is small, and
+# anyone who suspects a particular term can confirm it by hashing it. That is an
+# acceptable trade -- the goal is to stop the terms being *published*, not to keep
+# them secret from someone who already knows them.
+#
+# ALGORITHM
+#   canon  = lowercase, then drop every non-alphanumeric character
+#   digest = blake2b(canon, key=b"nexus-matcher/confidential-terms/v1", digest_size=8)
+#
+# ADDING A TERM
+#   python scripts/add_confidential_term.py
+# It prompts without echoing, appends the digest, and never writes the term
+# anywhere. Do not add terms by editing this file by hand -- that would mean
+# having the plaintext in your editor and shell history.
+#
+# ONE ENTRY IS A CANARY
+# One digest below is of a public, meaningless string used to prove the scanner
+# actually fires (see test_the_gate_actually_fires). It identifies nothing.
+
+02ff2416d0e5b725
+086a6e5eeafd00b3
+1f814aed198d6202
+29e3551109a57514
+2ec105143658723f
+3dc38be712c4ea61
+49c2db905783ec18
+51018d669976c4e0
+524997f23396af9d
+55087c1d4644e971
+7b816fee3b303d3f
+7e2d883100e0e625
+9341bedffd908e9c
+9573cc3503db83a2
+a0cde19a0eabdf9c
+a23871d04fa561f8
+a37c394c6bb17355
+b76a405eb4c84523
+c8bf6d1a4f1b86ed
+c96150d6d1005f8d
+cad3382d1aad2667
+d93007c2b729a333
+dd7ca518b7f083cc
+de4f297f5df13a02
+e3a27c64e512366d
+e5461bc5a1bbc7bb
+e8c1dd2f212fb9d2
+edada0918fedf9a4
+efc4cbe85b0aec27
+f5a01bbee7efdaf9
+f84a16d98d582a56
+f9e3a7da2abec2e2

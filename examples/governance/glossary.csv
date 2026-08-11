@@ -1,0 +1,31 @@
+id,business_name,logical_name,definition,data_type,domain,protection_class,classification,personal_information,direct_identifier
+GBF-0001,Passenger Legal Name,pax_legal_nm,The full legal name of a ticketed passenger as printed on the Gravel Bay sailing manifest.,string,Passenger,GBF-LEGACY-NAME,SEALED_RESTRICTED,yes,yes
+GBF-0002,Passenger Date Of Birth,pax_birth_dt,The calendar date of birth a passenger supplied when booking a sailing.,date,Passenger,MANIFEST_NAME,SEALED_RESTRICTED,yes,yes
+GBF-0003,Passenger Email Address,pax_email_addr,The email address the authority uses to send sailing notices to a passenger.,string,Passenger,BERTH_CONTACT,SEALED_RESTRICTED,yes,yes
+GBF-0004,Passenger Mobile Number,pax_mobile_no,The mobile telephone number a passenger gave for disruption alerts.,string,Passenger,BERTH_CONTACT,SEALED_RESTRICTED,yes,yes
+GBF-0005,Passenger Postal Address,pax_postal_addr,The residential postal address held against a passenger account.,string,Passenger,BERTH_CONTACT,SEALED_RESTRICTED,yes,yes
+GBF-0006,Fare Card Token,fare_card_tok,The vault token that stands in for the payment card used to buy a fare.,string,Fare,FARE_INSTRUMENT,SEALED_RESTRICTED,yes,no
+GBF-0007,Fare Card Last Four Digits,fare_card_last4,The last four digits of the payment card retained so a receipt can be found.,string,Fare,FARE_INSTRUMENT,SEALED_RESTRICTED,yes,no
+GBF-0008,Fare Refund Bank Account,fare_refund_acct,The bank account number a cancelled fare is refunded into.,string,Fare,FARE_INSTRUMENT,SEALED_RESTRICTED,yes,no
+GBF-0009,Crew Member Identifier,crew_member_id,The authority's permanent staff identifier for a member of a vessel crew.,string,Crew,CREW_ROSTER,BRIDGE_SENSITIVE,yes,yes
+GBF-0010,Crew Certificate Number,crew_cert_no,The maritime competency certificate number a crew member holds.,string,Crew,CREW_ROSTER,BRIDGE_SENSITIVE,yes,yes
+GBF-0011,Crew Shift Assignment,crew_shift_asgn,The sailing and watch a crew member is rostered to work.,string,Crew,CREW_ROSTER,BRIDGE_SENSITIVE,yes,yes
+GBF-0012,Boarding Pass Serial,boarding_pass_srl,The serial printed on a boarding pass and unique to one passenger sailing.,string,Passenger,BOARDING_PASS,BRIDGE_SENSITIVE,yes,no
+GBF-0013,Booking Reference,booking_ref,The six character reference that identifies one booking across the estate.,string,Passenger,BOARDING_PASS,BRIDGE_SENSITIVE,yes,no
+GBF-0014,Gate Scan Timestamp,gate_scan_ts,The moment a boarding pass was scanned at the terminal gate.,timestamp,Passenger,BOARDING_PASS,BRIDGE_SENSITIVE,yes,no
+GBF-0015,Salvage Claim Reference,salvage_claim_ref,The reference of an insurance claim raised after an incident at sea.,string,Claims,SALVAGE_CLAIM,BRIDGE_SENSITIVE,yes,no
+GBF-0016,Salvage Claim Assessed Amount,salvage_claim_amt,The amount an assessor put on a salvage claim after inspecting the damage.,decimal,Claims,SALVAGE_CLAIM,BRIDGE_SENSITIVE,yes,no
+GBF-0017,Harbour Berth Fee Rate,harbour_fee_rate,The negotiated rate the authority pays for a berth at a partner harbour.,decimal,Harbour,HARBOUR_TERMS,BRIDGE_SENSITIVE,no,no
+GBF-0018,Harbour Agreement Expiry Date,harbour_agmt_exp_dt,The date on which a commercial harbour agreement lapses unless renewed.,date,Harbour,HARBOUR_TERMS,BRIDGE_SENSITIVE,no,no
+GBF-0019,Charter Contract Value,charter_contract_val,The total contracted value of a private vessel charter.,decimal,Harbour,HARBOUR_TERMS,BRIDGE_SENSITIVE,no,no
+GBF-0020,Vessel Engine Temperature,vessel_engine_temp_c,The engine temperature a vessel reported on its telemetry feed in celsius.,float,Voyage,VESSEL_TELEMETRY,CREW_ONLY,no,no
+GBF-0021,Vessel Fuel Level,vessel_fuel_pct,The percentage of usable fuel remaining in a vessel's tanks.,float,Voyage,VESSEL_TELEMETRY,CREW_ONLY,no,no
+GBF-0022,Vessel Heading Degrees,vessel_heading_deg,The compass heading a vessel reported at the last telemetry ping.,float,Voyage,VESSEL_TELEMETRY,CREW_ONLY,no,no
+GBF-0023,Vessel Hull Identifier,vessel_hull_id,The authority's identifier for one hull in the Gravel Bay fleet.,string,Voyage,VESSEL_TELEMETRY,CREW_ONLY,no,no
+GBF-0024,Published Departure Time,sched_departure_tm,The departure time published in the sailing timetable for a route.,timestamp,Published,TIDE_TABLE,OPEN_DECK,no,no
+GBF-0025,Published Arrival Time,sched_arrival_tm,The arrival time published in the sailing timetable for a route.,timestamp,Published,TIDE_TABLE,OPEN_DECK,no,no
+GBF-0026,High Tide Height,tide_high_m,The predicted high tide height at a terminal in metres.,float,Published,TIDE_TABLE,OPEN_DECK,no,no
+GBF-0027,Terminal Name,terminal_nm,The public name of a Gravel Bay ferry terminal.,string,Published,TIDE_TABLE,OPEN_DECK,no,no
+GBF-0028,Sailing Route Code,route_cd,The short code that identifies a scheduled route between two terminals.,string,Published,,OPEN_DECK,,
+GBF-0029,Weather Observation Note,weather_obs_note,A free text note the bridge records about conditions during a sailing.,string,Voyage,n/a,OPEN_DECK,,
+GBF-0030,Vessel Passenger Capacity,vessel_pax_capacity,The maximum number of passengers a vessel is certified to carry.,integer,Voyage,,OPEN_DECK,,

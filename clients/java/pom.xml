@@ -1,0 +1,166 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>io.github.pierce-lonergan</groupId>
+  <artifactId>nexus-matcher-client</artifactId>
+  <version>2.1.0</version>
+  <packaging>jar</packaging>
+
+  <name>nexus-matcher-client</name>
+  <description>
+    Java client for the nexus_matcher governance matching API. Transport and types only:
+    the Python service is the one implementation of the matching and governance semantics,
+    and this artifact never re-decides either.
+  </description>
+
+  <properties>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <project.reporting.outputEncoding>UTF-8</project.reporting.outputEncoding>
+
+    <!--
+      17, not 21, although the JDK on this machine is 21. 17 is the LTS floor of the
+      enterprise JVM stack this client is for. `release` rather than source/target is what
+      makes the compiler check the JDK 17 API as well as the bytecode level, so a stray call
+      to a 21-only method fails here instead of at the adopter's runtime.
+    -->
+    <maven.compiler.release>17</maven.compiler.release>
+
+    <!--
+      Deliberately few. Transport is java.net.http.HttpClient from the JDK, so there is no
+      HTTP dependency at all. Jackson is the one runtime dependency: it is already present in
+      essentially every enterprise Java stack, so adding it costs an adopter nothing, and
+      hand-rolling a JSON parser for a governance payload is not a saving.
+    -->
+    <jackson.version>2.18.2</jackson.version>
+    <junit.version>5.11.3</junit.version>
+
+    <surefire.version>3.2.2</surefire.version>
+    <failsafe.version>3.2.2</failsafe.version>
+    <compiler.plugin.version>3.13.0</compiler.plugin.version>
+
+    <!--
+      Where the integration tests find a running service. Overridable, so the same suite can be
+      pointed at a service somebody else started:
+          mvn verify -Dnexus.matcher.baseUrl=http://127.0.0.1:8000
+      See README.md for the three fixture servers `verify` needs and the script that starts them.
+    -->
+    <nexus.matcher.baseUrl>http://127.0.0.1:8000</nexus.matcher.baseUrl>
+    <nexus.matcher.unavailableBaseUrl>http://127.0.0.1:8001</nexus.matcher.unavailableBaseUrl>
+    <nexus.matcher.deadlineBaseUrl>http://127.0.0.1:8002</nexus.matcher.deadlineBaseUrl>
+
+    <!--
+      Extra JVM arguments for the integration-test fork.
+
+      Some Windows hosts cannot run java.net.http.HttpClient AT ALL until one flag is set. The
+      symptom is `java.io.IOException: Unable to establish loopback connection` from
+      Selector.open(), caused by `SocketException: Invalid argument: connect` in
+      sun.nio.ch.UnixDomainSockets. HttpClient needs an internal wakeup pipe, the JDK builds it
+      from an AF_UNIX socket pair when it can, and endpoint-protection software on some managed
+      Windows machines blocks the AF_UNIX connect while leaving bind working, so the JDK's own
+      fallback to TCP never triggers. It is NOT specific to this client: a three-line program
+      calling `Selector.open()` and nothing else fails the same way on such a host.
+
+      Pointing jdk.net.unixdomain.tmpdir at a directory that does not exist makes the AF_UNIX
+      BIND fail instead, which IS the failure the JDK falls back from, so the pipe is built over
+      TCP loopback and everything works.
+
+      This is ON BY DEFAULT, which is a deliberate reversal. It was originally left off so the
+      build would not "quietly depend" on a workaround, but the value only ever reaches the
+      forked TEST JVM through failsafe's argLine below, so no shipped artifact can depend on it,
+      and leaving it off bought nothing except a `mvn verify` that is red out of the box on the
+      machine this client is developed on. A red default build hides the workaround from nobody;
+      it just blocks. Forcing the wakeup pipe onto TCP loopback is what the JDK did for years
+      before AF_UNIX support landed, so it is inert on a healthy host.
+
+      The value is a RELATIVE directory name on purpose, and must stay one. An absolute path
+      built from ${project.build.directory} was tried first and broke the build outright on this
+      machine: failsafe passes argLine to the forked JVM unquoted, the checkout lives under
+      `C:\Users\Pierce Lonergan\...`, and the space split the argument so the fork died with "The
+      forked VM terminated without properly saying goodbye" before running a single test. A bare
+      name has no space to split on and resolves against the fork's working directory, where it
+      equally does not exist, which is all the workaround needs.
+
+      Set it to empty to turn the workaround off:
+
+          mvn verify -Dnexus.matcher.itJvmArgs=-Dfile.encoding=UTF-8
+    -->
+    <nexus.matcher.itJvmArgs>-Dfile.encoding=UTF-8 -Djdk.net.unixdomain.tmpdir=nexus-no-af-unix-here</nexus.matcher.itJvmArgs>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>${compiler.plugin.version}</version>
+        <configuration>
+          <compilerArgs>
+            <!--
+              Record components already carry their names in the class file, so Jackson can bind
+              them without this. Every DTO annotates its components with @JsonProperty anyway;
+              -parameters is belt to that braces, and it costs a few bytes.
+            -->
+            <arg>-parameters</arg>
+            <arg>-Xlint:all</arg>
+          </compilerArgs>
+        </configuration>
+      </plugin>
+
+      <!--
+        Unit tests: *Test. These decode captured real response bodies and exercise the retry
+        policy. They need no service and they make no network call.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>${surefire.version}</version>
+      </plugin>
+
+      <!--
+        Integration tests: *IT, bound to `verify`, and they REQUIRE a real service. They do not
+        mock one and they do not skip when it is missing; they fail, naming the script that starts
+        it. A client tested only against mocks is a client tested against its author's
+        assumptions, and this contract moved twice while the client was being written.
+      -->
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-failsafe-plugin</artifactId>
+        <version>${failsafe.version}</version>
+        <configuration>
+          <argLine>${nexus.matcher.itJvmArgs}</argLine>
+          <systemPropertyVariables>
+            <nexus.matcher.baseUrl>${nexus.matcher.baseUrl}</nexus.matcher.baseUrl>
+            <nexus.matcher.unavailableBaseUrl>${nexus.matcher.unavailableBaseUrl}</nexus.matcher.unavailableBaseUrl>
+            <nexus.matcher.deadlineBaseUrl>${nexus.matcher.deadlineBaseUrl}</nexus.matcher.deadlineBaseUrl>
+          </systemPropertyVariables>
+        </configuration>
+        <executions>
+          <execution>
+            <goals>
+              <goal>integration-test</goal>
+              <goal>verify</goal>
+            </goals>
+          </execution>
+        </executions>
+      </plugin>
+    </plugins>
+  </build>
+</project>

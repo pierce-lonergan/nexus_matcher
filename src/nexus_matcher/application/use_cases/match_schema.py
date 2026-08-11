@@ -33,6 +33,7 @@ from typing import Any
 import numpy as np
 
 from nexus_matcher.core.fusion import fuse_linear_ids
+from nexus_matcher.domain.governance import GovernanceVocabulary
 from nexus_matcher.domain.models.entities import (
     DictionaryEntry,
     MatchingSession,
@@ -268,6 +269,25 @@ def _load_matching_config(source: MatchingConfig | str | Path | None) -> Matchin
     return MatchingConfig(**data)
 
 
+def _load_governance_vocabulary(
+    source: GovernanceVocabulary | str | Path | None,
+) -> GovernanceVocabulary:
+    """
+    Coerce a `governance=` argument into a vocabulary.
+
+    None becomes `empty()` rather than a permissive stand-in. An installation that
+    configured no vocabulary defines no codes, and `_index_dictionary` refuses entries
+    carrying codes it cannot resolve -- so "I forgot to wire the vocabulary" surfaces at
+    index time with the fix in the message, instead of as matches whose governance is
+    quietly None.
+    """
+    if source is None:
+        return GovernanceVocabulary.empty()
+    if isinstance(source, GovernanceVocabulary):
+        return source
+    return GovernanceVocabulary.from_json(source)
+
+
 # =============================================================================
 # TOKENIZATION
 # =============================================================================
@@ -460,6 +480,7 @@ class NexusMatcher:
         context_enricher: ContextEnricher | None = None,
         domain_matcher: DomainMatcher | None = None,
         config: MatchingConfig | None = None,
+        governance: GovernanceVocabulary | str | Path | None = None,
     ) -> None:
         """
         Initialize the matcher.
@@ -475,6 +496,12 @@ class NexusMatcher:
             context_enricher: Enricher for nested schema context (uses default if None)
             domain_matcher: Matcher for domain hierarchy scoring (uses default if None)
             config: Matching configuration
+            governance: The caller's controlled vocabulary, or a path to its JSON file.
+                It is what turns an indexed entry's `governance_code` into the
+                `ProtectionClass` on every MatchResult. Defaults to
+                `GovernanceVocabulary.empty()`, which defines nothing -- so indexing
+                entries that carry codes without wiring one is refused rather than
+                silently producing matches with no class. This library ships no taxonomy.
         """
         self._embedding_provider = embedding_provider
         self._vector_store = vector_store
@@ -486,6 +513,7 @@ class NexusMatcher:
         self._context_enricher = context_enricher or ContextEnricher()
         self._domain_matcher = domain_matcher or DomainMatcher.default()
         self._config = config or MatchingConfig()
+        self._governance = _load_governance_vocabulary(governance)
 
         # State
         self._dictionary_entries: dict[str, DictionaryEntry] = {}
@@ -495,13 +523,19 @@ class NexusMatcher:
         self._is_initialized = False
 
     @classmethod
-    def from_config(cls, config: MatchingConfig | str | Path | None = None) -> NexusMatcher:
+    def from_config(
+        cls,
+        config: MatchingConfig | str | Path | None = None,
+        governance: GovernanceVocabulary | str | Path | None = None,
+    ) -> NexusMatcher:
         """
         Build a fully wired matcher, with no components to assemble by hand.
 
         Args:
             config: A `MatchingConfig`, or a path to a JSON/TOML file holding its fields,
                 or None for the calibrated defaults.
+            governance: The caller's controlled vocabulary, or a path to its JSON file.
+                None means none is configured; this library ships no taxonomy.
 
         Returns:
             Configured NexusMatcher instance.
@@ -510,6 +544,7 @@ class NexusMatcher:
             matcher = NexusMatcher.from_config()
             matcher = NexusMatcher.from_config(MatchingConfig(auto_approve_threshold=0.85))
             matcher = NexusMatcher.from_config("matching.json")
+            matcher = NexusMatcher.from_config(governance="our_protection_classes.json")
 
         Note:
             This parameter used to be named `config_path` and was accepted and then never
@@ -568,6 +603,7 @@ class NexusMatcher:
             schema_parser_registry=schema_parsers,
             dictionary_loader_registry=dictionary_loaders,
             config=matching_config,
+            governance=governance,
         )
 
     def load_dictionary(
@@ -619,7 +655,19 @@ class NexusMatcher:
         return stats
 
     def _index_dictionary(self, entries: Sequence[DictionaryEntry]) -> None:
-        """Index dictionary entries for search."""
+        """
+        Index dictionary entries for search.
+
+        Refuses to index an entry whose `governance_code` this matcher's vocabulary does
+        not define. That is a WIRING error -- a glossary validated against one vocabulary
+        handed to a matcher holding another, or none -- and it is checked once here rather
+        than per match. Left unchecked it degrades silently: every MatchResult comes back
+        with `governance=None`, which is indistinguishable from "this entry has no class",
+        and a field inherits nothing where it should have inherited something. Same shape
+        as NM-0005, one layer up.
+        """
+        self._reject_unresolvable_governance(entries)
+
         # Store entries
         self._dictionary_entries = {e.id: e for e in entries}
 
@@ -713,6 +761,28 @@ class NexusMatcher:
                 raise RuntimeError(f"Sparse indexing failed: {sparse_result.error}")
 
         self._is_initialized = True
+
+    def _reject_unresolvable_governance(self, entries: Sequence[DictionaryEntry]) -> None:
+        """Fail loudly, once, naming the codes and the fix."""
+        unresolved = sorted(
+            {
+                e.governance_code
+                for e in entries
+                if e.governance_code and self._governance.get(e.governance_code) is None
+            }
+        )
+        if not unresolved:
+            return
+        known = ", ".join(sorted(self._governance.codes)) or "none -- no vocabulary is wired"
+        raise ValueError(
+            f"{len(unresolved)} protection code(s) on the entries being indexed are not "
+            f"in this matcher's governance vocabulary: {', '.join(unresolved)}.\n"
+            f"Vocabulary declares: {known}.\n"
+            f"Pass the same vocabulary the glossary was validated against, e.g. "
+            f"NexusMatcher.from_config(governance='protection_classes.json'). Indexing "
+            f"anyway would return every match with governance=None, which reads as 'this "
+            f"entry has no class' rather than 'nobody told me what its class means'."
+        )
 
     def match_schema(
         self,
@@ -1150,6 +1220,17 @@ class NexusMatcher:
                         candidates_evaluated=len(fused),
                         reranking_applied=self._reranker is not None,
                     ),
+                    # Resolved for EVERY returned candidate, not just rank 1, because
+                    # "rank 1 is a direct identifier and rank 2 is not" is usually the
+                    # fact a reviewer decides on. `_index_dictionary` has already proven
+                    # every indexed code resolves, so this cannot quietly return None for
+                    # a code the vocabulary simply does not know. MatchResult drops it on
+                    # a REJECTED RANK 1 only -- a novel field inherits nothing. A rejected
+                    # runner-up KEEPS its class, because no field inherits from rank 2 and
+                    # blanking it deleted the rank-1-versus-rank-2 comparison this line
+                    # exists to provide: 66 of 104 runner-ups on the 26-field pack came
+                    # back classless although their entry carried a real code.
+                    governance=self._governance.get(entry.governance_code),
                 )
             )
 

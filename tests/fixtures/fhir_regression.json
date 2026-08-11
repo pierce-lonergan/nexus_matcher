@@ -12607,12 +12607,15 @@
   }
  ],
  "_baseline": {
-  "measured_on": "2026-08-06, bundled bge-small-en-v1.5-onnx-int8, dense-only retrieval",
-  "_method": "median of 3 runs through BundledOnnxProvider.embed_documents/embed_queries -- the exact path the test uses",
-  "p_at_1": 0.3933,
-  "r_at_5": 0.6333,
-  "mrr": 0.5152,
+  "measured_on": "2026-08-11, bundled bge-small-en-v1.5-onnx-int8, dense-only retrieval, encoder batch_size default 32",
+  "_method": "3 runs through BundledOnnxProvider.embed_documents/embed_queries -- the exact path the test uses. All three were bit-identical (spread 0.0000 on every metric), so this is the value rather than a median over a spread.",
+  "p_at_1": 0.38,
+  "r_at_5": 0.6533,
+  "mrr": 0.5096,
   "tolerance": 0.02,
+  "_replaces": "2026-08-06: p_at_1 0.3933, r_at_5 0.6333, mrr 0.5152. The TOLERANCE IS UNCHANGED at 0.02 -- the recorded values moved, the bar did not. Widening it instead would have been the wrong fix and is explicitly forbidden by the test that reads this block.",
+  "_what_moved_and_why": "Two changes to batch COMPOSITION, neither of them a change to retrieval quality. (1) 2026-08-09 replaced fixed-window batching with token-length sorting under a 4096-token budget. (2) 2026-08-11 set the encoder batch_size default to 32, after benchmarks/exp_encoder_batch_size.py established that the previous 512 capped nothing -- against a 4096-token budget no batch on this corpus ever reaches 512 rows, so 512, 1024 and 4096 produce byte-identical batch plans. int8 ONNX inference is not batch-invariant, so both changes re-shuffle which texts share a batch and the last bits of every embedding move with them. ATTRIBUTION, by re-measuring this fixture at each batch size on 2026-08-11: p_at_1 is 0.3800 at BOTH 512 and 32, so the entire -0.0133 p_at_1 movement predates the batch_size change and belongs to (1). Change (2) moved r_at_5 0.6333 -> 0.6533 and mrr 0.5056 -> 0.5096, i.e. UP; two of the three re-recorded numbers are higher than what they replace.",
+  "_this_is_not_evidence_about_accuracy": "300 queries is exactly the sample size that produced this repo's retracted 1.67-point p_at_1 'regression'. On the full 4598-entry / 1556-query corpus, change (1) moved p_at_1 UP (0.2757 -> 0.2815, exact McNemar p=0.37) while this fixture reads the same change as a 1.33-point DROP -- same change, opposite sign, because 300 queries cannot resolve a point of P@1. Change (2) is inconclusive against every batch size measured on the full corpus -- exact McNemar p = 0.33 .. 0.84 across the five sizes that batch differently from 512 at all -- even though 886 of 1556 queries change rank between 32 and 512. Read a movement here as 'batch composition changed', never as 'the system got better or worse'.",
   "_why_this_tolerance": "Repeated runs are BIT-IDENTICAL: three runs through the provider gave a spread of exactly 0.0000 on all three metrics, so int8 batch non-invariance does not move this number for a fixed input set -- it only bites when batch COMPOSITION changes (a different batch size, or entries added to the corpus). The tolerance therefore is not absorbing run-to-run noise; it exists so that a legitimate change to batching or corpus handling does not fail the build for a few thousandths. It is sized well below the smallest real regression tested: truncating query vectors to 64 dims, adding noise, and zeroing document dims past 128 each trip all three metrics, the mildest of those being a 6-point P@1 drop. Finer-grained comparison belongs in benchmarks/optimization_ledger.py, not in a pass/fail gate."
  }
 }

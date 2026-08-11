@@ -303,7 +303,14 @@ class DomainHierarchy:
 # DEFAULT HIERARCHY
 # =============================================================================
 
-# CCB (Consumer & Community Banking) domain hierarchy
+# A generic retail-banking domain hierarchy, supplied as a starting point.
+#
+# This is an illustrative default, not a recommendation: the terms below are the
+# ordinary vocabulary of the industry, and they will not line up with any given
+# organisation's data model. Domain scoring is only as good as the hierarchy it
+# runs against, so callers with a real taxonomy should load theirs instead --
+# see DomainHierarchy.from_dict(). Nothing else in the library assumes these
+# particular names.
 DEFAULT_HIERARCHY_DATA: dict = {
     "FINANCE": {
         "BANKING": {

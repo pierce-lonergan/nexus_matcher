@@ -59,6 +59,38 @@ if ($Target -eq "build") {
     exit 0
 }
 
+# ---------------------------------------------------------------------------
+# Release preflight -- the gate that stands between this artifact and PyPI.
+#
+# `twine check` reads the metadata. It cannot see any of what shipped broken in
+# 2.0.0: a console script installed without the dependencies it needs, a CLI that
+# crashed on a legacy Windows codepage, an `__all__` entry that broke
+# `from nexus_matcher import *` on a default install. Only .github/workflows/publish.yml
+# ran release_preflight.py, so the CI path was gated and THIS path -- the one a human
+# uses, under time pressure, when CI is red or slow -- was not.
+#
+# `--wheel` rather than letting the preflight build its own: the point is to check the
+# file that is about to be uploaded. A preflight that builds a second wheel proves
+# something about a file nobody publishes, which is the same class of mistake as the
+# stale `dist/` artifact that a review read as evidence of a shipped release.
+#
+# $LASTEXITCODE is tested explicitly. $ErrorActionPreference = "Stop" does not stop this
+# script on a native executable's non-zero exit, so without the test the preflight would
+# print "NOT FIT TO PUBLISH" and the upload would proceed anyway -- a gate that warns.
+# ---------------------------------------------------------------------------
+Write-Info "Running release preflight on the wheel that will be uploaded..."
+$wheels = @(Get-ChildItem -Path dist -Filter *.whl)
+if ($wheels.Count -ne 1) {
+    Write-Err "Expected exactly one wheel in dist/, found $($wheels.Count). Aborting publish."
+    exit 1
+}
+python scripts/release_preflight.py --wheel $wheels[0].FullName
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Release preflight failed! Aborting publish."
+    Write-Err "It exits non-zero on any failed check; do not upload past it."
+    exit 1
+}
+
 Write-Host ""
 
 if ($Target -eq "test") {

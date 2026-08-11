@@ -1,0 +1,6 @@
+id,business_name,logical_name,definition,data_type,domain,protection_class,classification,personal_information,direct_identifier,expected_problem
+GBF-9001,Passenger Loyalty Name,pax_loyalty_nm,The name a passenger uses on their loyalty account.,string,Passenger,MANIFEST_NAME,CREW_ONLY,yes,yes,the tier is derived from the code
+GBF-9002,Porthole Maintenance Log,porthole_maint_log,A record of maintenance carried out on a cabin porthole.,string,Voyage,PORTHOLE_SECRET,CREW_ONLY,no,no,not in the configured vocabulary
+GBF-9003,Gate Turnstile Count,gate_turnstile_cnt,The number of passengers a terminal turnstile counted through the gate.,integer,Passenger,BOARDING_PASS,OPEN_DECK,yes,no,the tier is derived from the code
+GBF-9004,Passenger Nickname,pax_nickname,A short name a passenger asked to be greeted by on board.,string,Passenger,PAX-SENSITIVE-OLD,SEALED_RESTRICTED,yes,yes,not in the configured vocabulary
+GBF-9005,Crew Next Of Kin Name,crew_nok_nm,The name of the person a crew member nominated as next of kin.,string,Crew,CREW_ROSTER,BRIDGE_SENSITIVE,yes,no,direct_identifier

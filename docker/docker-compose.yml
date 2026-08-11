@@ -22,6 +22,12 @@ services:
       - NEXUS_VECTOR_QDRANT_PORT=6333
       - NEXUS_CACHE_ENABLE_REDIS=true
       - NEXUS_CACHE_REDIS_URL=redis://redis:6379/0
+      # This stack mounts no glossary, so the matching routes cannot be answered and
+      # /health/ready would never go green. Declaring matching optional is the supported
+      # way to say that; without it the container is correctly reported unhealthy.
+      # Set NEXUS_API_DICTIONARY and NEXUS_API_GOVERNANCE (and drop this line) to bring
+      # matching up.
+      - NEXUS_API_MATCHING_OPTIONAL=true
     volumes:
       - ../src:/app/src:ro
       - nexus-data:/app/data
@@ -32,7 +38,10 @@ services:
       redis:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      # /health/ready, not /health: `/health` answers 200 with `status: "degraded"` when
+      # the dictionary failed to load, so `curl -f` passes and `depends_on:
+      # service_healthy` gates on a container that 503s every match.
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/ready"]
       interval: 10s
       timeout: 5s
       retries: 5

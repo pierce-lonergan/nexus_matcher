@@ -87,7 +87,7 @@ from __future__ import annotations
 # CHANGELOG's latest release, the built wheel, the API and the log envelope all
 # said 2.0.0, so `python -m build` would have produced a 1.0.0 artifact and the
 # publish workflow would have tried to release it over the existing 2.0.0.
-__version__ = "2.0.1"
+__version__ = "2.1.0"
 __author__ = "Pierce Lonergan"
 __email__ = "lonerganpierce@gmail.com"
 __license__ = "Apache-2.0"
@@ -106,6 +106,15 @@ __pkg_info__ = {
 # =============================================================================
 
 # Core types (always available)
+# Governance (always available -- pure domain, no optional dependency). Exported eagerly
+# because a caller has to build a GovernanceVocabulary BEFORE they can load a glossary
+# that carries protection codes; behind a lazy import it would be the one name in the
+# quickstart that does not autocomplete.
+from nexus_matcher.domain.governance import (
+    GovernanceVocabulary,
+    ProtectionClass,
+)
+
 # Domain models (always available)
 from nexus_matcher.domain.models import (
     DictionaryEntry,
@@ -143,6 +152,8 @@ __all__ = [
     # --- schema parsing --------------------------------------------------
     "FlattenedAvroParser",
     "GlossaryIndex",
+    # --- governance ------------------------------------------------------
+    "GovernanceVocabulary",
     "HnswVectorStore",
     # --- vector stores ---------------------------------------------------
     "InMemoryVectorStore",
@@ -152,6 +163,7 @@ __all__ = [
     "MatchingConfig",
     # Lazy imports (documented for IDE completion)
     "NexusMatcher",
+    "ProtectionClass",
     "ProtectionLevel",
     "Reranker",
     "Schema",

@@ -20,6 +20,7 @@ import hashlib
 from dataclasses import dataclass, field
 from typing import Any
 
+from nexus_matcher.domain.governance import ProtectionClass
 from nexus_matcher.shared.types.base import (
     DataType,
     DocumentId,
@@ -136,11 +137,21 @@ class DictionaryEntry:
         definition: Full definition/description
         data_type: Expected data type
         protection_level: Data classification level
+        governance_code: The controlled protection code this entry carries, in the
+            spelling the caller's `GovernanceVocabulary` declares, or None when the entry
+            has no code and therefore sits at the open tier. Only ever set from a code
+            that vocabulary DEFINES -- an unrecognised token is rejected at load time and
+            survives only as `source_metadata['governance_code_raw']`, because a stored
+            code nobody defined reads as governance and is not.
         domain: Business domain (e.g., "Sales", "Finance")
         parent_table: Parent table/entity name
         sample_values: Example values
         synonyms: Alternative names/terms
         metadata: Additional metadata
+
+    `id` doubles as the GOVERNANCE ID: it is the handle a caller quotes when they say
+    "this field inherits that entry's class", and `MatchResult.governance_id` promotes it
+    so nobody has to reach through the entry to find it.
     """
 
     id: DocumentId
@@ -149,6 +160,13 @@ class DictionaryEntry:
     definition: str
     data_type: DataType
     protection_level: ProtectionLevel = ProtectionLevel.INTERNAL
+    # Deliberately NOT part of `to_searchable_text()`, and therefore not part of
+    # `content_hash`. Governance is metadata about the term, not a description of it;
+    # embedding it would change every vector the day a glossary is re-classified and turn
+    # the next incremental sync into a full re-embed -- the exact cost `content_hash`
+    # exists to avoid, and a documented property of this package (a governance-only edit
+    # must encode zero texts).
+    governance_code: str | None = None
     domain: str = ""
     parent_table: str = ""
     sample_values: tuple[str, ...] = field(default_factory=tuple)
@@ -238,6 +256,10 @@ class MatchResult:
     """
     Domain model representing a match between a schema field and dictionary entry.
 
+    A caller matches a field IN ORDER TO INHERIT the entry's governance, so the two
+    things they came for -- which entry, and what class it carries -- are first-class
+    fields here rather than something to fish out of `source_metadata`.
+
     Attributes:
         schema_field: The source schema field
         dictionary_entry: The matched dictionary entry
@@ -246,6 +268,19 @@ class MatchResult:
         score_breakdown: Detailed component scores
         decision: Classification decision
         performance: Performance metrics for this match
+        governance: The protection class this match would confer, resolved through the
+            caller's vocabulary. None when the entry carries no code (the open tier), and
+            also on a RANK-1 REJECT, which confers nothing -- see `__post_init__`. A
+            rejected runner-up keeps its class: no field inherits from rank 2.
+        governance_id: The matched entry's id, which is the governance id. Always
+            populated; derived from `dictionary_entry` when not supplied, and refused
+            when supplied and different, because two answers to "which entry's class is
+            this?" is worse than none.
+
+    Populated on EVERY candidate, not only rank 1. A consumer deciding between rank 1 and
+    rank 2 needs to see that one of them is a personal-identifier class and the other is
+    not; that is usually the deciding fact, and having it on rank 1 alone makes the
+    comparison impossible without a second lookup.
     """
 
     schema_field: SchemaField
@@ -255,6 +290,11 @@ class MatchResult:
     score_breakdown: ScoreBreakdown
     decision: MatchDecision
     performance: PerformanceMetrics
+    # `ProtectionClass` is a plain frozen dataclass in the same layer, so this costs the
+    # domain no new dependency. Typed as Any-free on purpose: the annotation is what
+    # tells a reader that None is a real, meaningful state here.
+    governance: ProtectionClass | None = None
+    governance_id: str = ""
 
     def __post_init__(self) -> None:
         """Validate match result."""
@@ -262,6 +302,44 @@ class MatchResult:
             raise ValueError(f"Confidence must be 0.0-1.0, got {self.final_confidence}")
         if self.rank < 1:
             raise ValueError(f"Rank must be >= 1, got {self.rank}")
+
+        if not self.governance_id:
+            object.__setattr__(self, "governance_id", str(self.dictionary_entry.id))
+        elif self.governance_id != str(self.dictionary_entry.id):
+            raise ValueError(
+                f"governance_id {self.governance_id!r} does not name the matched entry "
+                f"{self.dictionary_entry.id!r}. The governance id IS the entry id; two "
+                f"different answers to 'whose class is this?' is worse than none."
+            )
+
+        # A REJECTED RANK 1 INHERITS NOTHING, and that is enforced here rather than at the
+        # call site so it cannot be forgotten by the next one.
+        #
+        # A rejected top match means "no entry in this glossary describes this field". A
+        # novel field -- the case that most needs a human -- would otherwise arrive
+        # carrying the class of the least-bad candidate, which is a confident-looking
+        # classification derived from a match the matcher itself rejected. That is
+        # NM-0005's shape inverted: instead of losing a class it should have had, the
+        # field gains one it should not.
+        #
+        # `rank == 1` is a CORRECTION, not the original rule. REJECT is a per-CANDIDATE
+        # verdict -- `_determine_decision` compares every rank against `review_threshold`
+        # -- but the justification above is a per-FIELD one, and a field inherits from
+        # rank 1 only. Unqualified, the strip also blanked the runner-ups: measured over
+        # the 26-field Gravel Bay pack at top_k=5, 66 of 104 runner-up candidates came
+        # back with no class although the indexed entry carried a real code, 16 of them
+        # direct identifiers. `decision` could not disambiguate the two nulls, because
+        # both read REJECT, so the wire said "no class" where it meant "withheld" -- and
+        # it deleted exactly the rank-1-versus-rank-2 comparison this class's own
+        # docstring says the field exists to provide.
+        #
+        # At the shipped thresholds the narrowed guard is LATENT: `review_threshold` is
+        # 0.50 and a rank-1 confidence cannot fall below `semantic_weight * fusion_alpha`
+        # = 0.63, so no top match can be rejected. It stays because that floor is a
+        # consequence of two tunable numbers, not a law; it fires for a caller who raises
+        # the threshold past it, which is what `TestRejectConfersNothing` constructs.
+        if self.rank == 1 and self.decision == MatchDecision.REJECT and self.governance is not None:
+            object.__setattr__(self, "governance", None)
 
     @property
     def is_auto_approved(self) -> bool:

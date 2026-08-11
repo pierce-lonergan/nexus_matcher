@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import codecs
 import json
+import re
 import sys
+from urllib.parse import urlparse
 
 import pytest
 from typer.testing import CliRunner
@@ -255,9 +257,28 @@ def test_bracketed_business_name_reaches_the_table(tmp_path, cli_inputs, install
 
 
 def test_info_points_at_the_real_repository():
-    """`info` advertised a repository that is not this project's."""
+    """`info` advertised a repository that is not this project's.
+
+    Asserted as a closed property rather than the absence of the one wrong URL
+    we happened to ship: EVERY remote URL in the output must belong to this
+    project. An absence check only catches the mistake already made, and the
+    original defect was a URL inherited from where the code was written -- a
+    class of mistake that recurs with a different string each time.
+    """
     result = runner.invoke(app, ["info"])
 
     assert result.exit_code == 0
     assert "https://github.com/pierce-lonergan/nexus_matcher" in result.output
-    assert "jpmc" not in result.output
+
+    # Rich wraps the panel, so strip box-drawing padding before matching.
+    urls = re.findall(r"https?://[^\s|)\]}]+", result.output)
+    assert urls, "info should advertise at least one URL"
+    for url in urls:
+        host = urlparse(url).netloc.split(":")[0]
+        assert host in {"github.com", "localhost", "127.0.0.1"}, (
+            f"info advertises an unexpected host: {url}"
+        )
+        if host == "github.com":
+            assert url.startswith("https://github.com/pierce-lonergan/nexus_matcher"), (
+                f"info advertises a repository that is not this project's: {url}"
+            )

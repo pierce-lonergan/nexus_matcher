@@ -29,8 +29,10 @@ Artifact: `benchmarks/results/eval_pipeline_combined.json`. Environment and cave
 
 ## What works and is measured
 
-- Matching from the Python API and the CLI, against Avro / JSON Schema / SQL DDL
-  schemas and Excel / CSV dictionaries.
+- Matching from the Python API, the CLI, and over HTTP (`POST /api/v1/match`,
+  `/api/v1/match/batch`, `/api/v1/feedback`), against Avro / JSON Schema / SQL DDL
+  schemas and Excel / CSV dictionaries. The endpoint calls the same matcher, so it makes
+  no accuracy claim of its own; it is the numbers above, over a wire.
 - Dense retrieval (sentence-transformers) + BM25 sparse retrieval, combined with linear
   min-max fusion at `fusion_alpha = 0.90`.
 - Hierarchical context enrichment of the query — the single largest accuracy factor.
@@ -54,14 +56,20 @@ production benefit without measuring it on your data.
 
 ## What does not exist
 
-- **HTTP matching.** The REST app serves health and introspection routes only.
 - **Dictionary CRUD, cache, or metrics endpoints.**
-- **API authentication or rate limiting.** The OpenAPI description mentions API keys;
-  no route enforces one. CORS is currently `allow_origins=["*"]`.
-- **Configuration of matching via YAML or environment variables.**
-  `NexusMatcher.from_config()` ignores its `config_path`; `NEXUS_*` settings are read
-  only by the logging setup.
-- **Dependency health probing.** `/health/ready` reports hardcoded component status.
+- **API authentication or rate limiting.** No route enforces a key and `/openapi.json`
+  declares no security scheme; the description says the service ships unauthenticated
+  instead of offering a header nothing reads. CORS is refused unless
+  `NEXUS_API_CORS_ORIGINS` names the origins.
+- **Configuration of matching via YAML, or via an environment variable per setting.**
+  `from_config()` does honour a config file now — JSON or TOML, with an unknown key
+  raising rather than being discarded — and the service reads one from
+  `NEXUS_API_MATCHING_CONFIG`. A `.yaml` file is parsed as JSON and fails, and no
+  `NEXUS_*` variable sets an individual matching parameter; the `NEXUS_API_*` set
+  configures the HTTP service, not the matcher's numbers.
+- **Dependency health probing.** `/health/ready` checks `matcher` for real — 503 when no
+  dictionary loaded — but `api` and `config` are still hardcoded `True`, and nothing
+  probes a vector store or a cache.
 - **GPU support.** Every measurement in this repo is CPU-only, one machine.
 
 ---
@@ -86,12 +94,23 @@ production benefit without measuring it on your data.
 2. Raise coverage to the configured 80% gate, or lower the gate deliberately.
 3. Wire the cache layer into the matching pipeline, or remove it from the documented
    architecture.
-4. Implement an HTTP matching endpoint, or stop describing the service as a matching API.
-5. Make `from_config()` honour a config file, or remove the parameter.
-6. Make `/health/ready` probe real dependencies.
-7. Expose a `/metrics` route for the existing Prometheus backend.
-8. Regenerate the multi-reranker comparison artifact.
-9. Measure at catalogue scale and on GPU.
+4. Probe real dependencies from `/health/ready`. `matcher` is a real check; `api` and
+   `config` are still set unconditionally.
+5. Expose a `/metrics` route for the existing Prometheus backend.
+6. Regenerate the multi-reranker comparison artifact.
+7. Measure at catalogue scale and on GPU.
+
+An earlier revision of this list carried a demand to build the HTTP matching endpoint. It
+had already been built. This list and eight other places went on describing it as absent for
+as long as nothing checked — `tests/packaging/test_documented_routes.py` is the gate that now
+fails the build when a document contradicts the live route table, in either direction.
+
+Three statements in the section above went stale the same way in the session that landed
+those routes: CORS, the readiness components and the OpenAPI description all changed
+underneath sentences nobody re-read. Those are claims about behaviour rather than about
+routes, so `tests/packaging/test_documented_behaviour.py` settles them against a live
+`create_app()` instead. Its own docstring is explicit that it checks four behaviours and
+cannot read prose.
 
 ---
 

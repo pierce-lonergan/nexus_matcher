@@ -78,7 +78,7 @@ def sample_schema(sample_schema_field: SchemaField) -> Schema:
     return Schema(
         name="CustomerTransaction",
         fields=fields,
-        namespace="com.example.ccb",
+        namespace="com.example.banking",
         source_format="avro",
     )
 
