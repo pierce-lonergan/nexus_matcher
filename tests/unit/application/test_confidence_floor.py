@@ -218,7 +218,7 @@ class TestTheFloorIsReal:
         """
         session = _matcher(MatchingConfig()).match_schema_session(_SCHEMA)
         assert session.minimum_achievable_confidence == pytest.approx(0.63)
-        with pytest.raises(ValueError, match="0.63"):
+        with pytest.raises(ValueError, match=r"0\.63"):
             session.get_low_confidence_fields(0.6)
 
 
