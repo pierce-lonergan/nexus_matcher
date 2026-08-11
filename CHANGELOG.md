@@ -67,7 +67,7 @@ build artifact, not a release; everything in this section is unreleased work.
   +808 MiB before its 413, and eight concurrent ones cost +3.5 GiB with **zero** 503s —
   `BoundedWorkPool` never saw them, so on a memory-capped container the outcome is not a
   413, it is an OOMKill with nothing shedding first. A pure-ASGI `BodySizeLimitMiddleware`
-  now counts bytes as they arrive and stops the moment the cap is crossed, with or without
+  counts bytes as they arrive and refuses the moment the cap is crossed, with or without
   a `Content-Length`; registered last so it is outermost, which is the only position where
   it gets `receive` before the body has been streamed through. The cap is **derived** from
   `max_batch_fields` and `FieldSpec`'s own `max_length`s (×4 for UTF-8) rather than typed
@@ -77,6 +77,32 @@ build artifact, not a release; everything in this section is unreleased work.
   below what the field caps admit, because a 413 that contradicts the schema a client
   generated from is worse than no cap. Callers already receiving 413 now receive it earlier,
   with `details.limit_bytes` and `details.observed_bytes`.
+
+  **A refused body within twice the cap is now read and discarded before the 413 is sent**,
+  bounded at 2 × `max_bytes` (19.7 MB at the default) and 2.0 s of wall time, whichever
+  comes first. Outside those bounds nothing is read, exactly as before. This costs read
+  bandwidth and up to two seconds of connection time per refusal, and it buys the 413
+  actually arriving: refusing a body the client is still writing closes the socket with
+  bytes unread, which is an RST, and an RST discards the response already sent — the caller
+  sees a transport error instead of the readable 413 telling it to re-chunk.
+
+  Measured against the Java client's own transport on a pooled connection, a mis-chunked
+  batch 1.06× over the cap: **34/40 readable before, 120/120 after**. A partial drain was
+  tried and is *worse than doing nothing* (375/400 at 256 KiB against 392/400 draining
+  nothing) — the client refills the kernel buffer faster than a bounded read empties it, so
+  the bytes are still unread at close and the bandwidth bought nothing. Only reaching the
+  end of the body removes the reset, so the rule is drain fully or not at all, decided
+  before the first read from the declared length.
+
+  Memory is unaffected, which is the whole point: draining discards each chunk, so retained
+  bytes stay O(chunk). Sustained 15 rounds × 16 concurrent × 18.5 MiB — 4.44 GiB of body —
+  moved server RSS 175 → 178 MiB, against the +3.5 GiB this middleware was written to stop.
+
+  **Residual, stated because it is easy to overstate this fix:** a body beyond twice the cap
+  is still refused unread and still loses its 413 about 15% of the time on a pooled
+  connection. The fix moves the threshold so realistic mis-chunked batches fall inside it;
+  it does not make an arbitrarily large body safe to send. Treat a transport failure on a
+  large request body as a probable 413 and re-chunk rather than retry.
 
   **That 413 now carries `X-Request-ID` and `X-Response-Time-Ms`, and the request is logged
   under the id the caller is holding.** Being outermost is what makes the byte cap work, and
@@ -112,6 +138,32 @@ build artifact, not a release; everything in this section is unreleased work.
   again, which is the job `docs/API_REFERENCE.md`'s "Not implemented" table already does.
 
 ### Changed — BREAKING
+
+- **`tiers_most_open_first` is now enforced, where it was previously read by no code.** The
+  key appeared in the shipped example vocabulary and in nothing else — an adopter copying
+  the pack inherited a declaration that did nothing. It now validates the caller's file
+  against **itself**: every tier a class derives must appear in the list, the declared
+  `open_classification` must appear, no tier may appear twice (compared after
+  normalisation, so `"Sealed "` and `"sealed"` are one rung), and a bare string is refused
+  rather than read one letter per rung. A vocabulary that omits a tier its own classes use
+  now fails to load, naming both sides. This is validation of the caller's own declared
+  ordering, not a taxonomy this library supplies — it still supplies none.
+
+  Two deliberate non-rules: a declared tier no class currently uses stays legal, because a
+  policy ladder may have unreached rungs; and the `UNCLASSIFIED` sentinel is exempt, so
+  this library's own default cannot fail this library's own check.
+
+  Fixing this surfaced a second defect the review had not found: `tiers_most_open_first`
+  was missing from the reserved-key set, so a `{code: {...}}`-shaped document that also
+  declared the ordering was refused outright with *"no protection classes found"* — a
+  message pointing at the classes, which were fine.
+
+- **`MatchRequest` no longer rejects unknown top-level keys.** `extra="forbid"` on the
+  envelope made v1 non-extensible in both directions: a caller sending a key a newer
+  server understands got a 422 from an older one. `FieldSpec` stays strict — the typo
+  argument holds where the field names are, and relaxing it has a documented accuracy
+  cost. A misspelled `fields` is still a `missing` error, and an unknown key *inside* a
+  field is still a 422.
 
 - **`ScoreBreakdown.semantic_score` is renamed to `fused_retrieval_score`.** It never was
   a semantic similarity. It is the min-max-normalised *fused retrieval* score, rescaled
@@ -277,6 +329,20 @@ build artifact, not a release; everything in this section is unreleased work.
   alongside it.
 
 ### Added
+
+- **`governance.enhancement` now crosses the wire**, appended as the sixth key of the
+  governance object so existing key order is unchanged. It is the caller's own instruction
+  for how to protect a field — the thing a consumer most needs after learning the field is
+  sensitive — and it was resolved internally and then dropped before serialisation. `null`
+  for a class that declares none, which five of the nine example classes do; read with
+  `getattr`, not the drift path, because routing it through drift would make this repo's
+  own example pack a 500.
+
+- **Responses carry a `vocabulary` block** on both match routes:
+  `{"openClassification": ..., "tiersMostOpenFirst": [...]}`. Without it a
+  `"governance": null` is uninterpretable — a consumer cannot tell which tier an uncoded
+  field sits at, and a Java service calling this API has no second copy of the vocabulary
+  file to consult. Both values are the caller's own, echoed back.
 
 - **Governance inheritance over HTTP.** `create_app()` registers `POST /api/v1/match`,
   `POST /api/v1/match/batch` (the same service and projection at a higher field cap) and
@@ -604,6 +670,38 @@ build artifact, not a release; everything in this section is unreleased work.
   a mismatch between the returned schema and the results computed from it.
 
 ### Changed — defaults, all measurement-driven
+
+- **Encoder `batch_size` default 512 → 32**, hoisted out of four repeated signatures into
+  one named `DEFAULT_BATCH_SIZE`. Artifact: `exp_encoder_batch_size.json`.
+
+  **512 was never a cap.** Batches are assembled against a 4096-token budget, and on the
+  full FHIR corpus no batch ever reaches 512 rows — so 512, 1024 and 4096 produce
+  byte-identical batch plans (65 batches, widest 315 rows, `batches_capped_by_rows: 0`)
+  and byte-identical embeddings. Whatever the number was chosen to do, it had stopped
+  doing it when token-budget batching landed.
+
+  Cost, interleaved best-of-3 against a noise band calibrated on identical code in the
+  same session, on an idle machine per H-007: **32 is 5.6% faster at one intra-op thread
+  (band 0.7%) and 38.6% faster at the shipped eight (band 6.2%)** — outside the band in
+  both regimes, which is the H-003 requirement that the win not be a thread artifact.
+  A third run at 36–88% CPU busy produced bands of 15–48% and is retained in the artifact
+  as `cost_UNMEASURABLE_busy_machine` rather than averaged in; it certifies nothing.
+
+  **No accuracy claim is made in either direction.** Paired exact McNemar against 512 over
+  1556 queries: every batch size is inconclusive (32: 45 gained, 48 lost, p=0.84). int8
+  inference is genuinely not batch-invariant — 886 of 1556 queries change rank between 32
+  and 512 — but the movement is symmetric.
+
+  Two numbers this project previously believed, corrected by re-measuring rather than
+  re-quoting: the padding ratio at 32 vs 512 is **1.0151 vs 1.0282**, a 1.29% gap, not the
+  1.048 vs 2.230 recorded earlier — that 2.2x belongs to the pre-token-budget fixed-window
+  batching and did not survive it, so padding is *not* the mechanism behind the speedup.
+  And "512 is ~11.9% slower" had no artifact anywhere in the repo; the direction was right,
+  the magnitude is machine- and thread-dependent across 4.8–38.6%.
+
+  32 rather than 16 because 16 is 1.7 points better at one thread and 8.8 points worse at
+  the thread count that ships. That tiebreak is the weakest link in this decision and is
+  labelled as such where the constant lives; both values beat 512 cleanly.
 
 - **Query text now includes the parent path.** `satscores sname` instead of `sname`.
   Worth **+20.1 points of P@1** (0.491 → 0.691) — the largest single accuracy factor in

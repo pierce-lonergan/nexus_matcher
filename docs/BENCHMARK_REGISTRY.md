@@ -181,6 +181,81 @@ batch-32 figures those docs cited (12.5 ms → 9.85 ms) are a **1.27×** speedup
 also strongly batch-size dependent and was measured on a machine without VNNI, the
 instruction set INT8 inference benefits most from.
 
+### EXP-ENCODER-BATCH — what the encoder `batch_size` default should be
+
+- **Script:** `benchmarks/exp_encoder_batch_size.py`
+- **Artifact:** `benchmarks/results/exp_encoder_batch_size.json`
+- **Data:** full FHIR corpus, 4598 entries × 1556 queries, 252,168 real tokens.
+- **Component, not pipeline:** dense retrieval through `BundledOnnxProvider` only — no
+  BM25, no fusion, no reranking. The P@1 figures below are **encoder-only on the full
+  corpus** and are not this system's accuracy; see EVAL-PIPELINE for that.
+- **Outcome:** default changed **512 → 32** on 2026-08-11.
+
+**Structure (exact, deterministic — no machine state involved).** `_plan_batches` caps a
+batch by `MAX_BATCH_TOKENS` *and* by rows, so `batch_size` only binds on the short end of
+the length-sorted order.
+
+| batch_size | batches | padded tokens | padding ratio | batches actually row-capped |
+|---|---|---|---|---|
+| 16 | 386 | 254,742 | 1.0102 | 383 |
+| **32** | **196** | **255,979** | **1.0151** | **187** |
+| 64 | 107 | 257,095 | 1.0195 | 82 |
+| 128 | 72 | 258,547 | 1.0253 | 25 |
+| 256 | 65 | 259,518 | 1.0291 | 2 |
+| 512 (old default) | 65 | 259,281 | 1.0282 | **0** |
+| 1024 | 65 | 259,281 | 1.0282 | 0 |
+| 4096 | 65 | 259,281 | 1.0282 | 0 |
+
+**The old default of 512 was not a cap.** No batch on this corpus reaches 512 rows, so
+512, 1024 and 4096 produce byte-identical batch plans and byte-identical embeddings.
+
+**Correction.** A padding ratio of **2.230x for 512** has been quoted in this repo. It is
+wrong for the current encoder — it belongs to the pre-token-budget fixed-window batching
+(`tests/unit/infrastructure/test_bundled_onnx_batching.py` calls it "where the 2.2x came
+from"). Measured on today's code the 32-vs-512 padding gap is **1.29% of tokens**, not
+2.1×, so padding is *not* the mechanism behind the speedup.
+
+**Cost.** Interleaved, best-of-3, each block beside the noise band measured on identical
+code in the same session (H-007). Taken at 11.7% → 25.3% CPU busy.
+
+| threads | band | 16 | 32 | 64 | 512 |
+|---|---|---|---|---|---|
+| 1 | 0.7% | 1.074× | 1.056× | 1.030× | 1.000× |
+| 8 (the shipped cap) | 6.2% | 1.274× | **1.386×** | 1.294× | 1.000× |
+
+**32 rather than 16** because the regimes disagree and H-003 requires a batch-scheduling
+knob to win at 1 thread *and* at the library default: 16 is 1.8 points better at one
+thread and 11.2 points **worse** at the thread count that ships. Treat the ~5% 1-thread
+margin as the durable figure — it reproduced at 4.8% and 5.6% in two quiet windows. The
+8-thread margin swings 10.6–38.6% with machine state; do not quote it.
+
+**Accuracy: no batch size is distinguishable from any other.** Paired, full corpus, exact
+McNemar against 512.
+
+| batch_size | P@1 | R@5 | MRR | queries whose rank moved | gained@1 | lost@1 | McNemar p |
+|---|---|---|---|---|---|---|---|
+| 16 | 0.2879 | 0.5373 | 0.4049 | 883 | 47 | 37 | 0.3261 |
+| **32** | 0.2796 | 0.5392 | 0.4005 | 886 | 45 | 48 | **0.8358** |
+| 64 | 0.2763 | 0.5424 | 0.3977 | 882 | 35 | 43 | 0.4282 |
+| 128 | 0.2783 | 0.5398 | 0.4010 | 879 | 38 | 43 | 0.6570 |
+| 256 | 0.2847 | 0.5386 | 0.4024 | 840 | 38 | 33 | 0.6353 |
+| 512 | 0.2815 | 0.5334 | 0.3996 | — | — | — | — |
+
+int8 inference is genuinely not batch-invariant — **886 of 1556 queries change rank**
+between 32 and 512 — but the churn is symmetric and every size measured is inconclusive.
+Among the five that batch differently from 512 at all, p runs 0.33 … 0.84; 1024 and 4096
+are p = 1 by construction. **No accuracy claim is made for this change**, in either
+direction. The 1.67-point P@1 "regression" once attributed to `batch_size` came from a
+300-query fixture and does not survive a paired test on the full corpus.
+
+**One run was discarded as UNMEASURABLE and kept in the artifact anyway** (key
+`cost_UNMEASURABLE_busy_machine`). Taken earlier the same day at 36–88% CPU busy, its
+bands were 15.3% / 16.4% / 48.1% and *every* comparison was inconclusive, including ones
+the quiet run resolves cleanly. Its point estimates agree in direction with the quiet run
+at all three thread counts; nothing in it may be quoted. It also carries the only
+32-intra-op-thread leg measured, where per-trial spread reached 135% — H-003's saturated
+box, and the reason the shipped thread count is capped at 8.
+
 ### SUITE-003-REAL — ColBERT MaxSim, cold vs pre-computed
 
 - **Script:** `benchmarks/suite_003_real_colbert.py`
@@ -292,7 +367,7 @@ artifacts**. Reproduce before relying on them.
 | `InMemoryVectorStore` no longer re-normalises the whole corpus matrix per query | 68.9 ms → 3.2 ms at 50k × 768, and one 153 MB allocation per query removed |
 | Edit distance: pure-Python DP → `rapidfuzz` | ~145× faster, bit-identical results |
 | BM25 backend comparison: `rank_bm25` vs `bm25s` at 50k docs | 38.7 ms/query vs 0.12 ms/query. **`bm25s` is not adopted** — the shipped `BM25Retriever` still uses `rank_bm25`. |
-| Embedding batch size | ~128 texts/sec at batch 1 vs ~1691 at batch 128 |
+| Embedding batch size | ~128 texts/sec at batch 1 vs ~1691 at batch 128. **Superseded** for the bundled encoder by EXP-ENCODER-BATCH, which has an artifact. Note it does not contradict that row: batch 1 versus batch 128 is a different question from where the optimum sits among 16–4096, and the bundled encoder now caps batches by tokens rather than rows. |
 
 ### Fixed defects that had inflated or destroyed earlier measurements
 
@@ -344,6 +419,16 @@ numpy     2.3.5
 The C-grade mock suites and SUITE-004c / SUITE-005 were recorded earlier on
 Linux / Python 3.12 with AVX-512 and VNNI available. **Do not compare timings across
 those two environments.**
+
+EXP-ENCODER-BATCH was measured on the same Windows machine but a later toolchain —
+Python 3.13.4, numpy 2.3.5, **onnxruntime 1.28.0** (SUITE-002-REAL used 1.23.2). It uses
+the bundled int8 ONNX encoder and no torch at all. Its own artifact records this block,
+so check there rather than assuming this one applies.
+
+**Timings on this machine need their noise band quoted beside them, always.** Identical
+code measured 0.7% spread idle and 48.1% at 88% CPU busy in a single day (H-007). A
+throughput number with no band is not a result here, and a run taken above ~25% busy
+should be recorded as UNMEASURABLE rather than averaged in.
 
 ---
 

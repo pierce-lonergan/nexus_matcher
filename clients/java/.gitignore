@@ -1,0 +1,7 @@
+# Maven build output. `target/` is already ignored repository-wide; repeated here so this
+# module is self-contained if it is ever extracted.
+target/
+
+# Written by serve-fixtures.sh while the integration-test servers are running.
+.fixture-*.log
+.fixture-pids

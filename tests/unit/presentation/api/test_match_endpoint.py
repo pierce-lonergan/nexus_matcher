@@ -28,6 +28,7 @@ import json
 import pytest
 from fastapi.testclient import TestClient
 
+from nexus_matcher.domain.governance import OPEN_CLASSIFICATION
 from nexus_matcher.presentation.api.app import create_app
 from nexus_matcher.presentation.api.matching import _to_schema_field
 from nexus_matcher.presentation.api.schemas import FieldSpec, MatchResponseView
@@ -35,6 +36,9 @@ from tests.unit.presentation.api._support import (
     FICTIONAL_VOCABULARY,
     GLOSSARY,
     STAND_IN_CONFIDENCE,
+    TIER_GUARDED,
+    TIER_OPEN,
+    TIER_SEALED,
     FakeMatcher,
     build_api_matcher,
     request_fields,
@@ -60,7 +64,15 @@ GOVERNANCE_KEYS = (
     "classification",
     "personalInformation",
     "directIdentifier",
+    # Last, and appended rather than inserted: the five before it are the shape a Java
+    # client has already generated against.
+    "enhancement",
 )
+
+# The top level, which was `results` alone. `vocabulary` is what makes a `governance` of
+# null readable -- it names the tier an uncoded field sits at -- and it is second because
+# appending is the only additive edit to a key order that is itself the contract.
+RESPONSE_KEYS = ("results", "vocabulary")
 
 
 def client_for(matcher: object, **kwargs: object) -> TestClient:
@@ -316,6 +328,7 @@ class TestGovernancePassthrough:
                 "classification": expected.classification,
                 "personalInformation": expected.personal_information,
                 "directIdentifier": expected.direct_identifier,
+                "enhancement": expected.enhancement,
             }
 
     def test_an_entry_with_no_code_serialises_governance_as_an_explicit_null(self, real_client):
@@ -423,6 +436,79 @@ class TestGovernancePassthrough:
             "a field whose best candidate the matcher rejected inherited that candidate's "
             "class anyway"
         )
+
+
+# =============================================================================
+# THE VOCABULARY BLOCK -- WHAT A NULL GOVERNANCE MEANS
+# =============================================================================
+
+
+class TestTheResponseSaysWhatItsNullsMean:
+    """
+    `governance: null` was uninterpretable from the response alone.
+
+    `open_classification` -- the tier an uncoded field sits at -- was reachable NOWHERE
+    over HTTP: not on a route, and the string appeared nowhere in `/openapi.json`. So a
+    Java client receiving null had to open the vocabulary JSON on the server to learn which
+    tier that field is at, and a response pasted into a ticket could not be read at all
+    without it. Verified before the fix on this fixture: 4 of 18 candidates null, and
+    `openClassification` absent from both the body and the served spec.
+    """
+
+    def test_the_top_level_keys_are_exactly_the_contract_in_order(self, real_client):
+        assert tuple(post_match(real_client).json()) == RESPONSE_KEYS
+
+    def test_the_response_names_the_tier_that_a_null_governance_means(self, real_client):
+        """
+        Pinned against the fixture's own declared open tier, not against whatever the
+        endpoint returned. And asserted alongside a real null, so the block is checked to
+        answer the question the response actually raises rather than to merely exist.
+        """
+        body = post_match(real_client).json()
+        uncoded = body["results"]["billing.tariff_band"][0]
+
+        assert uncoded["governance"] is None
+        assert body["vocabulary"]["openClassification"] == TIER_OPEN
+
+    def test_the_callers_own_tier_ordering_crosses_the_wire_in_their_own_order(self, real_client):
+        """
+        Most open FIRST, as declared, because the order is the entire content -- it is the
+        only thing that can rank two of the caller's tiers, and sorting it would replace
+        their ladder with an alphabetical one.
+        """
+        vocabulary = post_match(real_client).json()["vocabulary"]
+        assert vocabulary["tiersMostOpenFirst"] == [TIER_OPEN, TIER_GUARDED, TIER_SEALED]
+
+    def test_a_matcher_with_no_vocabulary_reports_the_sentinel_rather_than_a_plausible_tier(
+        self, fake_client
+    ):
+        """
+        `FakeMatcher` exposes no vocabulary at all, which is the shape a caller's own
+        matcher adapter has. The answer must be the domain's sentinel -- a word no real
+        taxonomy uses -- so "nothing is configured" cannot be misread as a configured tier,
+        and it must not be a 500: an unreadable vocabulary costs one optional block, not
+        the endpoint.
+        """
+        vocabulary = post_match(fake_client).json()["vocabulary"]
+
+        assert vocabulary["openClassification"] == OPEN_CLASSIFICATION
+        assert vocabulary["tiersMostOpenFirst"] == []
+
+    def test_the_published_schema_describes_the_block_for_a_generated_client(self, real_client):
+        """
+        A Java client generates from `/openapi.json`, so a block with no description is a
+        DTO whose meaning lives in a docstring the build step never reads. Neither field
+        may be typed as a closed set: both carry the caller's own vocabulary.
+        """
+        schemas = real_client.get("/openapi.json").json()["components"]["schemas"]
+        properties = schemas["VocabularyView"]["properties"]
+
+        for name in ("openClassification", "tiersMostOpenFirst"):
+            assert properties[name].get("description"), f"{name} is published undescribed"
+            assert "enum" not in json.dumps(properties[name]), (
+                f"{name} was typed as a closed set, which hard-codes one customer's "
+                f"taxonomy into the published schema"
+            )
 
 
 # =============================================================================
@@ -575,6 +661,45 @@ class TestRequestValidation:
 
         violations = response.json()["error"]["details"]["violations"]
         assert any("documentation" in v["location"] for v in violations), violations
+
+    def test_an_unknown_key_on_the_ENVELOPE_is_ignored_so_v1_can_be_extended(self, real_client):
+        """
+        The other half of that asymmetry, and the reason it is not an inconsistency.
+
+        `MatchRequest` used to `forbid` extras too, which made v1 non-extensible in BOTH
+        directions of a version skew: a caller sending a key a newer server understands got
+        a 422 from an older one, and kept getting 422s from a newer one until their own
+        build caught up. Under that rule the first optional request field this endpoint
+        ever gains is a breaking change requiring a coordinated deploy of somebody else's
+        Java pipeline.
+
+        The cost is bounded and visible: a misspelled `top_k` is now the default 5, which
+        the caller reads off the response they already have. Nothing about a
+        CLASSIFICATION can be lost this way -- that is `FieldSpec`, which stays strict.
+        """
+        response = real_client.post(
+            "/api/v1/match",
+            json={"fields": request_fields(), "top_k": 1, "traceId": "abc-123"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert tuple(response.json()) == RESPONSE_KEYS
+
+    def test_the_field_spec_stays_strict_while_the_envelope_does_not(self, real_client):
+        """
+        Both rules in one assertion, because the pair is the decision and either one alone
+        reads as an accident. Same body twice: an extra key on the envelope is fine, the
+        same extra key inside a field is a 422.
+        """
+        fields = [{"name": "a", "path": "t.a"}]
+
+        assert real_client.post("/api/v1/match", json={"fields": fields, "x": 1}).status_code == 200
+        assert (
+            real_client.post(
+                "/api/v1/match", json={"fields": [{"name": "a", "path": "t.a", "x": 1}]}
+            ).status_code
+            == 422
+        )
 
     def test_top_k_above_the_servers_results_per_field_is_refused_with_the_cap(self):
         """

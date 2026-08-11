@@ -407,11 +407,26 @@ include = [
     "/tests",
     "/docs",
     "/benchmarks",
-    "README.md",
-    "CHANGELOG.md",
-    "LICENSE",
-    "QUICKSTART.md",
-    "py.typed",
+    # `/examples` because docs/GOVERNANCE.md, QUICKSTART.md and the CHANGELOG all walk the
+    # reader through examples/governance/, and an sdist that omits it ships instructions
+    # for files it does not contain. 208 KB, 15 files. Before this was rooted, the ONLY
+    # examples/ file in the tarball was its README -- the description without the pack.
+    #
+    # `/scripts` because tests/packaging invokes check_doc_numbers.py and
+    # release_preflight.py, so without it an unpacked sdist cannot run the suite it ships:
+    # collection fails outright with FileNotFoundError, not a skip.
+    "/examples",
+    "/scripts",
+    # ROOTED, every one of them. Hatchling matches an UNROOTED pattern at any depth, so a
+    # bare "README.md" swept in clients/java/README.md -- a file that was not tracked at
+    # the time -- and examples/governance/README.md, which is the only examples/ file in
+    # the sdist and therefore describes a pack the tarball does not contain. An sdist whose
+    # contents depend on what happens to be sitting in the working directory is not a
+    # reproducible artifact.
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE",
+    "/QUICKSTART.md",
 ]
 exclude = [
     "/.github",

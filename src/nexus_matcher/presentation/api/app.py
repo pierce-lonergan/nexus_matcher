@@ -832,12 +832,20 @@ Cross-origin access is refused unless the operator names the permitted origins i
     #
     # Registration order is reversed by Starlette, so this wraps everything above it and
     # gets `receive` before `BaseHTTPMiddleware` -- which never hands a middleware
-    # `receive` at all -- has a chance to stream the body through. Outermost is also the
-    # only position where a refusal costs nothing: the point of the middleware is that the
-    # bytes past the cap are never pulled off the wire, not that a 413 is eventually
-    # returned. `body_byte_cap` rather than a literal, so an operator who raises
+    # `receive` at all -- has a chance to stream the body through. What the cap protects is
+    # MEMORY: an oversized body is never buffered or parsed, and 8 concurrent 198 MiB
+    # requests move RSS by ~1 MiB instead of 3.5 GiB.
+    #
+    # It is NOT true that no byte past the cap is read. A body within twice the cap is read
+    # and discarded first, because refusing while the client is still writing closes the
+    # socket with bytes unread, and that RST destroys the 413 the caller needs in order to
+    # know to re-chunk. Draining discards, so this costs bandwidth and up to 2 s, never
+    # memory. `body_limit.py` carries the measurements and the reason a PARTIAL drain is
+    # worse than none.
+    #
+    # `body_byte_cap` rather than a literal, so an operator who raises
     # NEXUS_API_MAX_BATCH_FIELDS does not inherit a stale cap and a 413 naming the wrong
-    # limit. See `body_limit.py` for the measurements.
+    # limit.
     app.add_middleware(BodySizeLimitMiddleware, max_bytes=service_limits.body_byte_cap)
 
     # Root endpoint

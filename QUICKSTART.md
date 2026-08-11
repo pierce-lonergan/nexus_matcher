@@ -279,15 +279,33 @@ order, byte-identical between two identical requests:
           "name": "Passenger manifest identity",
           "classification": "SEALED_RESTRICTED",
           "personalInformation": true,
-          "directIdentifier": true
+          "directIdentifier": true,
+          "enhancement": "MASK_IN_LOGS"
         },
         "confidence": 0.904167,
         "decision": "AUTO_APPROVE"
       }
     ]
+  },
+  "vocabulary": {
+    "openClassification": "OPEN_DECK",
+    "tiersMostOpenFirst": [
+      "OPEN_DECK",
+      "CREW_ONLY",
+      "BRIDGE_SENSITIVE",
+      "SEALED_RESTRICTED"
+    ]
   }
 }
 ```
+
+`vocabulary` echoes back the two things a caller cannot otherwise infer from a response:
+which tier an uncoded field sits at, and the order the caller's own file declares its
+tiers in. Without it a `"governance": null` is uninterpretable without a second copy of
+the vocabulary file, which a service consuming this API may not have.
+
+`enhancement` is the caller's own instruction for how to protect the field — it is
+whatever their vocabulary declares, and it is `null` for a class that declares none.
 
 Read `decision`, not `confidence`. `confidence` is rank-relative and will move with any
 retrieval change — do not diff against the number above.

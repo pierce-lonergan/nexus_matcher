@@ -94,10 +94,12 @@ Frozen dataclass, `nexus_matcher.application.use_cases.match_schema.MatchingConf
 | `edit_distance_weight` | 0.05 | |
 | `type_weight` | 0.05 | |
 | `domain_weight` | 0.15 | |
-| `auto_approve_threshold` | 0.85 | Calibrated — `benchmarks/results/exp_calibration_combined.json` |
+| `auto_approve_threshold` | 0.87 | Calibrated — `benchmarks/results/exp_calibration_combined.json`, where 0.87 is the point that holds auto-approve precision at 0.95 (coverage 0.12). An earlier revision of this table printed 0.85; that is the 0.90-precision point on the same curve, and it was never the shipped default. |
 | `review_threshold` | 0.50 | Below this, `REJECT` |
 | `min_confidence_gap` | 0.10 | Minimum margin over the runner-up required to auto-approve |
 | `results_per_field` | 5 | Matches returned per field |
+| `expand_query_abbreviations` | `False` | Query-side abbreviation expansion. Off because it was measured at **-2.0 points** of P@1: one wrong expansion corrupts the single query vector. |
+| `dictionary_alias_count` | 0 | Dictionary-side alias generation. Off because the gain inverts with corpus size — +1.9 at 688 entries, **-13.7 at 10k and -18.8 at 30k**. Never enable without re-measuring at your own corpus size. |
 
 #### `BatchProcessor`
 
@@ -170,7 +172,7 @@ is also created for `uvicorn nexus_matcher.presentation.api.app:app`.
 
 | Method | Path | Response |
 |---|---|---|
-| POST | `/api/v1/match` | `MatchResponseView` — `results`, one entry per input field, keyed by the caller's own `path`, in the order sent. Field cap `NEXUS_API_MAX_FIELDS` (default 100). |
+| POST | `/api/v1/match` | `MatchResponseView` — `results`, one entry per input field, keyed by the caller's own `path`, in the order sent, plus the top-level `vocabulary` block described below. Field cap `NEXUS_API_MAX_FIELDS` (default 100). |
 | POST | `/api/v1/match/batch` | Identical contract and one shared implementation; the only difference is the cap, `NEXUS_API_MAX_BATCH_FIELDS` (default 250). |
 | POST | `/api/v1/feedback` | **201** and `FeedbackResponseView` — the stored record echoed back, server `receivedAt` included. Appended to `NEXUS_API_FEEDBACK_PATH`; **503** when that is unset, **422** on a malformed record, **500** when the append itself fails. |
 | GET | `/` | `{"service": "nexus-matcher", "version": …, "docs": "/docs"}`. `version` is the installed package's `__version__`, resolved at startup — this document used to print a literal here, and a literal is a second copy that drifts. |
@@ -182,9 +184,20 @@ is also created for `uvicorn nexus_matcher.presentation.api.app:app`.
 
 ### The matching request body
 
-`FieldSpec` sets `extra="forbid"`, so an unrecognised key is a **422** rather than a
-silently dropped input — a misspelled `documentation` would drop the column comment, and
-the column comment is real retrieval signal.
+The two levels have deliberately different strictness, and the difference is the contract:
+
+- **Inside a field, unknown keys are refused.** `FieldSpec` sets `extra="forbid"`, so an
+  unrecognised key is a **422** rather than a silently dropped input — a misspelled
+  `documentation` would drop the column comment, and the column comment is real retrieval
+  signal. A field that matched worse because a key was ignored is a defect you would never
+  trace back to a typo.
+- **At the top level, unknown keys are accepted.** `MatchRequest` sets `extra="ignore"`,
+  so a caller sending an envelope key a newer server understands is not rejected by an
+  older one. Forbidding them made the contract non-extensible in both directions at once,
+  which is a poor trade for a strictness that catches nothing: an envelope typo does not
+  silently degrade a match the way a field typo does.
+
+A misspelled `fields` is still an error — it is `missing`, not `extra`.
 
 | Key | Required | Meaning |
 |---|---|---|
@@ -200,6 +213,191 @@ Worked request, response and failure modes: [GOVERNANCE.md](GOVERNANCE.md#matchi
 
 Both match routes answer **503** until a dictionary is loaded — see
 [DEPLOYMENT.md](DEPLOYMENT.md#2-environment-configuration) for the variables that load one.
+
+### The matching response
+
+Two top-level keys, in this order: `results`, then `vocabulary`. `results` was once the
+whole body, so `vocabulary` is appended rather than placed first — a client generated
+against the earlier shape keeps reading `results` at the same key.
+
+Everything below was captured from a live server started with
+[`examples/governance/serve.sh`](../examples/governance/serve.sh), which loads the
+fictional Gravel Bay Ferry Authority pack. The request:
+
+```json
+{
+  "fields": [
+    {"name": "pax_legal_nm",   "path": "booking.pax_legal_nm",  "doc": "Passenger legal name as printed on the manifest.", "type": "string"},
+    {"name": "crew_member_id", "path": "roster.crew_member_id", "doc": "Permanent staff identifier for a vessel crew member.", "type": "string"},
+    {"name": "route_cd",       "path": "timetable.route_cd",    "doc": "Short code identifying a scheduled route.", "type": "string"}
+  ],
+  "top_k": 1
+}
+```
+
+and the response, pretty-printed — the server sends it compact, and nothing else here is
+edited:
+
+```json
+{
+  "results": {
+    "booking.pax_legal_nm": [
+      {
+        "rank": 1,
+        "governanceId": "GBF-0001",
+        "businessName": "Passenger Legal Name",
+        "definition": "The full legal name of a ticketed passenger as printed on the Gravel Bay sailing manifest.",
+        "domain": "Passenger",
+        "governance": {
+          "code": "MANIFEST_NAME",
+          "name": "Passenger manifest identity",
+          "classification": "SEALED_RESTRICTED",
+          "personalInformation": true,
+          "directIdentifier": true,
+          "enhancement": "MASK_IN_LOGS"
+        },
+        "confidence": 0.925,
+        "decision": "AUTO_APPROVE"
+      }
+    ],
+    "roster.crew_member_id": [
+      {
+        "rank": 1,
+        "governanceId": "GBF-0009",
+        "businessName": "Crew Member Identifier",
+        "definition": "The authority's permanent staff identifier for a member of a vessel crew.",
+        "domain": "Crew",
+        "governance": {
+          "code": "CREW_ROSTER",
+          "name": "Crew employment record",
+          "classification": "BRIDGE_SENSITIVE",
+          "personalInformation": true,
+          "directIdentifier": true,
+          "enhancement": null
+        },
+        "confidence": 0.925,
+        "decision": "AUTO_APPROVE"
+      }
+    ],
+    "timetable.route_cd": [
+      {
+        "rank": 1,
+        "governanceId": "GBF-0028",
+        "businessName": "Sailing Route Code",
+        "definition": "The short code that identifies a scheduled route between two terminals.",
+        "domain": "Published",
+        "governance": null,
+        "confidence": 0.925,
+        "decision": "AUTO_APPROVE"
+      }
+    ]
+  },
+  "vocabulary": {
+    "openClassification": "OPEN_DECK",
+    "tiersMostOpenFirst": ["OPEN_DECK", "CREW_ONLY", "BRIDGE_SENSITIVE", "SEALED_RESTRICTED"]
+  }
+}
+```
+
+`POST /api/v1/match/batch` returns the same body for the same request — one implementation
+behind two field caps.
+
+A candidate carries a ninth key, `explain`, only when the request set `explain: true`. It
+is **absent**, not present-and-null, otherwise. Requesting it for `booking.pax_email_addr`
+against the same pack returns:
+
+```json
+"explain": {
+  "scores":  {"fusedRetrieval": 1.0, "lexical": 1.0, "editDistance": 1.0, "type": 0.5, "domain": 0.5},
+  "weights": {"fusedRetrieval": 0.7, "lexical": 0.05, "editDistance": 0.05, "type": 0.05, "domain": 0.15},
+  "absoluteCosine": 0.840633
+}
+```
+
+`scores` and `weights` are open maps carrying the same keys, so
+`sum(scores[k] * weights[k])` clamped to [0, 1] reproduces `confidence` from the response
+alone; the weights are the live matcher's, not the shipped defaults, so a tuned deployment
+gets numbers that reproduce *its* confidences. `fusedRetrieval` is min-max normalised
+within this field's shortlist — 0.9 means "ranked first here", not "90% similar" — and
+`absoluteCosine` is the only figure comparable across fields. It is `null` when the dense
+retriever did not return that candidate.
+
+#### `governance`, and its sixth key
+
+Six keys, in this order: `code`, `name`, `classification`, `personalInformation`,
+`directIdentifier`, `enhancement`.
+
+`enhancement` is the newest and was **appended**, so the order of the five before it is
+unchanged and a client reading them by name is unaffected.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `code` | `string` | The protection code, resolved through the caller's vocabulary — aliases already followed. The example pack maps `GBF-LEGACY-NAME` to `MANIFEST_NAME`, which is why `GBF-0001` comes back as the latter. |
+| `name` | `string` | The class's human-readable name. |
+| `classification` | `string` | The tier. Rankable only against `vocabulary.tiersMostOpenFirst`. |
+| `personalInformation` | `bool` | |
+| `directIdentifier` | `bool` | |
+| `enhancement` | `string` or `null` | The caller's own instruction for **how to protect the field** — masking, tokenisation, a retention rule. Passed through untouched and never interpreted by this library. |
+
+`enhancement` is the only member that says what to *do* rather than what the field *is*,
+which is why it is carried: it was resolved on every `MatchResult` and then dropped at the
+wire, so the answer to "mask it, tokenise it, or retain it seven years" lived only in a
+file the HTTP caller does not have.
+
+**`null` is a documented value, not a defect.** It means the class declares no instruction
+— the tier is the whole instruction. Five of the nine classes in
+`examples/governance/protection_classes.json` declare none, so a client that treats it as
+required refuses this repository's own example pack. The other four declare one, across
+three distinct values — `MASK_IN_LOGS` (twice), `TOKENISE_AT_REST`, `RETAIN_SEVEN_YEARS` —
+and those strings are entirely that fictional pack's own invention. It is free text,
+deliberately not a closed set.
+
+`code`, `name`, `classification` and `enhancement` are all typed `string` in the published
+schema, never an enum. They carry the caller's controlled vocabulary, and this library
+ships no taxonomy at all — closing them would hard-code one organisation's into the schema
+a Java client is generated from.
+
+#### `vocabulary`, and why a response needs one
+
+```json
+"vocabulary": {
+  "openClassification": "OPEN_DECK",
+  "tiersMostOpenFirst": ["OPEN_DECK", "CREW_ONLY", "BRIDGE_SENSITIVE", "SEALED_RESTRICTED"]
+}
+```
+
+Both values are the caller's own, echoed back from the vocabulary file
+`NEXUS_API_GOVERNANCE` names. This library supplies neither and ranks nothing.
+
+It exists because **without it a `"governance": null` cannot be read.** `null` is not
+"unclassified" — on any candidate that is not a rejected rank 1 it means the entry carries
+no protection code, which is a real tier with a name only the caller's vocabulary knows.
+In the response above, `timetable.route_cd` matched `GBF-0028` and came back `null`;
+`openClassification` is what says that field sits at `OPEN_DECK`. A consumer holding only
+the response cannot derive that, and a separate service — the case this endpoint exists
+for — has no copy of the vocabulary file to look it up in. The body is a governance
+artifact that gets pasted into a ticket and diffed, and an artifact whose `null` means
+"ask a second system" is not one.
+
+`tiersMostOpenFirst` is the only thing that can rank two classifications against each
+other. Empty means the vocabulary declares no ordering: treat tiers as incomparable there,
+and never as alphabetical, which sorts `CONFIDENTIAL` above `PUBLIC`.
+
+The block is constant per deployment and roughly 120 bytes, so it is a rounding error
+against a response carrying candidates. It rides on the response rather than sitting on an
+endpoint somebody has to know to call.
+
+**When no vocabulary is configured** the block reads:
+
+```json
+"vocabulary": {"openClassification": "UNCLASSIFIED", "tiersMostOpenFirst": []}
+```
+
+`UNCLASSIFIED` is this library's own sentinel, not a tier: it is deliberately not a word a
+real taxonomy uses, so it cannot be mistaken for one. Reaching it requires a glossary with
+no protection-code column at all — pointing `NEXUS_API_DICTIONARY` at a glossary that *has*
+one while leaving `NEXUS_API_GOVERNANCE` unset is refused at startup, and both match routes
+then answer **503** (`NEXUS-1002`) rather than serving every field as `null`.
 
 ### Published failure responses
 
@@ -277,7 +475,10 @@ cache connection today.
 ### `SchemaField`
 
 `name`, `data_type`, `full_path`, `parent_path`, `description`, `is_nullable`,
-`is_array`, `array_item_type`, `default_value`, `constraints`, `metadata`.
+`is_array`, `array_item_type`, `default_value`, `constraints`, `source_metadata`.
+
+The last one is `source_metadata`. An earlier revision of this list called it `metadata`;
+there is no such attribute, and `getattr(field, "metadata")` raises `AttributeError`.
 
 `parent_path` matters: it is the hierarchical context injected into the retrieval query,
 and it is the single largest accuracy factor measured on the benchmark
@@ -286,8 +487,13 @@ and it is the single largest accuracy factor measured on the benchmark
 ### `DictionaryEntry`
 
 `id`, `business_name`, `logical_name`, `definition`, `data_type`, `protection_level`,
-`domain`, `parent_table`, `sample_values`, `synonyms`, `is_enum`, `enum_values`,
-`source_metadata`.
+`governance_code`, `domain`, `parent_table`, `sample_values`, `synonyms`, `is_enum`,
+`enum_values`, `source_metadata`.
+
+`governance_code` is the controlled protection code the entry carries, in the caller's own
+vocabulary. A code the vocabulary does not define does not land here — it survives only as
+`source_metadata['governance_code_raw']`, because a stored code nobody defined reads as
+governance and is not.
 
 `id` and `business_name` must be non-empty. `to_searchable_text()` concatenates
 business name, logical name (underscores replaced), definition, and synonyms — that
@@ -306,8 +512,28 @@ There is no `technical_name` attribute; the field is called `logical_name`.
 | `score_breakdown` | `ScoreBreakdown` |
 | `decision` | `MatchDecision` enum |
 | `performance` | `PerformanceMetrics` |
+| `governance` | `ProtectionClass` or `None` |
+| `governance_id` | `str`, always populated |
 
 Convenience properties: `is_auto_approved`, `needs_review`, `is_rejected`.
+
+A caller matches a field in order to inherit the entry's governance, so both are
+first-class attributes rather than something to fish out of `source_metadata`, and both are
+populated on **every** candidate rather than on rank 1 alone — deciding between rank 1 and
+rank 2 usually turns on which of them is a direct-identifier class, and that comparison is
+impossible if only the top match carries one.
+
+`governance` is `None` when the entry carries no code (the open tier), and also on a rank-1
+`REJECT`, which confers nothing: a rejected top match means no entry in the glossary
+describes this field, so a novel field would otherwise arrive carrying the class of a
+candidate the matcher itself rejected. A rejected runner-up keeps the class its entry
+confers — nothing inherits from rank 2, so nothing needs to be withheld there. The rank
+qualifier is the rule, not a detail of it. `decision` alone does not separate the two nulls;
+over HTTP, `vocabulary.openClassification` is what resolves the first.
+
+`governance_id` is the matched entry's id, which *is* the governance id. It is derived from
+`dictionary_entry` when not supplied and refused when supplied and different, because two
+answers to "whose class is this?" is worse than none.
 
 `MatchDecision` is a `str`-backed enum, so `result.decision == "AUTO_APPROVE"`,
 `result.decision.value` and `result.decision.name` all work. Prefer comparing against
@@ -315,9 +541,29 @@ Convenience properties: `is_auto_approved`, `needs_review`, `is_rejected`.
 
 ### `ScoreBreakdown`
 
-`semantic_score`, `lexical_score`, `edit_distance_score`, `type_compatibility_score`,
-`domain_score`, `graph_boost`, plus optional `colbert_score` and `cross_encoder_score`
-(both `None` when no reranker is configured). Property `has_reranking`.
+`fused_retrieval_score`, `lexical_score`, `edit_distance_score`,
+`type_compatibility_score`, `domain_score`, `graph_boost`, plus optional `colbert_score`
+and `cross_encoder_score` (both `None` when no reranker is configured) and
+`absolute_cosine`. Property `has_reranking`.
+
+**The first field is `fused_retrieval_score`, and the rename matters.** It used to be
+called `semantic_score`, and that name misled every reader of it — including an earlier
+revision of this document. It is not a cosine similarity: it is the min-max-normalised
+fused retrieval score, with each arm rescaled by its own min and max **over the candidates
+retrieved for this field**, then combined with `fusion_alpha`. It is therefore
+rank-relative. The rank-1 candidate lands at or just above `fusion_alpha` for essentially
+every field, whether the match is excellent or barely plausible — which is why the value is
+so often 0.9: 0.9 is `fusion_alpha`. Telling an auditor "semantic score 0.9" claims 90%
+semantic similarity and delivers "ranked first among N candidates".
+
+`absolute_cosine` is the number that answers "how similar were they really?" — the raw
+dense score before normalisation, and the only one here comparable **across** fields.
+`None` when the dense arm did not return that candidate at all, i.e. it reached the result
+list through the lexical arm.
+
+`semantic_score` still works, as a property and as a constructor keyword, and emits a
+`DeprecationWarning`. Passing both it and `fused_retrieval_score` is a `TypeError` rather
+than a coin toss. It is scheduled for removal in 3.0.
 
 ### `PerformanceMetrics`
 
@@ -334,8 +580,11 @@ Declared in `pyproject.toml`. Each target module was verified importable:
 |---|---|
 | `nexus_matcher.schema_parsers` | `avro`, `json_schema`, `sql_ddl` |
 | `nexus_matcher.dictionary_loaders` | `excel`, `csv` (both from `…dictionary_loaders.excel`) |
-| `nexus_matcher.vector_stores` | `qdrant`, `memory` |
-| `nexus_matcher.embedding_providers` | `sentence_transformers` |
+| `nexus_matcher.vector_stores` | `qdrant`, `memory`, `hnsw` |
+| `nexus_matcher.embedding_providers` | `sentence_transformers`, `bundled_onnx` |
+
+`bundled_onnx` is the default `from_config` wires, registered here so plugin discovery can
+find the offline encoder too. An earlier revision of this table omitted both it and `hnsw`.
 
 Earlier revisions of `pyproject.toml` also declared `csv_headers`, `database`, `faiss`
 and `openai` entry points pointing at modules that do not exist. Those have been removed.

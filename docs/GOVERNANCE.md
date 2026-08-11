@@ -49,7 +49,11 @@ Each entry in the vocabulary declares a `code`, the `classification` that code d
 
 `enhancement` is an optional handling instruction the caller attaches — masking,
 tokenisation, a retention rule. The library passes it through untouched and never
-interprets it.
+interprets it, and it travels all the way to the caller: it is the only member of a class
+that says what to **do** with a field rather than what the field **is**, and whoever is
+deciding how to protect a column is exactly who needs it. `null` is a normal value — five
+of the nine classes in the example pack declare it, meaning the tier is the whole
+instruction.
 
 ### 2. A glossary row whose stated tier contradicts its code is a data defect
 
@@ -110,6 +114,34 @@ salted digest of a passenger name retrieves the passenger name entry as its top 
 Inheriting it would tag a pseudonym as a `SEALED_RESTRICTED` direct identifier. The match
 is not auto-approved, and that is the correct behaviour.
 
+## Ranking tiers is your business, and you can say so
+
+Nothing here ranks classifications. `SEALED_RESTRICTED` is not "above" `OPEN_DECK` to any
+code in this library; they are two strings out of your file, and a library that ordered
+them would be shipping a taxonomy through the back door.
+
+A vocabulary may declare its **own** ladder, and the example pack does:
+
+```json
+"tiers_most_open_first": ["OPEN_DECK", "CREW_ONLY", "BRIDGE_SENSITIVE", "SEALED_RESTRICTED"]
+```
+
+The key is **optional**: a vocabulary without it loads exactly as before and reports no
+ordering — treat tiers as incomparable there, never as alphabetical, which sorts
+`CONFIDENTIAL` above `PUBLIC`. When it *is* present it is **checked against the classes in
+the same file**. A tier some class derives, or your declared `open_classification`, that is
+missing from the list refuses the load, with a message naming both the class and the list.
+
+That check is your file against itself. The list is yours, the tiers in it are yours, and
+the library still supplies none — it only refuses a ladder with a rung missing under a
+class that is standing on it. A tier you declare that no class currently uses is fine; a
+policy is allowed rungs this vocabulary does not reach.
+
+The key had shipped in the example pack while being read by no code at all, so anyone who
+started their vocabulary by copying that file — which is what the pack is for — inherited a
+no-op that looked like a rule. Enforcing it is what makes declaring it worth anything, and
+it is what puts the ordering on the wire (`vocabulary.tiersMostOpenFirst`, below).
+
 ## What a match carries
 
 `MatchResult` carries governance as first-class fields, not as something to fish out of
@@ -126,7 +158,8 @@ decides between rank 1 and rank 2 is usually which of the two is a direct identi
 So `None` carries two meanings, and `decision` does not separate them:
 
 - **The matched entry carries no code**, so it sits at the open tier and has nothing to
-  confer.
+  confer. Over HTTP the response names that tier itself, in `vocabulary.openClassification`
+  — otherwise "the open tier" is an answer the caller cannot resolve without your file.
 - **This is the rank-1 candidate and the matcher rejected it.** A rejected top match means
   no entry in this glossary describes the field, and a novel field — the case that most
   needs a human — would otherwise arrive wearing the class of the least-bad candidate.
@@ -242,6 +275,18 @@ against this pack hit exactly that. The body names all three problems:
     {"location": ["body", "fields", "0", "dataType"], "message": "Extra inputs are not permitted", "type": "extra_forbidden"}]}}}
 ```
 
+**The strictness stops at the field.** An unrecognised key on the request *envelope* —
+alongside `fields`, `top_k` and `explain` — is **ignored**, not rejected. The two rules
+disagree on purpose, because the two mistakes cost different things. Inside a field, a
+silently ignored key is lost retrieval signal and worse matches with nothing to show for
+it. On the envelope, it is a version skew: under `extra="forbid"` a caller sending a key a
+newer server understands gets a 422 from an older one, so the first optional request field
+this endpoint ever gains would be a breaking change needing a coordinated deploy of your
+pipeline. What you give up is bounded and visible in the response you already have — a
+misspelled `top_k` is silently the default `5`, a misspelled `explain` silently `false`,
+and neither can change a classification. `fields` is required, so misspelling *that* is
+still a 422.
+
 ### One request, and what comes back
 
 ```bash
@@ -268,12 +313,17 @@ requests produce identical bytes:
           "name": "Passenger manifest identity",
           "classification": "SEALED_RESTRICTED",
           "personalInformation": true,
-          "directIdentifier": true
+          "directIdentifier": true,
+          "enhancement": "MASK_IN_LOGS"
         },
         "confidence": 0.904167,
         "decision": "AUTO_APPROVE"
       }
     ]
+  },
+  "vocabulary": {
+    "openClassification": "OPEN_DECK",
+    "tiersMostOpenFirst": ["OPEN_DECK", "CREW_ONLY", "BRIDGE_SENSITIVE", "SEALED_RESTRICTED"]
   }
 }
 ```
@@ -283,9 +333,34 @@ sent** — a field nothing matched gets `[]`, never a missing key. That is rule 
 contract: a field cannot silently vanish from the map and inherit nothing unnoticed.
 
 `governance` is the protection class the matched entry confers, drawn from *your*
-`protection_classes.json`; `null` means the entry carries no code and sits at the open tier.
-`code`, `name` and `classification` are your vocabulary's own strings — the library defines
-none of them and does not type them as a closed set.
+`protection_classes.json`. `code`, `name`, `classification` and `enhancement` are your
+vocabulary's own strings — the library defines none of them and does not type any of them
+as a closed set, so a generated client gets `String` and not an enum of somebody else's
+tiers. `enhancement` is `null` on a class that declares none.
+
+### `vocabulary`, and why a `null` needs it
+
+`governance: null` means one of the two things listed under [What a match
+carries](#what-a-match-carries), and the first of them — *the entry carries no code, so it
+sits at the open tier* — is not readable from the response unless the response says which
+tier that is. It did not. `open_classification` was reachable nowhere over HTTP: not on a
+route, and the string appeared nowhere in `/openapi.json`. A Java client receiving `null`
+had to open a JSON file sitting on the server to find out what it had been told.
+
+So every match response carries the two facts needed to read its own nulls:
+
+| Key | Meaning |
+|---|---|
+| `openClassification` | The tier a field with no protection code sits at. `UNCLASSIFIED` is the library's sentinel and means no vocabulary is configured. |
+| `tiersMostOpenFirst` | Your declared ladder, in your order. `[]` when your vocabulary declares none. |
+
+It rides on the response rather than on a `/vocabulary` endpoint because this body is a
+governance artifact: it gets pasted into a ticket and diffed, and the person reading that
+ticket cannot be expected to know there is a second call to make. It is constant per
+deployment and costs 134 bytes on the response above.
+
+It is **not** a dump of your catalog. Your codes, names and classes are in your own file;
+this is the minimum needed to interpret the response it arrives with.
 
 Do not diff against `confidence`. It is the rank-relative number described above, it will
 move with any retrieval change (H-001), and `decision` is what carries the verdict. The

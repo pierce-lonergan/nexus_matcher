@@ -42,6 +42,10 @@ from nexus_matcher.presentation.api.app import create_app
 VOCABULARY = {
     "notice": "FICTIONAL EXAMPLE DATA. Tallow Creek Grain Cooperative is invented.",
     "open_classification": "TALLOW_OPEN",
+    # Declared here so the response's `vocabulary` block is checked to come from the
+    # OPERATOR'S OWN FILE, reached through NEXUS_API_GOVERNANCE, rather than from the
+    # package fixture the rest of this suite shares.
+    "tiers_most_open_first": ["TALLOW_OPEN", "TALLOW_SEALED"],
     "classes": [
         {
             "code": "GROWERID",
@@ -111,7 +115,8 @@ def test_the_environment_alone_brings_up_a_server_that_classifies(configured):
         )
 
     assert response.status_code == 200, response.text
-    candidate = response.json()["results"]["delivery.grower_name"][0]
+    body = response.json()
+    candidate = body["results"]["delivery.grower_name"][0]
     assert candidate["governanceId"] == "TCG-0001"
     assert candidate["governance"] == {
         "code": "GROWERID",
@@ -119,6 +124,14 @@ def test_the_environment_alone_brings_up_a_server_that_classifies(configured):
         "classification": "TALLOW_SEALED",
         "personalInformation": True,
         "directIdentifier": True,
+        "enhancement": "MASK_IN_LOGS",
+    }
+    # The operator's own open tier and their own ladder, over HTTP. Neither was reachable
+    # anywhere on this surface, so a client receiving `"governance": null` had to open a
+    # file on the server to learn which tier that field sits at.
+    assert body["vocabulary"] == {
+        "openClassification": "TALLOW_OPEN",
+        "tiersMostOpenFirst": ["TALLOW_OPEN", "TALLOW_SEALED"],
     }
 
 

@@ -1,0 +1,1 @@
+{"error":{"code":"NEXUS-8004","message":"top_k=50 exceeds this server's configured results_per_field=5, so it could only ever return 5 candidates. Ask for at most 5, or raise results_per_field on the server.","details":{"top_k":50,"results_per_field":5,"status_code":422}}}

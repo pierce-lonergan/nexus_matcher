@@ -1,0 +1,1 @@
+{"error":{"code":"NEXUS-8004","message":"Every field needs a distinct `path`, because the response is keyed by it: ['t.a'] appear more than once. Two fields under one key would leave one of them with no governance and no error.","details":{"duplicate_paths":["t.a"],"status_code":422}}}

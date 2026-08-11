@@ -60,6 +60,7 @@ one. Restating the same mapping is not a conflict and stays legal.
 ```json
 {
   "open_classification": "Open",
+  "tiers_most_open_first": ["Open", "Guarded", "Sealed"],
   "aliases": {"MTR#": "METERID", "n/a": null},
   "classes": [
     {
@@ -79,6 +80,23 @@ A bare list of class objects is also accepted, as is a mapping of `code -> attri
 `open_classification` names the tier an uncoded field sits at; it defaults to the neutral
 sentinel `OPEN_CLASSIFICATION` below, which is deliberately not a word any real taxonomy
 uses, so an unconfigured vocabulary cannot be mistaken for a configured one.
+
+## `tiers_most_open_first` -- the caller's own ordering, checked against itself
+
+Tiers are strings to this library and it will never rank them. `tiers_most_open_first` is
+OPTIONAL: a vocabulary that omits it works exactly as before, and nothing here invents an
+order for one that does. What the key buys, when it is present, is that the ordering and
+the classes have to AGREE -- a tier some class derives, or the declared open tier, that is
+missing from the list refuses the load and the message names both sides.
+
+Checking it is not this library forming an opinion about a taxonomy. The list is the
+caller's, the tiers in it are the caller's, and the only thing compared is the caller's
+file against itself. The alternative is what shipped: the key sat in the example pack and
+was read by NO code, so an adopter copying that file inherited a no-op and a reasonable
+belief that something enforced it.
+
+Declaring a tier the classes do not use is fine and stays legal -- a policy ladder is
+allowed to have rungs this particular vocabulary does not reach. The reverse is the defect.
 """
 
 from __future__ import annotations
@@ -407,13 +425,14 @@ class GovernanceVocabulary:
     package defines one.
     """
 
-    __slots__ = ("_aliases", "_by_code", "_open")
+    __slots__ = ("_aliases", "_by_code", "_open", "_tiers")
 
     def __init__(
         self,
         classes: Iterable[ProtectionClass] = (),
         open_classification: str = OPEN_CLASSIFICATION,
         aliases: Mapping[str, str | None] | Iterable[tuple[str, str | None]] | None = None,
+        tiers_most_open_first: Iterable[str] = (),
     ) -> None:
         by_code: dict[str, ProtectionClass] = {}
         for protection_class in classes:
@@ -506,6 +525,7 @@ class GovernanceVocabulary:
         self._by_code = by_code
         self._aliases = resolved
         self._open = str(open_classification)
+        self._tiers = _checked_tier_order(tiers_most_open_first, by_code, self._open)
 
     # -- construction ---------------------------------------------------------
 
@@ -542,7 +562,7 @@ class GovernanceVocabulary:
         else:
             document = path_or_obj
 
-        raw_classes, open_tier, raw_aliases = _split_document(document)
+        raw_classes, open_tier, raw_aliases, tier_order = _split_document(document)
 
         classes: list[ProtectionClass] = []
         # A LIST of pairs, not a dict. See the alias loop in `__init__` for why the dict
@@ -590,10 +610,15 @@ class GovernanceVocabulary:
                     enhancement=_optional_text(raw, "enhancement", subject),
                 )
             )
-            for token in _alias_tokens(raw, subject):
+            for token in _declared_list(raw, "aliases", subject, "alias"):
                 alias_pairs.append((token, code))
 
-        return cls(classes=classes, open_classification=open_tier, aliases=alias_pairs)
+        return cls(
+            classes=classes,
+            open_classification=open_tier,
+            aliases=alias_pairs,
+            tiers_most_open_first=tier_order,
+        )
 
     @classmethod
     def empty(cls) -> GovernanceVocabulary:
@@ -612,6 +637,23 @@ class GovernanceVocabulary:
     def codes(self) -> frozenset[str]:
         """The declared codes, in their declared spelling. Aliases are not codes."""
         return frozenset(c.code for c in self._by_code.values())
+
+    @property
+    def tiers_most_open_first(self) -> tuple[str, ...]:
+        """
+        The caller's declared tier ordering, most open first, or `()` when they declared
+        none.
+
+        A TUPLE and not a set, because the order is the entire content: it is the only
+        thing in this module that can answer "is this field's tier more closed than that
+        one's", and it answers it because the caller wrote it down, not because anything
+        here ranked their taxonomy.
+
+        Empty is a real answer and must stay distinguishable from a one-tier vocabulary.
+        A consumer that cannot compare tiers should say so rather than fall back to
+        alphabetical, which puts "CONFIDENTIAL" before "PUBLIC".
+        """
+        return self._tiers
 
     def get(self, code: str | None) -> ProtectionClass | None:
         """
@@ -770,10 +812,10 @@ class GovernanceVocabulary:
 
 def _split_document(
     document: Any,
-) -> tuple[Sequence[Any], str, Mapping[str, Any]]:
-    """Pull (classes, open tier, aliases) out of any of the three accepted shapes."""
+) -> tuple[Sequence[Any], str, Mapping[str, Any], list[str]]:
+    """Pull (classes, open tier, aliases, tier order) out of any of the three shapes."""
     if isinstance(document, Sequence) and not isinstance(document, (str, bytes)):
-        return document, OPEN_CLASSIFICATION, {}
+        return document, OPEN_CLASSIFICATION, {}, []
 
     if not isinstance(document, Mapping):
         raise ValueError(
@@ -786,6 +828,9 @@ def _split_document(
     # quietly substituting the sentinel.
     declared_open = _optional_text(document, "open_classification", "the vocabulary document")
     open_tier = declared_open if declared_open else OPEN_CLASSIFICATION
+    tier_order = _declared_list(
+        document, "tiers_most_open_first", "the vocabulary document", "tier"
+    )
     aliases = document.get("aliases") or {}
     if not isinstance(aliases, Mapping):
         raise ValueError("'aliases' must be an object mapping a legacy token to a code or null")
@@ -793,15 +838,32 @@ def _split_document(
     for key in ("classes", "protection_classes"):
         candidate = document.get(key)
         if isinstance(candidate, Sequence) and not isinstance(candidate, (str, bytes)):
-            return candidate, open_tier, aliases
+            return candidate, open_tier, aliases, tier_order
 
     # A bare `{code: {...}}` mapping. Recognised only when EVERY value is an object, so a
     # document that meant to have a "classes" key and misspelled it fails loudly instead
     # of being read as a catalog of one class called "clases".
-    reserved = {"open_classification", "aliases", "classes", "protection_classes"}
+    #
+    # `tiers_most_open_first` is reserved here for the same reason the other three are, and
+    # it was a real refusal before it was reserved: a code-keyed document that also declared
+    # the ordering held one non-Mapping value, so `all(...)` failed and the whole file came
+    # back "no protection classes found" -- a message pointing at the classes, which were
+    # fine, rather than at the key it could not place.
+    reserved = {
+        "open_classification",
+        "tiers_most_open_first",
+        "aliases",
+        "classes",
+        "protection_classes",
+    }
     body = {k: v for k, v in document.items() if k not in reserved}
     if body and all(isinstance(v, Mapping) for v in body.values()):
-        return [{"code": code, **dict(attrs)} for code, attrs in body.items()], open_tier, aliases
+        return (
+            [{"code": code, **dict(attrs)} for code, attrs in body.items()],
+            open_tier,
+            aliases,
+            tier_order,
+        )
 
     raise ValueError(
         "no protection classes found. Supply them as a 'classes' array, as a bare array, "
@@ -869,34 +931,108 @@ def _optional_text(raw: Mapping[str, Any], key: str, subject: str) -> str | None
     return value
 
 
-def _alias_tokens(raw: Mapping[str, Any], subject: str) -> list[str]:
+def _declared_list(raw: Mapping[str, Any], key: str, subject: str, item: str) -> list[str]:
     """
-    A class's own alias list, refusing the two shapes that silently half-work.
+    A declared list of strings -- a class's `aliases`, or the document's
+    `tiers_most_open_first` -- refusing the two shapes that silently half-work.
 
     The bare string is the one that mattered. `"aliases": "LEGACY-METER"` is iterable, so
     the loop walked it CHARACTER BY CHARACTER and declared L, E, G, A, C, Y and M as
     aliases of the class. Single-character aliases match nothing a glossary carries, so the
     legacy spelling the caller was trying to declare stays unknown and every row using it
-    is refused -- for a reason that appears nowhere in their file.
+    is refused -- for a reason that appears nowhere in their file. The tier ordering is the
+    same shape and would fail the same way, one letter per rung.
+
+    ONE function for both, rather than a second copy, because the two keys have exactly the
+    same rules and a copy is how they stop having them.
     """
-    declared = raw.get("aliases")
+    declared = raw.get(key)
     if declared is None:
         return []
     if isinstance(declared, (str, bytes)) or not isinstance(declared, Sequence):
         raise ValueError(
-            f"{subject} has an 'aliases' of {declared!r}, which is "
-            f"{type(declared).__name__}; it must be a list of tokens. A bare string would "
-            f"be read one character at a time."
+            f"{key!r} on {subject} is {declared!r}, which is {type(declared).__name__}; "
+            f"it must be a list of tokens. A bare string would be read one character at "
+            f"a time."
         )
     tokens: list[str] = []
     for position, token in enumerate(declared):
         if not isinstance(token, str) or not token.strip():
             raise ValueError(
-                f"{subject} has an alias at position {position} of {token!r}; every alias "
-                f"must be a non-blank string"
+                f"{subject} declares {item} #{position} as {token!r}; every {item} must "
+                f"be a non-blank string"
             )
         tokens.append(token)
     return tokens
+
+
+def _checked_tier_order(
+    declared: Iterable[str],
+    by_code: Mapping[str, ProtectionClass],
+    open_classification: str,
+) -> tuple[str, ...]:
+    """
+    The caller's declared tier ordering, checked against the classes in the same file.
+
+    This key shipped in the example pack and was read by NOTHING -- `grep` found exactly
+    one occurrence in the repository, the declaration itself. An adopter copies that file
+    to start their own vocabulary, so the no-op propagates along with a reasonable belief
+    that the ordering means something. Enforcing it is the smaller change: the alternative
+    is deleting a key that expresses something real about the caller's taxonomy.
+
+    What is checked is the file against ITSELF. Every tier some class derives must appear,
+    and so must the declared open tier, because those are the tiers that actually reach a
+    consumer -- an ordering that cannot place the value on the wire cannot be used to
+    compare it against anything. Nothing here decides what belongs in a taxonomy or what
+    order it should be in.
+
+    Two deliberate non-rules:
+
+    * A declared tier NO class uses is legal. An organisation's ladder is allowed rungs
+      this vocabulary does not reach, and refusing would make the key unusable for the
+      thing it is for.
+    * The sentinel open tier is exempt. `OPEN_CLASSIFICATION` is what an unset
+      `open_classification` defaults to, so requiring it in the list would refuse a file
+      over a value the caller never wrote -- this library's default failing this library's
+      check.
+
+    Comparison is by `_norm_tier`, the same normalisation a glossary row is compared
+    through, so "Sealed " in the ladder and "sealed" on a class are one tier here exactly
+    as they are one tier there. The DECLARED spellings are what get stored and reported.
+    """
+    tiers = tuple(declared)
+    if not tiers:
+        return ()
+
+    seen: dict[str, str] = {}
+    for tier in tiers:
+        key = _norm_tier(tier)
+        if key in seen:
+            raise ValueError(
+                f"'tiers_most_open_first' declares {seen[key]!r} and {tier!r}, which are "
+                f"the same tier; an ordering cannot put one tier in two places"
+            )
+        seen[key] = tier
+
+    for protection_class in by_code.values():
+        if _norm_tier(protection_class.classification) not in seen:
+            raise ValueError(
+                f"protection class {protection_class.code!r} derives classification "
+                f"{protection_class.classification!r}, which is not in the declared "
+                f"'tiers_most_open_first' {list(tiers)!r}. An ordering that omits a tier "
+                f"the vocabulary uses cannot place it, so add it to the list or remove the "
+                f"key."
+            )
+
+    if open_classification != OPEN_CLASSIFICATION and _norm_tier(open_classification) not in seen:
+        raise ValueError(
+            f"open_classification {open_classification!r} is not in the declared "
+            f"'tiers_most_open_first' {list(tiers)!r}. That is the tier an uncoded field "
+            f"sits at -- the most common answer this vocabulary gives -- so an ordering "
+            f"without it cannot place the majority of fields."
+        )
+
+    return tiers
 
 
 def _alias_target_label(target_key: str | None, by_code: Mapping[str, ProtectionClass]) -> str:

@@ -34,7 +34,7 @@ matcher failure is a named 500. It never hangs. See `limits.py`.
 
 ## Coupling that is deliberate, and how it is made safe
 
-Two private names on the application layer are read here, because the application layer
+Three private names on the application layer are read here, because the application layer
 exposes no public equivalent:
 
   * `NexusMatcher._match_fields` -- the only way to match a LIST OF FIELDS. The public
@@ -44,15 +44,20 @@ exposes no public equivalent:
   * `NexusMatcher._config` -- the weights `explain` reports, read off the LIVE matcher so
     a tuned deployment gets a response that reproduces ITS numbers, not the shipped ones.
     Same pattern, and same justification, as the CLI's `_MATCHER_CONFIG_ATTR`.
+  * `NexusMatcher._governance` -- the vocabulary every `MatchResult.governance` was
+    resolved through, for the response's `vocabulary` block. Read from the same object that
+    produced the nulls it explains, so the two cannot disagree.
 
-Neither is left to fail obscurely: a missing attribute raises `ContractDriftError`, a 500
-that names both sides. And the weights are not trusted on their name alone -- when
-`explain` is requested the emitted numbers must reproduce the emitted confidence, or the
-response is refused. A governance document whose arithmetic does not close is worse than
-no document, because it is the one that gets used as evidence.
+None is left to fail obscurely. A missing `_match_fields` raises `ContractDriftError`, a
+500 that names both sides; the other two fall back rather than take matching down, because
+a renamed attribute there costs one optional block and not the endpoint. And the weights
+are not trusted on their name alone -- when `explain` is requested the emitted numbers must
+reproduce the emitted confidence, or the response is refused. A governance document whose
+arithmetic does not close is worse than no document, because it is the one that gets used
+as evidence.
 
-A public `match_fields` on `NexusMatcher` would remove both couplings; that file belongs
-to another lane.
+A public `match_fields` on `NexusMatcher`, and a public accessor for its vocabulary, would
+remove all three couplings; that file belongs to another lane.
 """
 
 from __future__ import annotations
@@ -64,6 +69,7 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 
+from nexus_matcher.domain.governance import OPEN_CLASSIFICATION
 from nexus_matcher.domain.models.entities import SchemaField
 from nexus_matcher.presentation.api.errors import (
     ConservationViolationError,
@@ -95,6 +101,9 @@ if TYPE_CHECKING:
 # public -- H-006's shape is exactly a change whose two halves live in different lanes.
 _MATCH_FIELDS_ATTR = "_match_fields"
 _MATCHER_CONFIG_ATTR = "_config"
+# The vocabulary the matcher resolved every `MatchResult.governance` through. Read for the
+# response's `vocabulary` block, which is what makes a `governance` of null readable.
+_MATCHER_GOVERNANCE_ATTR = "_governance"
 
 # Decimals kept for every emitted number. Six, matching the CLI's JSON writer, and for the
 # same reason: with `explain` the response has to be self-checking, and an auditor
@@ -308,7 +317,59 @@ def _governance_payload(match: MatchResult) -> dict[str, Any] | None:
                 f"caller would apply an incomplete classification.",
             )
         payload[key] = cast(value)
+
+    # LAST, and by `getattr` rather than through the loop above.
+    #
+    # Last because the five keys before it are a shape a Java client has already generated
+    # against, and appending is the only edit to a dict literal that is additive on the
+    # wire.
+    #
+    # `getattr(..., None)` because null is a DECLARED value here, not a missing one: five
+    # of the nine classes in `examples/governance/protection_classes.json` set
+    # `"enhancement": null`, so putting it through the `drift()` path above would make the
+    # repository's own example pack a 500. It is carried at all because the caller reading
+    # this object is deciding how to protect a field, and this is the only member that says
+    # what to DO -- it was resolved on every MatchResult and then dropped at the wire.
+    enhancement = getattr(protection_class, "enhancement", None)
+    payload["enhancement"] = None if enhancement is None else str(enhancement)
     return payload
+
+
+def _vocabulary_payload(matcher: object) -> dict[str, Any]:
+    """
+    What the response's `governance` nulls MEAN, carried in the response that has them.
+
+    `open_classification` was reachable nowhere over HTTP -- not on a route, not in
+    `/openapi.json`. So a Java client receiving `"governance": null` could not tell which
+    tier that field sits at without opening the vocabulary JSON, which is a file on the
+    server that the caller's pipeline may never have seen. A governance artifact that
+    requires a second source of truth to read is not one.
+
+    Emitted on the RESPONSE rather than from a `/vocabulary` route on purpose. The body
+    gets pasted into tickets and diffed; the interpretation has to travel with it, and a
+    separate endpoint is a thing the reader of that ticket has to know to call.
+
+    Read off the live matcher by the same private-attribute coupling as `_scoring_weights`,
+    and with the same posture: falling back rather than refusing. The fallback is
+    `OPEN_CLASSIFICATION`, the domain's sentinel, which exists precisely to say "nothing is
+    configured" in a word no real taxonomy uses -- so an unreadable vocabulary reports
+    itself as unconfigured instead of inventing a plausible tier.
+    """
+    vocabulary = getattr(matcher, _MATCHER_GOVERNANCE_ATTR, None)
+
+    open_classification = OPEN_CLASSIFICATION
+    resolve = getattr(vocabulary, "classification_for", None)
+    if callable(resolve):
+        # The documented accessor, given the value a field with no code carries. Asking the
+        # vocabulary is what keeps this in step with the tier `MatchResult` resolves
+        # through, instead of reading a private attribute that means the same thing today.
+        open_classification = str(resolve(None))
+
+    declared = getattr(vocabulary, "tiers_most_open_first", ())
+    return {
+        "openClassification": open_classification,
+        "tiersMostOpenFirst": [str(tier) for tier in declared],
+    }
 
 
 def _scoring_weights(matcher: object) -> dict[str, float]:
@@ -585,7 +646,13 @@ class MatchService:
         )
 
         weights = _scoring_weights(matcher) if request.explain else None
-        return {"results": _project_results(specs, fields, matched, request.top_k, weights)}
+        # `results` first: it was the whole body, and the key order IS the wire contract.
+        # `vocabulary` is what makes a `governance` of null readable without the caller
+        # holding a copy of the server's vocabulary file.
+        return {
+            "results": _project_results(specs, fields, matched, request.top_k, weights),
+            "vocabulary": _vocabulary_payload(matcher),
+        }
 
 
 def _invoke_matcher(

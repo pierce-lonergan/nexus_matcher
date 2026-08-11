@@ -595,6 +595,174 @@ class TestTheShippedExamplePackStillLoads:
         assert loaded.get("tbc") is None
         assert loaded.get("GBF-LEGACY-NAME").code == "MANIFEST_NAME"
 
+    def test_the_packs_declared_tier_ordering_is_read_and_kept_in_its_declared_order(self):
+        """
+        The pack has always declared `tiers_most_open_first`, and it was read by NOTHING --
+        one occurrence in the whole repository, the declaration itself. An adopter copies
+        this file to start their own vocabulary, so the no-op propagates with it.
+        """
+        assert GovernanceVocabulary.from_json(self.PACK).tiers_most_open_first == (
+            "OPEN_DECK",
+            "CREW_ONLY",
+            "BRIDGE_SENSITIVE",
+            "SEALED_RESTRICTED",
+        )
+
+
+# =============================================================================
+# THE DECLARED TIER ORDERING
+# =============================================================================
+
+
+def _ordered(**overrides) -> dict:
+    """A two-tier vocabulary, so a test can vary one thing about the ordering."""
+    document = {
+        "open_classification": "Open",
+        "tiers_most_open_first": ["Open", "Sealed"],
+        "classes": [
+            {
+                "code": "METERID",
+                "classification": "Sealed",
+                "personal_information": True,
+                "direct_identifier": True,
+            }
+        ],
+    }
+    document.update(overrides)
+    return document
+
+
+class TestTheDeclaredTierOrderingIsCheckedAgainstTheClasses:
+    """
+    The caller's own ladder, checked against the caller's own classes.
+
+    Enforcing this is not the library forming an opinion about a taxonomy: the list is
+    theirs, the tiers in it are theirs, and the only comparison made is their file against
+    itself. What is refused is a file that DISAGREES WITH ITSELF -- an ordering that cannot
+    place a tier the vocabulary actually derives, which is a ladder with a missing rung
+    rather than a ranking anyone here chose.
+
+    The alternative considered was deleting the key. Enforcing is the smaller change and
+    keeps something real the caller can say; deleting throws away the only thing in the
+    file that can rank two classifications.
+    """
+
+    def test_a_vocabulary_that_declares_no_ordering_still_loads_and_says_so(self):
+        """
+        OPTIONAL, and empty is a real answer. Every vocabulary in this file and every one
+        in the test suite predates the key; none of them may start failing, and none of
+        them may acquire an ordering nobody declared.
+        """
+        loaded = GovernanceVocabulary.from_json(THORNBURY)
+        assert loaded.tiers_most_open_first == ()
+        assert loaded.codes
+
+    def test_a_tier_a_class_derives_but_the_ordering_omits_refuses_the_load(self):
+        """
+        The message must name BOTH sides. A refusal that says only "inconsistent" sends
+        the reader back to two parts of one file to work out which half is wrong -- and
+        the answer is genuinely either, since the library has no view on which.
+        """
+        with pytest.raises(ValueError) as raised:
+            GovernanceVocabulary.from_json(_ordered(tiers_most_open_first=["Open", "Guarded"]))
+
+        message = str(raised.value)
+        assert "METERID" in message and "'Sealed'" in message, message
+        assert "'Open', 'Guarded'" in message, message
+
+    def test_the_declared_open_tier_must_be_placeable_too(self):
+        """
+        The open tier is where every UNCODED field sits -- typically the most common answer
+        the vocabulary gives, and the meaning of a null on the wire. An ordering that
+        cannot place it cannot rank the majority of a schema.
+        """
+        with pytest.raises(ValueError, match="open_classification"):
+            GovernanceVocabulary.from_json(
+                _ordered(open_classification="Public", tiers_most_open_first=["Open", "Sealed"])
+            )
+
+    def test_the_sentinel_open_tier_is_exempt_because_the_caller_never_wrote_it(self):
+        """
+        `UNCLASSIFIED` is what an unset `open_classification` DEFAULTS to. Requiring it in
+        the caller's list would refuse a file over a value this library supplied -- our own
+        default failing our own check.
+        """
+        loaded = GovernanceVocabulary.from_json(
+            {
+                "tiers_most_open_first": ["Open", "Sealed"],
+                "classes": _ordered()["classes"],
+            }
+        )
+        assert loaded.classification_for(None) == OPEN_CLASSIFICATION
+        assert loaded.tiers_most_open_first == ("Open", "Sealed")
+
+    def test_a_declared_tier_no_class_uses_is_legal(self):
+        """
+        An organisation's ladder is allowed rungs this vocabulary does not reach. Refusing
+        would make the key unusable for the thing it is for -- declaring a policy, not
+        enumerating today's classes.
+        """
+        loaded = GovernanceVocabulary.from_json(
+            _ordered(tiers_most_open_first=["Open", "Guarded", "Sealed", "Sealed Plus"])
+        )
+        assert loaded.tiers_most_open_first[-1] == "Sealed Plus"
+
+    def test_one_tier_declared_twice_refuses_because_an_order_needs_one_position(self):
+        with pytest.raises(ValueError, match="same tier"):
+            GovernanceVocabulary.from_json(
+                _ordered(tiers_most_open_first=["Open", "Sealed", "Open"])
+            )
+
+    def test_two_spellings_of_one_tier_are_the_same_tier_here_too(self):
+        """
+        Compared through `_norm_tier`, the same normalisation a glossary row is compared
+        through. A ladder where "Sealed " and "sealed" were two rungs would rank a tier
+        against itself; and the class below must still find its rung despite the padding.
+        """
+        with pytest.raises(ValueError, match="same tier"):
+            GovernanceVocabulary.from_json(
+                _ordered(tiers_most_open_first=["Open", "Sealed", "sealed "])
+            )
+
+        loaded = GovernanceVocabulary.from_json(
+            _ordered(tiers_most_open_first=["Open", "  SEALED  "])
+        )
+        assert loaded.tiers_most_open_first == ("Open", "  SEALED  ")
+
+    def test_an_ordering_given_as_a_bare_string_is_refused(self):
+        """
+        A string is iterable, so it would be read one letter per rung -- the same defect
+        that read `"aliases": "LEGACY-METER"` as seven single-character aliases.
+        """
+        with pytest.raises(ValueError, match="list of tokens"):
+            GovernanceVocabulary.from_json(_ordered(tiers_most_open_first="Open"))
+
+    def test_a_null_inside_the_ordering_is_refused_rather_than_stringified(self):
+        with pytest.raises(ValueError, match="non-blank string"):
+            GovernanceVocabulary.from_json(_ordered(tiers_most_open_first=["Open", None]))
+
+    def test_the_key_is_reserved_in_the_code_keyed_mapping_shape(self):
+        """
+        A regression for a refusal that was real before the key was read at all: the
+        code-keyed `{code: {...}}` shape is recognised only when EVERY unreserved value is
+        an object, so a document declaring the ordering held one list value and the whole
+        file came back "no protection classes found" -- a message pointing at the classes,
+        which were fine.
+        """
+        loaded = GovernanceVocabulary.from_json(
+            {
+                "open_classification": "Open",
+                "tiers_most_open_first": ["Open", "Sealed"],
+                "METERID": {
+                    "classification": "Sealed",
+                    "personal_information": True,
+                    "direct_identifier": True,
+                },
+            }
+        )
+        assert loaded.get("METERID").classification == "Sealed"
+        assert loaded.tiers_most_open_first == ("Open", "Sealed")
+
 
 # =============================================================================
 # ONE TOKEN, ONE MEANING

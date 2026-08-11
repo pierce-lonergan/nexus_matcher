@@ -14,20 +14,43 @@ The endpoint ALREADY answered 413 to an oversized body, by parsing all of it fir
 only the status passes on the broken code, on the measured no-op FastAPI dependency, and
 on the real fix alike -- it cannot tell them apart, which makes it worse than no test.
 
-What is asserted instead is the mechanism: the handler is never entered, and no more than
-the cap plus the chunk that crossed it is ever pulled from `receive`. Both are false on
-every shape that does not intercept `receive`.
+What is asserted instead is the mechanism: the handler is never entered, no chunk handed
+over is still referenced afterwards, and the reads a refused request costs are bounded.
+All three are false on every shape that does not intercept `receive`.
+
+## And the second defect: the 413 that never arrived
+
+Measured later against a real uvicorn on raw sockets, the refusal itself was being lost
+about 1-6% of the time -- the server closed on unread bytes, which sends RST, which
+discards the response the client had already buffered. The fix is a bounded drain, and
+what these tests assert about it is the ORDER of ASGI events: whether the body had stopped
+arriving when the refusal went out. That is precisely the condition deciding FIN vs RST,
+and it needs no socket.
+
+Which tests were watched red, and on what:
+
+  * on the SHIPPED middleware, `..._is_not_sent_while_the_client_is_still_writing` and its
+    streaming twin -- the two that pin the defect itself
+  * on a PARTIAL drain (the obvious fix, measured worse than no drain at all),
+    `test_a_partial_drain_is_never_what_happens`
+  * on a drain with the per-receive deadline removed,
+    `test_a_client_that_stops_sending_mid_body_is_still_answered`, which hangs
 
 ## No clock
 
 `test_degradation.py` forbids latency assertions by name -- other agents run concurrently
 on this machine and a flaky gate teaches people to ignore red -- so nothing here measures
-time or memory. Bytes pulled is the same claim, made deterministically.
+time, memory or a rate. The end-to-end claim is statistical (8 losses in 400 trials), and
+a gate that has to run 400 sockets to be 99.97% sure is exactly the flaky gate that rule
+forbids; every assertion here is instead a deterministic property of one request.
 """
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import json
+import sys
 from typing import Any
 
 import pytest
@@ -43,6 +66,14 @@ from tests.unit.presentation.api._support import FakeMatcher
 # Small enough that the tests are instant, and the arithmetic is the same at 9.9 MB.
 CAP = 4096
 CHUNK = 1024
+
+# The shipped `_DRAIN_MAX_MULTIPLE` is 2, so a refused request may cost 2 x CAP in reads.
+DRAIN_BUDGET = CAP * 2
+# A body over the cap and INSIDE the drain budget: the mis-chunked batch, which is the
+# case the 413 was being lost on. The real one is 10474502 bytes against a 9873024 cap.
+IN_BUDGET = CAP * 2
+# A body so far over the cap that no drain could finish: the attack, refused for free.
+OVER_BUDGET = CAP * 16
 
 # One character that costs four UTF-8 bytes, for the worst-case body below. `max_length`
 # on `FieldSpec` counts CHARACTERS, so this is a legal 8192-character `doc` that puts
@@ -79,18 +110,85 @@ def _scope(content_length: int | None = None, request_id: bytes | None = None) -
 
 
 class Driven:
-    """What one raw ASGI request produced: status, headers, body, and the bytes pulled."""
+    """What one raw ASGI request produced, including the order the ASGI events happened in.
+
+    `events` is the load-bearing field. It records every `receive` and every `send` in the
+    order they occurred, which is the only way to state the property this middleware was
+    losing the 413 for: the refusal must go out AFTER the body has stopped arriving, not
+    while the client is still writing.
+    """
 
     def __init__(
-        self, status: int, headers: list[tuple[bytes, bytes]], body: bytes, pulled: int
+        self,
+        status: int,
+        headers: list[tuple[bytes, bytes]],
+        body: bytes,
+        pulled: int,
+        events: list[tuple[str, Any]],
+        chunks: list[bytes],
     ) -> None:
         self.status = status
         self.headers = headers
         self.body = body
         self.pulled = pulled
+        self.events = events
+        self.handed_over = chunks
 
     def json(self) -> Any:
         return json.loads(self.body)
+
+    @property
+    def body_was_consumed_before_answering(self) -> bool:
+        """
+        Was the request body finished arriving at the moment the response started?
+
+        True only if a `more_body=False` receive happened before the first send. That is
+        exactly the socket-level condition that decides whether the server's close is a
+        FIN or an RST, and therefore whether the client can still read the 413 it has
+        already buffered.
+        """
+        for kind, detail in self.events:
+            if kind == "send":
+                return False
+            if kind == "receive" and detail == "last":
+                return True
+        return False
+
+    @property
+    def receives_before_answering(self) -> int:
+        count = 0
+        for kind, _detail in self.events:
+            if kind == "send":
+                break
+            if kind == "receive":
+                count += 1
+        return count
+
+    def retained_chunks(self) -> int:
+        """
+        How many handed-over body chunks anything is STILL holding a reference to.
+
+        This is what turns "draining must not reinstate the +3.5 GiB" into a deterministic
+        assertion rather than an RSS measurement, which the no-latency-assertions rule at
+        the top of this file rules out anyway. `self.handed_over` is the only list holding
+        each chunk, so a chunk the code under test let go of is referenced by that list and
+        by nothing else. Anything more means it did not let go, which is exactly what a
+        drain that accumulates instead of discarding looks like, and what buffering the
+        whole body looks like.
+
+        The baseline is MEASURED against a control rather than typed as a number. The
+        expected count is not the obvious 2: the list holds one, `getrefcount`'s argument
+        holds one, and the comprehension's own loop variable holds a third. Hard-coding it
+        made this read as "8 of 8 chunks retained" on a correct implementation -- a test
+        that is red on the truth is worse than no test, in the other direction.
+
+        Plain `bytes`, no subclass: `bytes` cannot be weakly referenced at all, and a
+        subclass that could would no longer be what a real server hands over.
+        """
+        gc.collect()
+        control = [b"\x00" * CHUNK]
+        baseline = max(sys.getrefcount(chunk) for chunk in control)
+        return sum(1 for chunk in self.handed_over if sys.getrefcount(chunk) > baseline)
 
     def header(self, name: str) -> str | None:
         """One response header, matched case-insensitively as HTTP defines it."""
@@ -119,36 +217,48 @@ async def drive(
     chunks = [body[i : i + CHUNK] for i in range(0, len(body), CHUNK)] or [b""]
     state = {"index": 0, "pulled": 0}
     messages: list[dict[str, Any]] = []
+    events: list[tuple[str, Any]] = []
+    # Every chunk actually handed over, held here and nowhere else in this function, so
+    # `Driven.retained_chunks` can ask whether the code under test is still holding one.
+    handed_over: list[bytes] = []
 
     async def receive() -> dict[str, Any]:
         index = state["index"]
         if index >= len(chunks):
+            events.append(("receive", "disconnect"))
             return {"type": "http.disconnect"}
         state["index"] = index + 1
-        state["pulled"] += len(chunks[index])
-        return {
-            "type": "http.request",
-            "body": chunks[index],
-            "more_body": state["index"] < len(chunks),
-        }
+        chunk = chunks[index]
+        state["pulled"] += len(chunk)
+        more = state["index"] < len(chunks)
+        handed_over.append(chunk)
+        events.append(("receive", "more" if more else "last"))
+        return {"type": "http.request", "body": chunk, "more_body": more}
 
     async def send(message: dict[str, Any]) -> None:
+        events.append(("send", message["type"]))
         messages.append(message)
 
     scope = _scope(len(body) if declare_length else None, request_id)
     await app(scope, receive, send)
+    # `chunks` and `body` are the test's own second and third references to the same
+    # objects; dropped so that a retained chunk can only be the code under test holding it.
+    chunks.clear()
+    del body
 
     starts = [m for m in messages if m["type"] == "http.response.start"]
     assert len(starts) == 1, f"the request was answered {len(starts)} times: {messages!r}"
     payload = b"".join(m.get("body", b"") for m in messages if m["type"] == "http.response.body")
     headers = [(bytes(k), bytes(v)) for k, v in starts[0].get("headers", [])]
-    return Driven(int(starts[0]["status"]), headers, payload, int(state["pulled"]))
+    return Driven(
+        int(starts[0]["status"]), headers, payload, int(state["pulled"]), events, handed_over
+    )
 
 
-def guarded(max_bytes: int = CAP) -> BodySizeLimitMiddleware:
+def guarded(max_bytes: int = CAP, **drain: Any) -> BodySizeLimitMiddleware:
     """The real app, wrapped exactly as `create_app` wraps it."""
     app = create_app(configure_logs=False, matcher=FakeMatcher(), environ={})
-    return BodySizeLimitMiddleware(app, max_bytes=max_bytes)
+    return BodySizeLimitMiddleware(app, max_bytes=max_bytes, **drain)
 
 
 def body_of_exactly(nbytes: int) -> bytes:
@@ -207,40 +317,210 @@ async def test_an_oversized_body_is_refused_before_the_handler_is_entered(handle
     assert handler_entries == [], "the oversized body was parsed and handed to the handler"
 
 
-async def test_nothing_past_the_cap_is_pulled_off_the_wire(handler_entries):
+async def test_nothing_past_the_cap_is_ever_RETAINED(handler_entries):
     """
     The assertion that separates this fix from every shape that does not work.
 
     A dependency, a `max_length`, or the shipped `max_fields` check all answer 413 having
-    first pulled and parsed every byte -- that is the +2179 MiB. The allowance is exactly
-    one chunk: the message that crosses the cap has already been handed over by the server
-    when it is counted, and chunk size is the server's choice, not ours.
-    """
-    oversized = body_of_exactly(CAP * 16)
+    first pulled and parsed every byte -- that is the +2179 MiB. What makes those shapes
+    expensive is not that the bytes were READ, it is that they were KEPT: a drained chunk
+    is counted and dropped, which is why bounding the drain on time and bandwidth is enough
+    and no bound on memory is needed.
 
-    result = await drive(guarded(), oversized)
+    So the claim is made against retention directly rather than against a proxy for it.
+    Every chunk handed over is weakly referenced, and after the request not one of them may
+    still be reachable. False on anything that buffers the body, false on a drain that
+    accumulates what it drains, and it costs no clock and no RSS measurement.
+    """
+    result = await drive(guarded(), body_of_exactly(OVER_BUDGET))
 
     assert result.status == 413
-    assert result.pulled <= CAP + CHUNK, (
-        f"pulled {result.pulled} of {len(oversized)} bytes for a {CAP}-byte cap; the body "
-        f"was read into memory before being refused"
+    assert result.retained_chunks() == 0, (
+        f"{result.retained_chunks()} of {len(result.handed_over)} body chunks are still "
+        f"reachable after the request was refused; the body was retained, not discarded"
     )
     assert handler_entries == []
 
 
-async def test_a_declared_content_length_over_the_cap_is_refused_without_reading_a_byte(
+async def test_the_reads_a_refused_request_costs_are_bounded(handler_entries):
+    """
+    The other half. Retention is bounded by discarding; BANDWIDTH is bounded by counting.
+
+    An unbounded drain is a slow-loris hole -- a client can make the server read forever by
+    declaring a body it dribbles out -- so the total a refused request may pull is capped
+    at `_DRAIN_MAX_MULTIPLE` x the byte cap. The allowance on top is exactly one chunk: the
+    message that crosses a bound has already been handed over by the server when it is
+    counted, and chunk size is the server's choice, not ours.
+    """
+    oversized = body_of_exactly(OVER_BUDGET)
+
+    result = await drive(guarded(), oversized)
+
+    assert result.status == 413
+    assert result.pulled <= DRAIN_BUDGET + CHUNK, (
+        f"pulled {result.pulled} of {len(oversized)} bytes for a {CAP}-byte cap; the drain "
+        f"is unbounded and a client that keeps writing can make this server read forever"
+    )
+    assert handler_entries == []
+
+
+async def test_a_declared_length_beyond_the_drain_budget_is_refused_without_reading_a_byte(
     handler_entries,
 ):
     """
-    The cheap fast path, and only that. It cannot be the mechanism -- a client that omits
-    the header, or a proxy that rewrites it, would walk straight past -- but when the
-    client does declare an oversized body there is no reason to read any of it.
+    The cheap fast path, and the control that keeps the drain below from eating it.
+
+    Content-Length is the one signal that says how big the body is BEFORE a byte is read,
+    which is what lets this path decide up front whether a drain could finish. Beyond the
+    budget it could not, and a drain that cannot finish is pure cost -- it does not save
+    the 413 and it still spends the bandwidth -- so nothing is read at all. This is the
+    row that measured +0 MiB against 8 x 304 MiB concurrent, and it must stay zero: an
+    implementation that "fixed" the lost 413 by always draining would turn this into 2432
+    MiB of reads and would go red here.
     """
-    result = await drive(guarded(), body_of_exactly(CAP * 16), declare_length=True)
+    result = await drive(guarded(), body_of_exactly(OVER_BUDGET), declare_length=True)
 
     assert result.status == 413, result.body
     assert result.pulled == 0, f"{result.pulled} bytes were read despite a declared length"
+    assert result.receives_before_answering == 0
     assert handler_entries == []
+
+
+# =============================================================================
+# THE REFUSAL HAS TO SURVIVE THE CLOSE
+# =============================================================================
+#
+# Measured against a real uvicorn on raw sockets, one non-blocking loop writing the body
+# and reading the response at once, 400 trials per arm:
+#
+#     as shipped, content-length     warm 392/400 readable, 8 LOST   fresh 392/400, 8 LOST
+#     as shipped, chunked            warm 396/400,          4 LOST   fresh 396/400, 4 LOST
+#     after this fix, all four arms  400/400,               0 LOST
+#
+# The server refuses and closes while the client is still writing. Closing a socket with
+# unread bytes in its receive buffer sends RST instead of FIN, and an RST discards what the
+# peer had already buffered -- so the client sees `fixed content-length: 403, bytes
+# received: 0`: headers in, body gone.
+#
+# None of that is assertable without a socket. What IS assertable, and what is exactly the
+# condition that decides FIN vs RST, is the ORDER: had the body stopped arriving at the
+# moment the refusal went out? These tests assert that ordering, so they need no clock, no
+# server, and no repetition -- and they are red on the shipped code, where the answer on
+# the fast path is "no receives at all".
+
+
+async def test_a_refusal_is_not_sent_while_the_client_is_still_writing(handler_entries):
+    """
+    THE regression. On the shipped code this is zero receives then a send, every time.
+
+    A body over the cap but inside the drain budget is the mis-chunked batch that motivated
+    this -- 10474502 bytes against a 9873024-byte cap, 1.06x. The whole of it is pulled and
+    thrown away BEFORE the 413 is written, so the server's close finds nothing unread and
+    the client can still read the response it has already buffered.
+    """
+    result = await drive(guarded(), body_of_exactly(IN_BUDGET), declare_length=True)
+
+    assert result.status == 413, result.body
+    assert result.body_was_consumed_before_answering, (
+        f"the 413 was written while the body was still arriving, so the close will reset "
+        f"the connection and discard it; ASGI events were {result.events!r}"
+    )
+    assert handler_entries == []
+
+
+async def test_the_streaming_path_does_not_send_while_the_client_is_still_writing(
+    handler_entries,
+):
+    """
+    The same defect on the path with no Content-Length to consult, measured at 4/400 lost.
+
+    It cannot look the size up, so it drains speculatively on what is left of the budget
+    and gives up if that runs out. Here it does not run out, so the ordering is the same.
+    """
+    result = await drive(guarded(), body_of_exactly(IN_BUDGET))
+
+    assert result.status == 413, result.body
+    assert result.json()["error"]["details"]["source"] == "stream"
+    assert result.body_was_consumed_before_answering, (
+        f"the streaming refusal was written mid-body; ASGI events were {result.events!r}"
+    )
+    assert handler_entries == []
+
+
+async def test_a_partial_drain_is_never_what_happens(handler_entries):
+    """
+    Draining PART of a body is measured worse than draining none, so it must not be a state
+    this code can reach.
+
+        drain 0 (as shipped)   warm 392/400   fresh 377/400
+        drain 64 KiB           warm 387/400   fresh 382/400
+        drain 256 KiB          warm 375/400   fresh 364/400   <- worse than doing nothing
+        drain to the END       warm 400/400   fresh 400/400
+
+    The client refills the receive buffer faster than a bounded read can empty it, so a
+    partial drain still leaves unread bytes at close, still resets, and has spent the
+    bandwidth for nothing. Every refusal must therefore be one of two things and never
+    a third: drained to the end, or not started.
+    """
+    for size, declared in ((IN_BUDGET, True), (OVER_BUDGET, True)):
+        result = await drive(guarded(), body_of_exactly(size), declare_length=declared)
+
+        assert result.status == 413
+        consumed = result.body_was_consumed_before_answering
+        untouched = result.receives_before_answering == 0
+        assert consumed or untouched, (
+            f"a {size}-byte body was drained only partway before the 413 went out, which "
+            f"spends the bandwidth AND loses the response; events {result.events!r}"
+        )
+    assert handler_entries == []
+
+
+async def test_a_client_that_stops_sending_mid_body_is_still_answered():
+    """
+    The anti-hang property, and the reason the deadline is on EACH receive rather than
+    between them.
+
+    A drain that awaits a message the client will never send waits forever. That is the
+    same shape as the client-side `expectContinue` fix that was reverted -- 654 s observed,
+    and the 30 s request timeout never fired -- arriving from the server's end instead. A
+    hang defeats every timeout and fallback an adopter has, which is worse than the flake
+    being fixed here.
+
+    No timing is ASSERTED. `receive` here never returns at all, so without the deadline
+    this test does not fail slowly, it never terminates; the `asyncio.timeout` is a
+    backstop so a regression fails the suite instead of hanging it. That makes the test
+    robust to a loaded machine rather than sensitive to it: a slow box makes it take
+    slightly longer, never makes it red.
+    """
+    sends: list[dict[str, Any]] = []
+    stalled = asyncio.Event()  # deliberately never set
+
+    async def receive() -> dict[str, Any]:
+        await stalled.wait()
+        raise AssertionError("unreachable")
+
+    async def send(message: dict[str, Any]) -> None:
+        sends.append(message)
+
+    app = guarded(drain_seconds=0.05)
+    async with asyncio.timeout(30):
+        await app(_scope(content_length=IN_BUDGET), receive, send)
+
+    assert [m["type"] for m in sends] == ["http.response.start", "http.response.body"]
+    assert sends[0]["status"] == 413
+
+
+async def test_the_drain_bounds_are_refused_at_construction_like_every_other_limit():
+    """
+    A drain budget below the cap could never finish -- a refused body is larger than the
+    cap by definition -- so it would spend bandwidth on every refusal and still lose the
+    413. Rejected where the zero-byte cap is, rather than discovered from a caller.
+    """
+    app = create_app(configure_logs=False, matcher=FakeMatcher(), environ={})
+    with pytest.raises(ValueError, match="drain_multiple"):
+        BodySizeLimitMiddleware(app, max_bytes=CAP, drain_multiple=0)
+    with pytest.raises(ValueError, match="drain_seconds"):
+        BodySizeLimitMiddleware(app, max_bytes=CAP, drain_seconds=0)
 
 
 async def test_the_refusal_uses_the_services_one_error_envelope(handler_entries):

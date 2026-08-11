@@ -110,9 +110,31 @@ class MatchRequest(BaseModel):
     """
     A batch of fields to match. Identical for `/match` and `/match/batch`; only the
     server's field-count cap differs.
+
+    `extra="ignore"` here, and `extra="forbid"` on `FieldSpec` one class up. The asymmetry
+    is the point, and it is a judgement about which direction each envelope has to survive.
+
+    THIS envelope has to be extensible, because it is the one a version skew lands on. Two
+    services on one contract drift apart in both directions -- a caller sending a key a
+    newer server understands gets a 422 from an older one, and the same caller keeps
+    getting 422s from a newer server after the field is added but before their build is
+    updated. Under `forbid` there is no way to add an optional request field to v1 at all
+    without a coordinated deploy of somebody else's Java pipeline, so the first optional
+    field this endpoint ever gains becomes a breaking change.
+
+    What that costs is bounded, and worth stating rather than waving at. A misspelled
+    `top_k` is now silently the default 5, and a misspelled `explain` silently false. Both
+    are VISIBLE IN THE RESPONSE the caller already has -- five candidates when they asked
+    for ten, no `explain` block when they asked for one -- and neither changes a
+    classification. `fields` is required, so misspelling THAT is still a 422.
+
+    `FieldSpec` keeps `forbid` for the opposite reason: a misspelled `doc` there is
+    silently dropped retrieval signal, so the caller gets measurably worse matches with
+    nothing in the response to show for it. That is the failure this endpoint exists to
+    prevent, and it is exactly what an ignored key looks like.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="ignore")
 
     # The attribute is `field_specs` and the wire name is `fields`. `BaseModel.fields` is
     # a deprecated pydantic-v1 property, so a model attribute of that name is a trap
@@ -190,6 +212,11 @@ class GovernanceView(BaseModel):
     A REJECTED candidate below rank 1 DOES carry its class. Nothing inherits from a
     runner-up, and the class is what lets a reviewer see that rank 1 is a direct
     identifier and rank 2 is not.
+
+    `code`, `name` and `classification` are deliberately typed `str` and NOT as an enum or
+    a `Literal`. They carry the caller's own controlled vocabulary; closing them would
+    hard-code one organisation's taxonomy into the schema a Java client generates from, and
+    this library ships no taxonomy at all.
     """
 
     code: str
@@ -197,6 +224,25 @@ class GovernanceView(BaseModel):
     classification: str
     personalInformation: bool
     directIdentifier: bool
+    # Carried because the caller who reads this object is deciding HOW TO PROTECT a field,
+    # and this is the only member that says what to do rather than what the field is. It
+    # was resolved on every `MatchResult` and dropped at the wire, so the answer to "mask
+    # it, tokenise it, or retain it seven years" lived only in a file the Java caller does
+    # not have.
+    #
+    # `str | None`, and read with `getattr(..., None)` rather than through the `drift()`
+    # path the five required members use: null is a documented value, not a defect. Five of
+    # the nine classes in `examples/governance/protection_classes.json` declare it null, so
+    # a required member here would refuse the repository's own example pack.
+    enhancement: str | None = Field(
+        description=(
+            "The caller's own handling instruction for this class -- masking, "
+            "tokenisation, a retention rule -- passed through untouched and never "
+            "interpreted by this library. Null when the class declares none, which is not "
+            "an error: it means the tier is the whole instruction. Free text in the "
+            "caller's vocabulary, deliberately not a closed set."
+        )
+    )
 
 
 class ExplainView(BaseModel):
@@ -265,6 +311,41 @@ class MatchCandidateView(BaseModel):
     explain: ExplainView | None = None
 
 
+class VocabularyView(BaseModel):
+    """
+    The two facts about the loaded vocabulary that a response cannot be READ without.
+
+    Not a dump of the caller's catalog -- that is their file and they have it. This is the
+    minimum needed to interpret the response it arrives with, which is why it rides on the
+    response rather than sitting on an endpoint somebody has to know to call. The body is a
+    governance artifact that gets pasted into a ticket and diffed; an artifact whose null
+    means "ask a second system" is not one.
+
+    Constant per deployment and roughly 120 bytes, so it is a rounding error against a
+    response that carries candidates.
+    """
+
+    openClassification: str = Field(
+        description=(
+            "The tier a field with no protection code sits at, named by the caller's own "
+            "vocabulary. This is what a `governance` of null MEANS on any candidate that "
+            "is not a rejected rank 1 -- without it, null is a value a client cannot "
+            "resolve without the vocabulary file. `UNCLASSIFIED` is this library's "
+            "sentinel and indicates no vocabulary is configured; it is deliberately not a "
+            "word a real taxonomy uses, so it cannot be mistaken for a real tier."
+        )
+    )
+    tiersMostOpenFirst: list[str] = Field(
+        description=(
+            "The caller's declared tier ordering, most open first, from their own "
+            "`tiers_most_open_first`. The ONLY thing that can rank two classifications "
+            "against each other: this library ranks nothing and supplies no tiers. Empty "
+            "when the vocabulary declares no ordering -- treat tiers as incomparable "
+            "there, never as alphabetical, which sorts CONFIDENTIAL above PUBLIC."
+        )
+    )
+
+
 class MatchResponseView(BaseModel):
     """
     The whole response: one list per input field, keyed by the caller's own `path`.
@@ -275,6 +356,10 @@ class MatchResponseView(BaseModel):
     """
 
     results: dict[str, list[MatchCandidateView]]
+    # Second, never first: `results` was the whole body and a Java client generated against
+    # that shape must keep reading it at the same key. Appending is additive on the wire;
+    # reordering is not.
+    vocabulary: VocabularyView
 
 
 class FeedbackResponseView(BaseModel):

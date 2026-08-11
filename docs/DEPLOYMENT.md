@@ -166,6 +166,24 @@ bytes per character on the wire, so a body inside its declared field bounds can 
 a derived cap. Raise this variable for that — the validation only refuses values *below* the
 floor, never above it.
 
+**What a refusal costs you, which is not zero.** A refused body *within twice the cap* is
+read and discarded before the 413 is sent — up to **2 × the cap in read bandwidth** (19.7 MB
+at the default) and up to **2.0 seconds of connection time**, per refused request. Beyond
+twice the cap nothing is read and the refusal is immediate.
+
+That is a deliberate trade, and it is worth understanding before you size a rate limit or a
+front proxy in front of this service. Refusing a body the client is still writing closes the
+socket with bytes unread; that is an RST, and an RST discards the 413 already sent, so the
+caller sees an opaque transport error instead of the two numbers telling it to re-chunk.
+Draining **discards** each chunk, so this costs bandwidth and time, never memory — eight
+concurrent 198 MB bodies still move server RSS by about 1 MiB.
+
+Both bounds are derived or fixed in code and are **not** environment-settable today: the
+byte bound scales with whatever `NEXUS_API_MAX_BODY_BYTES` resolves to, and the time bound
+is 2.0 s, chosen to sit under uvicorn's own 5 s `timeout_keep_alive` so it does not widen
+the slow-loris window. If you need them tunable, that is a change to `body_limit.py`, not a
+variable you are missing.
+
 This block was previously `NEXUS_API_HOST`, `NEXUS_API_PORT`, `NEXUS_API_WORKERS`,
 `NEXUS_API_TIMEOUT` and `NEXUS_API_CORS_ORIGINS`. **No code read any of those five**
 (verified by grep over `src/`), and an operator who configured a deployment from that list

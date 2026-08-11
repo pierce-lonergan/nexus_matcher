@@ -126,6 +126,45 @@ MAX_TOKENS = 512
 # ~6 MB per call, where a 64-row batch of 417-token entries was allocating 41 MB.
 MAX_BATCH_TOKENS = 4096
 
+# Hard cap on ROWS in one session.run, applied on top of MAX_BATCH_TOKENS. Re-derived
+# 2026-08-11 on the FHIR corpus (4598 entries + 1556 queries, 252,168 real tokens) by
+# benchmarks/exp_encoder_batch_size.py; artifact benchmarks/results/exp_encoder_batch_size.json.
+#
+# THE PREVIOUS DEFAULT OF 512 WAS NOT A CAP AT ALL. Against a 4096-token budget no batch
+# on this corpus ever reaches 512 rows, so 512, 1024 and 4096 produce byte-identical batch
+# plans (65 batches, widest 315 rows) and byte-identical embeddings. Whatever 512 was
+# chosen to do, it was doing nothing; the token budget was the only thing shaping batches.
+#
+# Throughput, interleaved best-of-3, each row beside the band measured on IDENTICAL code
+# in the same session -- H-007: the band is machine state, not a constant, so a speedup
+# quoted without one is not a result:
+#
+#     1 intra-op thread     band 0.7%   16: 1.074x  32: 1.056x  64: 1.030x  512: 1.000x
+#     8 (the shipped cap)   band 6.2%   16: 1.274x  32: 1.386x  64: 1.294x  512: 1.000x
+#
+# 32 and not 16 because the two regimes disagree and H-003 makes a batch-scheduling knob
+# prove itself in both: 16 is 1.8 points better at one thread and 11.2 points WORSE at the
+# thread count that actually ships. 32 is the only value at or near the top of both. Take
+# the 1-thread margin as the durable one -- it reproduced at 4.8% and 5.6% in two quiet
+# windows (bands 1.0% and 0.7%). A third run landed at 36% CPU busy, put it at 6.8%, and
+# had a band of 15.3%; it certifies nothing and is recorded UNMEASURABLE rather than
+# averaged in. The 8-thread margin swings 10.6-38.6% with machine state; do not quote it.
+#
+# ACCURACY DOES NOT CHOOSE THIS VALUE and no accuracy claim is made for it. int8 inference
+# is not batch-invariant and the churn is large -- 886 of 1556 queries change rank between
+# 32 and 512 -- but it is symmetric: 45 gained at rank 1, 48 lost, exact McNemar p = 0.84.
+# Every size measured was inconclusive against 512; among the five that batch differently
+# from it at all (16, 32, 64, 128, 256) the p-values run 0.33 to 0.84, and 32's 0.84 is the
+# least distinguishable of them. 1024 and 4096 are p = 1 by construction. The 1.67-point P@1
+# "regression" once blamed on batch_size came from a 300-query fixture and did not survive
+# a paired test; it needs new evidence that does before anyone acts on it again.
+#
+# Padding is not the mechanism either, despite a retracted 2.230x figure for 512 -- that
+# belongs to the pre-token-budget fixed-window encoder. On today's code the gap is 1.0151x
+# at 32 against 1.0282x at 512, i.e. 1.3% of the tokens buying 4.8-38.6% of the time. What is
+# actually bought is smaller session.run calls, not fewer padded tokens.
+DEFAULT_BATCH_SIZE = 32
+
 # Intra-op threads when the caller does not say. ONNX Runtime's own default is one thread
 # per physical core, which on an idle 32-thread workstation measured 6.07s against 4.00s
 # at 8 threads -- a 1.52x loss, with the two distributions not overlapping at all across 6
@@ -278,7 +317,7 @@ class BundledOnnxProvider:
             batches.append(current)
         return batches
 
-    def _encode(self, texts: Sequence[str], batch_size: int = 512) -> np.ndarray:
+    def _encode(self, texts: Sequence[str], batch_size: int = DEFAULT_BATCH_SIZE) -> np.ndarray:
         self._load()
         if not texts:
             return np.zeros((0, EMBEDDING_DIM), dtype=np.float32)
@@ -353,17 +392,21 @@ class BundledOnnxProvider:
 
         return out
 
-    def embed_documents(self, texts: Sequence[str], batch_size: int = 512) -> np.ndarray:
+    def embed_documents(
+        self, texts: Sequence[str], batch_size: int = DEFAULT_BATCH_SIZE
+    ) -> np.ndarray:
         """Encode DICTIONARY entries. No instruction prefix -- BGE is asymmetric."""
         return self._encode(list(texts), batch_size)
 
-    def embed_queries(self, texts: Sequence[str], batch_size: int = 512) -> np.ndarray:
+    def embed_queries(
+        self, texts: Sequence[str], batch_size: int = DEFAULT_BATCH_SIZE
+    ) -> np.ndarray:
         """Encode QUERIES, applying the model's query instruction."""
         return self._encode([self._query_instruction + t for t in texts], batch_size)
 
     # -- EmbeddingProvider protocol ---------------------------------------
 
-    def embed(self, texts: Sequence[str], batch_size: int = 512) -> Result:
+    def embed(self, texts: Sequence[str], batch_size: int = DEFAULT_BATCH_SIZE) -> Result:
         """Batch-encode as queries. This is the interface NexusMatcher calls per schema."""
         try:
             arr = self.embed_queries(list(texts), batch_size)

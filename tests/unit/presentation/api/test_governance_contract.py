@@ -7,7 +7,7 @@ The coupling between this HTTP layer and the domain's governance types.
 # TESTS → domain/governance :: ProtectionClass, read by name
 # TESTS → domain/models/entities :: MatchResult.governance / .governance_id
 
-This layer reads `MatchResult.governance_id`, `MatchResult.governance`, and five
+This layer reads `MatchResult.governance_id`, `MatchResult.governance`, and six
 attributes on `ProtectionClass`, BY NAME. Names are exactly what a parallel lane renames,
 and H-006 is the ledger entry for changes whose two halves land in different files --
 three occurrences so far, the most expensive of which shipped 2.5x faster and unreachable.
@@ -53,6 +53,12 @@ CONTRACT: tuple[tuple[str, str], ...] = (
     ("classification", "classification"),
     ("personal_information", "personalInformation"),
     ("direct_identifier", "directIdentifier"),
+    # Read by name like the five above, but NOT required like them -- see
+    # `test_an_absent_enhancement_is_a_null_and_not_a_refusal`. It is here because a rename
+    # in the domain lane must fail this file, and because losing it silently is the same
+    # class of defect as losing any other member: the caller stops being told how to
+    # protect the field and nothing says so.
+    ("enhancement", "enhancement"),
 )
 
 FIELD = SchemaField(name="resident_nm", data_type=DataType.STRING, full_path="a.resident_nm")
@@ -107,6 +113,25 @@ def test_the_classification_tier_is_carried_through_untouched():
         assert payload["classification"] == expected.classification
         assert payload["personalInformation"] is expected.personal_information
         assert payload["directIdentifier"] is expected.direct_identifier
+        assert payload["enhancement"] == expected.enhancement
+
+
+def test_the_enhancement_crosses_the_wire_in_both_of_its_declared_states():
+    """
+    A declared instruction and a declared null, from the same fixture.
+
+    `enhancement` is the only member of a protection class that says what to DO with the
+    field rather than what the field is, and it reached this layer on every result and was
+    then dropped -- so the caller deciding whether to mask or tokenise had to read a file on
+    the server. Both states are pinned because the null one is what makes it optional: four
+    of the fixture's classes declare an instruction and one declares null, exactly as five
+    of the nine classes in the shipped example pack do.
+    """
+    instructed = next(e for e in GLOSSARY if e.governance_code == "RESIDENT")
+    declared_none = next(e for e in GLOSSARY if e.governance_code == "OUTAGENOTE")
+
+    assert _governance_payload(governed_match(FIELD, instructed))["enhancement"] == "MASK_IN_LOGS"
+    assert _governance_payload(governed_match(FIELD, declared_none))["enhancement"] is None
 
 
 def test_an_entry_with_no_code_yields_no_class():
@@ -161,6 +186,31 @@ def test_a_partially_populated_protection_class_is_refused():
 
     with pytest.raises(ContractDriftError, match="direct_identifier"):
         _governance_payload(_malformed(governance=_HalfBuilt()))
+
+
+def test_an_absent_enhancement_is_a_null_and_not_a_refusal():
+    """
+    The asymmetry with the five required members, stated as a test.
+
+    A class object that never declares `enhancement` at all -- a caller's own
+    ProtectionClass-shaped adapter, or a domain lane that has not added the attribute --
+    must produce an explicit null, not the `ContractDriftError` that a missing
+    `direct_identifier` produces one test up. Null is a DOCUMENTED value for this member
+    and a defect for the other five, so `getattr(..., None)` is the right read here and the
+    `drift()` path is not: routing it through `drift()` would turn the five classes in the
+    shipped example pack that declare `"enhancement": null` into a 500.
+    """
+
+    class _NoEnhancement:
+        code = "RESIDENT"
+        name = "Resident Name"
+        classification = "LUMENPORT_GUARDED"
+        personal_information = True
+        direct_identifier = True
+
+    payload = _governance_payload(_malformed(governance=_NoEnhancement()))
+    assert payload is not None
+    assert payload["enhancement"] is None
 
 
 def test_a_result_with_no_governance_attributes_at_all_still_yields_an_id():

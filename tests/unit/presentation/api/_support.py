@@ -85,6 +85,11 @@ FICTIONAL_VOCABULARY_JSON: dict[str, Any] = {
         "this taxonomy. Invented for this test file; it is not any organisation's catalog."
     ),
     "open_classification": TIER_OPEN,
+    # The caller's own ordering of their own tiers, most open first. Declared here because
+    # the response carries it and because declaring it is what makes the loader CHECK it:
+    # a tier some class derives, or the open tier, missing from this list refuses the load.
+    # Nothing in the library supplies or ranks these; the list is Lumenport's.
+    "tiers_most_open_first": [TIER_OPEN, TIER_GUARDED, TIER_SEALED],
     "aliases": {
         # A legacy spelling that must be MAPPED, and a junk token that must be DROPPED.
         # Both declared, so "we quietly dropped something" cannot happen unnoticed.
