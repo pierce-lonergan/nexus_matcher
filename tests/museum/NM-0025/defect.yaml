@@ -1,7 +1,7 @@
 id: NM-0025
 symptom: "the only documented machine-readable output dropped protection_level and 2 of 5 score components, so the governance use case was impossible from the CLI and the confidence could not be checked"
 severity: HIGH
-fixed_in: unreleased
+fixed_in: 2.1.0
 gate_that_should_have_caught_it: "none -- the CLI tests stubbed the dictionary entry with exactly the four attributes the writer read, so a stub shaped like the defect could not see it"
 gate_that_catches_it_now: "tests/museum/NM-0025/test_nm_0025.py, plus tests/unit/presentation/test_cli_json_governance.py"
 touches:

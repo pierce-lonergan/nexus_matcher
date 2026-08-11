@@ -1,7 +1,7 @@
 id: NM-0024
 symptom: "content_hash listed its own fields while to_searchable_text embedded synonyms too, so editing synonyms left a stale vector and sync reported success"
 severity: HIGH
-fixed_in: unreleased
+fixed_in: 2.1.0
 gate_that_should_have_caught_it: "none -- the property tests compared sync against itself, and both sides used the same hash (H-004)"
 gate_that_catches_it_now: "tests/museum/NM-0024/test_nm_0024.py, plus tests/properties/test_incremental_work.py"
 touches:

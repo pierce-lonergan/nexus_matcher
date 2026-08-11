@@ -1,0 +1,92 @@
+{
+  "notice": "FICTIONAL EXAMPLE DATA. The Gravel Bay Ferry Authority does not exist and neither does this taxonomy. It was invented for this example pack. It is not any organisation's catalog, and it is not a template of one -- replace it wholesale with your own before matching anything real.",
+  "vocabulary": "gravel-bay-ferry-authority (fictional)",
+  "version": "1.0.0",
+  "tiers_most_open_first": [
+    "OPEN_DECK",
+    "CREW_ONLY",
+    "BRIDGE_SENSITIVE",
+    "SEALED_RESTRICTED"
+  ],
+  "open_classification": "OPEN_DECK",
+  "aliases": {
+    "GBF-LEGACY-NAME": "MANIFEST_NAME",
+    "OLD-BERTH-PHONE": "BERTH_CONTACT",
+    "n/a": null,
+    "tbc": null
+  },
+  "classes": [
+    {
+      "code": "MANIFEST_NAME",
+      "name": "Passenger manifest identity",
+      "classification": "SEALED_RESTRICTED",
+      "personal_information": true,
+      "direct_identifier": true,
+      "enhancement": "MASK_IN_LOGS"
+    },
+    {
+      "code": "BERTH_CONTACT",
+      "name": "Passenger contact channel",
+      "classification": "SEALED_RESTRICTED",
+      "personal_information": true,
+      "direct_identifier": true,
+      "enhancement": "MASK_IN_LOGS"
+    },
+    {
+      "code": "FARE_INSTRUMENT",
+      "name": "Fare payment instrument",
+      "classification": "SEALED_RESTRICTED",
+      "personal_information": true,
+      "direct_identifier": false,
+      "enhancement": "TOKENISE_AT_REST"
+    },
+    {
+      "code": "CREW_ROSTER",
+      "name": "Crew employment record",
+      "classification": "BRIDGE_SENSITIVE",
+      "personal_information": true,
+      "direct_identifier": true,
+      "enhancement": null
+    },
+    {
+      "code": "BOARDING_PASS",
+      "name": "Boarding and gate record",
+      "classification": "BRIDGE_SENSITIVE",
+      "personal_information": true,
+      "direct_identifier": false,
+      "enhancement": null
+    },
+    {
+      "code": "SALVAGE_CLAIM",
+      "name": "Salvage and incident claim detail",
+      "classification": "BRIDGE_SENSITIVE",
+      "personal_information": true,
+      "direct_identifier": false,
+      "enhancement": "RETAIN_SEVEN_YEARS"
+    },
+    {
+      "code": "HARBOUR_TERMS",
+      "name": "Commercial harbour agreement terms",
+      "classification": "BRIDGE_SENSITIVE",
+      "personal_information": false,
+      "direct_identifier": false,
+      "enhancement": null
+    },
+    {
+      "code": "VESSEL_TELEMETRY",
+      "name": "Vessel operational telemetry",
+      "classification": "CREW_ONLY",
+      "personal_information": false,
+      "direct_identifier": false,
+      "enhancement": null
+    },
+    {
+      "code": "TIDE_TABLE",
+      "name": "Published sailing and tide data",
+      "classification": "OPEN_DECK",
+      "personal_information": false,
+      "direct_identifier": false,
+      "enhancement": null
+    }
+  ]
+}

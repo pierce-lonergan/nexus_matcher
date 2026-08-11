@@ -639,15 +639,35 @@ exclude_lines = [
     "if __name__ == .__main__.:",
     "@abstractmethod",
 ]
-# Ratchet, not an aspiration. Measured 65% (6056 stmts / 1986 missed, 1572
-# branches / 227 partial) on 2026-08-05 running the full suite in an env with
-# every extra except qdrant-client, redis and blake3 installed. The previous
-# value was 80, which nothing ever reached, so pytest exited 1 on every green
-# run and the gate taught people to ignore it.
+# RATCHET, not an aspiration. IT MAY ONLY RISE. Lowering it is how a gate becomes a
+# decoration, and this one has already been both: it was 80, which nothing ever reached,
+# so pytest exited 1 on every green run and the gate taught people to ignore it.
 #
-# 62 sits ~3 points below today's number: it passes now, and it fails if
-# coverage regresses. Raise it as coverage climbs - do not lower it.
-fail_under = 62
+# TWO invocations enforce this number - `make test-cov` (whole suite) and the CI unit job
+# (`pytest tests/unit --cov=nexus_matcher -m "not slow"`). The binding one is whichever
+# measures lower, so both are re-measured whenever this line moves.
+#
+# MEASURED 2026-08-10, on this tree, in an env with every extra except qdrant-client,
+# redis and blake3 (all three are MORE covered on CI, which installs [full,dev], so the
+# CI number is the friendlier of the two - this floor is set against the local one):
+#     75.73%  CI unit job     (7915 stmts / 1744 missed, 2154 branches / 314 partial)
+#     77.39%  whole suite     (7915 stmts / 1620 missed, 2154 branches / 309 partial)
+# The previous value was 62, set against 65% measured on 2026-08-05.
+#
+# 73 SITS ~2.7 POINTS UNDER THE BINDING NUMBER - it passes now, and it fails if coverage
+# regresses. Not tighter than that, because the same two commands read 66.25% and 69.91%
+# earlier the SAME AFTERNOON, while two parallel lanes had landed source ahead of its
+# tests. That 11-point intraday swing is churn, not test quality, and a ratchet that fires
+# on churn is a ratchet somebody switches off - the user-visible consequence being a green
+# CI over a real coverage regression, which is the failure this file documents most.
+#
+# Proven to have teeth rather than assumed: replayed against the 2026-08-10 coverage data
+# that read 64.71%, `--fail-under=62` exits 0 and `--fail-under=73` exits 2. A subset run
+# (`pytest tests/unit/domain --cov=nexus_matcher`) reports 16.89% and exits non-zero
+# naming this number, so the value on this line is the one actually enforced.
+#
+# Raise it as coverage climbs. Re-measure both commands, put the numbers and the date here.
+fail_under = 73
 
 [tool.black]
 line-length = 100

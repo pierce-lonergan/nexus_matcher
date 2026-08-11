@@ -12,6 +12,33 @@ that it came from. Numbers without an artifact are not stated.
 
 ## [Unreleased]
 
+---
+
+## [2.1.0] - 2026-08-10
+
+### Security
+
+- **A comment naming the organisation and business unit whose data model the default
+  domain hierarchy was sketched from has been removed.** It sat above
+  `DEFAULT_HIERARCHY_DATA` in `domain/services/domain_hierarchy.py` and shipped **inside
+  the 2.0.0 and 2.0.1 wheels**, so it is on PyPI in both. Two further copies were in
+  `docs/modules/domain_hierarchy.md` and four in an integration test. `DEFAULT_HIERARCHY_DATA`
+  itself is unchanged — the names in it are ordinary industry vocabulary — but it is now
+  documented for what it is: an illustrative default that callers should replace via
+  `DomainHierarchy.from_dict()`.
+
+  Yanking 2.0.0 and 2.0.1 hides them from resolvers; it does not make the files
+  unreachable. Anyone who must have the string gone from what they redistribute should
+  pin 2.1.0 or later.
+
+- **Two gates now enforce this mechanically**, because the rule previously existed only
+  as an intention. `tests/meta/test_no_confidential_terms.py` scans every tracked file on
+  each commit, and `scripts/release_preflight.py` scans the built wheel before upload —
+  the tree and the artifact are different scopes, and it was the artifact that mattered.
+  The blocklist is stored as salted digests rather than words, so the gate can recognise
+  a term the repository never contains; `scripts/add_confidential_term.py` extends it
+  without the term reaching your shell history. Recorded as **NM-0029**.
+
 ### Changed — BREAKING
 
 - **`ScoreBreakdown.semantic_score` is renamed to `fused_retrieval_score`.** It never was
@@ -51,6 +78,17 @@ that it came from. Numbers without an artifact are not stated.
   when a reranker makes the bound unsound. `MatchingSession` carries the value that
   produced it. The floor was folklore; nothing computed it, so no threshold could be
   checked against it.
+- **`GovernanceVocabulary` and `ProtectionClass`** — a caller-supplied controlled
+  vocabulary of protection codes, loaded from a JSON file the caller owns. **This library
+  ships no taxonomy**: one organisation's codes baked into a library are useless to every
+  other organisation. `DictionaryEntry` gains `governance_code`, and `MatchResult` gains
+  `governance_id` and `governance` — populated on every candidate, not only rank 1,
+  because a reviewer choosing between rank 1 and rank 2 usually decides on the class.
+  `ingest.load_entries(governance=…)` validates every row against the vocabulary: a code
+  the vocabulary does not define is rejected rather than stored, and a row whose stated
+  tier contradicts its own code **refuses the load** — the tier is derived from the code,
+  never read from the row (**NM-0028**). A `REJECT` match confers no class at all, so a
+  novel field can never inherit the classification of a candidate the matcher rejected.
 
 ### Fixed
 

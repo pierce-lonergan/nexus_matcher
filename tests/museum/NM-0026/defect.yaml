@@ -1,7 +1,7 @@
 id: NM-0026
 symptom: "match -f json wrote its progress spinner and summary line to stdout alongside the payload, so redirecting the only machine-readable output produced a file no JSON parser accepts"
 severity: HIGH
-fixed_in: unreleased
+fixed_in: 2.1.0
 gate_that_should_have_caught_it: "none -- every CLI test asserted that a substring appeared in the output, and none ever parsed it"
 gate_that_catches_it_now: "tests/museum/NM-0026/test_nm_0026.py, plus tests/unit/presentation/test_cli_json_governance.py"
 touches:

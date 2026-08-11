@@ -1,0 +1,15 @@
+id: NM-0029
+symptom: "a comment naming the employer and business unit whose data model the default hierarchy was sketched from shipped inside the 2.0.0 and 2.0.1 wheels to PyPI"
+severity: CRITICAL
+fixed_in: 2.1.0
+gate_that_should_have_caught_it: "none -- the rule existed only as a sentence in a task description and a regex somebody ran by hand, scoped to whichever vocabulary was on their mind that day"
+gate_that_catches_it_now: "tests/museum/NM-0029/test_nm_0029.py, plus tests/meta/test_no_confidential_terms.py (tree) and scripts/release_preflight.py::check_no_confidential_terms_in_artifacts (built wheel)"
+touches:
+  - src/nexus_matcher/domain/services/domain_hierarchy.py
+  - docs/modules/domain_hierarchy.md
+  - tests/integration/test_domain_hierarchy_integration.py
+notes: >
+  This entry deliberately does NOT reproduce the leaked string. The replay plants the
+  public canary instead, which travels the identical code path -- a blocked term reaching
+  a file under src/. A museum entry that stored the secret in order to prove the secret
+  cannot be stored would be self-defeating, and it would sit in git history forever.

@@ -126,25 +126,26 @@ class TestDomainHierarchyIntegration:
 class TestCustomHierarchy:
     """Test custom hierarchy creation."""
 
-    def test_create_jpmc_specific_hierarchy(self):
-        """Test creating JPMC-specific domain hierarchy."""
+    def test_create_organisation_specific_hierarchy(self):
+        """A caller's own taxonomy scores correctly without the bundled default."""
         hierarchy = DomainHierarchy()
 
-        # Build CCB-specific hierarchy
-        hierarchy.add_domain("CCB")
-        hierarchy.add_domain("CONSUMER_BANKING", parent="CCB")
-        hierarchy.add_domain("CHASE_CARD", parent="CCB")
-        hierarchy.add_domain("HOME_LENDING", parent="CCB")
+        # A hierarchy that exists nowhere in DEFAULT_HIERARCHY_DATA, to show that
+        # scoring follows the supplied tree rather than the bundled one.
+        hierarchy.add_domain("RETAIL")
+        hierarchy.add_domain("DEPOSITS", parent="RETAIL")
+        hierarchy.add_domain("CARD_SERVICES", parent="RETAIL")
+        hierarchy.add_domain("HOME_LENDING", parent="RETAIL")
 
-        hierarchy.add_domain("CHECKING", parent="CONSUMER_BANKING")
-        hierarchy.add_domain("SAVINGS", parent="CONSUMER_BANKING")
+        hierarchy.add_domain("CHECKING", parent="DEPOSITS")
+        hierarchy.add_domain("SAVINGS", parent="DEPOSITS")
 
         matcher = DomainMatcher(hierarchy)
 
         # Test relationships
         assert matcher.score("CHECKING", "SAVINGS") >= 0.7  # Siblings
-        assert matcher.score("CONSUMER_BANKING", "CHECKING") >= 0.8  # Parent
-        assert matcher.score("CHECKING", "CHASE_CARD") >= 0.5  # Cousins
+        assert matcher.score("DEPOSITS", "CHECKING") >= 0.8  # Parent
+        assert matcher.score("CHECKING", "CARD_SERVICES") >= 0.5  # Cousins
 
     def test_deep_hierarchy(self):
         """Test deeply nested hierarchy."""

@@ -42,11 +42,16 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from nexus_matcher.domain.governance import (
+    CLASSIFICATION_COLUMN_ALIASES,
+    CODE_COLUMN_ALIASES,
+    GovernanceVocabulary,
+)
 from nexus_matcher.domain.models.entities import DictionaryEntry
 from nexus_matcher.shared.types.base import DataType, ProtectionLevel
 
@@ -97,16 +102,18 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
         "entity",
         "schema",
     ),
-    "protection_level": (
-        "protectionlevel",
-        "classification",
-        "sensitivity",
-        "governance",
-        "governancestatus",
-        "confidentiality",
-        "pii",
-        "securityclassification",
-    ),
+    # The free-text tier, and the CONTROLLED code that derives it. Both alias tuples are
+    # imported rather than written out here: `domain.governance` owns what a classification
+    # and a protection code ARE, and `problems_with()` has to resolve the same two columns
+    # out of a raw row, so a copy in this file would be a second notion of which column is
+    # which -- exactly the split that once had the loader path rejecting files the ingest
+    # path read without complaint.
+    #
+    # Ordered as they are deliberately. `map_columns` takes the first unclaimed column per
+    # field, so a glossary carrying both "Classification" and "Classification Code" keeps
+    # the existing meaning of the first.
+    "protection_level": CLASSIFICATION_COLUMN_ALIASES,
+    "governance_code": CODE_COLUMN_ALIASES,
 }
 
 
@@ -506,11 +513,30 @@ def _as_text(value: Any) -> str:
     return str(value).strip()
 
 
+def load_governance(
+    source: GovernanceVocabulary | str | Path | Mapping[str, Any] | Sequence[Any] | None,
+) -> GovernanceVocabulary | None:
+    """
+    Coerce a `governance=` argument into a vocabulary, or None for "feature off".
+
+    None and `GovernanceVocabulary.empty()` are NOT the same thing and the difference is
+    load-bearing. None means no vocabulary was configured, so no code is validated and
+    none is stored -- the behaviour every existing caller already has. `empty()` means a
+    vocabulary WAS configured and declares nothing, so every code in the glossary is a
+    code nobody defined, and strict loading says so instead of quietly indexing them.
+    """
+    if source is None or isinstance(source, GovernanceVocabulary):
+        return source
+    return GovernanceVocabulary.from_json(source)
+
+
 def load_entries(
     source: str | Path | Iterable[dict],
     query: str | None = None,
     columns: dict[str, str] | None = None,
     id_prefix: str = "",
+    governance: GovernanceVocabulary | str | Path | Mapping[str, Any] | Sequence[Any] | None = None,
+    governance_strict: bool = True,
     **kwargs: Any,
 ) -> list[DictionaryEntry]:
     """
@@ -522,6 +548,14 @@ def load_entries(
         columns: Explicit {field: source_column} overrides. Anything not given is
             inferred from the header via `map_columns`.
         id_prefix: Prefix for generated ids, useful when pooling several glossaries.
+        governance: The caller's controlled vocabulary -- a `GovernanceVocabulary`, a
+            path to its JSON file, or the parsed document. None (the default) leaves
+            governance unread: no code is validated, and none is attached.
+        governance_strict: With a vocabulary configured, REFUSE the whole load when any
+            row's governance is defective (an undefined code, or a tier that contradicts
+            its own code). Set False to load anyway -- the catalog still wins, so no
+            entry inherits the contradicted tier, and each offending row carries its
+            problems in `source_metadata['governance_problems']`.
         **kwargs: Passed to the reader (`sheet`, `delimiter`, `encoding`).
 
     Returns:
@@ -530,10 +564,12 @@ def load_entries(
 
     Raises:
         ValueError: if neither a business name nor a definition column can be identified,
-            which means the mapping is wrong rather than the data being sparse.
+            which means the mapping is wrong rather than the data being sparse; or, under
+            `governance_strict`, if any row's governance is defective.
     """
     rows, header = read_source(source, query=query, **kwargs)
     mapping = {**map_columns(header), **(columns or {})}
+    vocabulary = load_governance(governance)
 
     if "business_name" not in mapping and "definition" not in mapping:
         raise ValueError(
@@ -544,11 +580,12 @@ def load_entries(
 
     entries: list[DictionaryEntry] = []
     used_ids: set[str] = set()
+    defects: list[str] = []
     # Hoisted: this is a property of the MAPPING, not of the row. Rebuilding it inside
     # the comprehension below meant one set construction per row -- 30k of them on a 30k
     # glossary, measured at 3x the cost of the whole source_metadata build.
     mapped_columns = set(mapping.values())
-    for row in rows:
+    for row_number, row in enumerate(rows, start=1):
         # `row` is bound as a default argument rather than captured. Capturing the loop
         # variable works only while the closure is called inside the same iteration --
         # true today, and silently wrong the moment anyone defers a call.
@@ -560,6 +597,23 @@ def load_entries(
         definition = get("definition")
         if not business_name and not definition:
             continue
+
+        # Governance, resolved through the caller's vocabulary and NEVER from the row.
+        #
+        # `governance_code` is the CANONICAL code the vocabulary declares, so a legacy
+        # spelling is stored as the code it maps to and a token the vocabulary does not
+        # define is stored as nothing at all. Storing an unknown code would leave a field
+        # carrying a label nobody defined, which reads as governance and is not.
+        governance_code: str | None = None
+        problems: list[str] = []
+        if vocabulary is not None:
+            problems = vocabulary.problems_with(row)
+            if problems:
+                defects.append(
+                    f"row {row_number} ({business_name or definition!r}): " + "; ".join(problems)
+                )
+            protection_class = vocabulary.get(get("governance_code"))
+            governance_code = protection_class.code if protection_class is not None else None
 
         raw_id = get("id")
         if raw_id:
@@ -593,12 +647,18 @@ def load_entries(
                 data_type=_coerce_type(get("data_type")),
                 domain=get("domain"),
                 protection_level=_coerce_protection(get("protection_level")),
-                # Everything unmapped is preserved, PLUS the raw governance string. The
+                governance_code=governance_code,
+                # Everything unmapped is preserved, PLUS the raw governance strings. The
                 # classification column is usually the whole reason for matching -- an
                 # earlier version mapped it (which excluded it from here) and then never
                 # used it, so the value a caller most needs was silently dropped. The
                 # enum is lossy by design (an org's "Highly Restricted" collapses to
                 # RESTRICTED), so the original text is kept alongside it.
+                #
+                # `governance_code_raw` is the same guarantee for the controlled code,
+                # and it is the ONLY place a rejected token survives: it is evidence for
+                # whoever fixes the source file, sitting under a key that cannot be
+                # mistaken for an accepted class.
                 source_metadata={
                     **{k: v for k, v in row.items() if k not in mapped_columns},
                     **(
@@ -606,9 +666,35 @@ def load_entries(
                         if mapping.get("protection_level")
                         else {}
                     ),
+                    **(
+                        {"governance_code_raw": get("governance_code")}
+                        if mapping.get("governance_code")
+                        else {}
+                    ),
+                    **({"governance_problems": problems} if problems else {}),
                 },
             )
         )
+
+    if defects and governance_strict:
+        # REFUSE the load rather than return the good rows.
+        #
+        # Returning a partial glossary is the failure mode this check exists to stop: the
+        # rows that vanished are exactly the rows whose governance was wrong, so the
+        # caller indexes a dictionary that looks healthy, matches a field against it, and
+        # inherits nothing where they should have inherited a class. A defective
+        # vocabulary reference is a source-data bug and it has to be fixed in the source.
+        shown = defects[:10]
+        more = f"\n  ... and {len(defects) - len(shown)} more" if len(defects) > len(shown) else ""
+        raise ValueError(
+            f"{len(defects)} row(s) carry defective governance and the load was refused.\n  "
+            + "\n  ".join(shown)
+            + more
+            + "\nFix the source, or pass governance_strict=False to load anyway -- the "
+            "catalog still wins, so no entry inherits a contradicted tier, and each "
+            "offending row carries its problems in source_metadata['governance_problems']."
+        )
+
     return entries
 
 

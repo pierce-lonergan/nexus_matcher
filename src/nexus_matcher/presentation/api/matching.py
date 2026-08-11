@@ -1,0 +1,676 @@
+"""
+nexus_matcher.presentation.api.matching | Layer: PRESENTATION
+POST /api/v1/match and /api/v1/match/batch -- matching over HTTP.
+
+## Relationships
+# DEPENDS_ON → application/use_cases/match_schema :: the matcher this wraps
+# DEPENDS_ON → domain/models/entities :: SchemaField in, MatchResult out
+# DEPENDS_ON → presentation/api/limits :: admission control and the deadline
+# DEPENDS_ON → presentation/api/errors :: every failure mode
+# DEPENDS_ON → presentation/api/schemas :: the wire contract
+# USED_BY    → presentation/api/app :: mounted by create_app
+
+## Why this exists
+
+Matching was Python-and-CLI only. The adopter's pipeline is Java, so every documented way
+to use this library was unreachable to them; the REST surface was health and
+introspection. This is the one thing blocking them.
+
+## The three properties this module is responsible for
+
+**CONSERVATION (NM-0005).** Every input field appears in the output, under the caller's
+own `path`. A dict silently absorbs a collision, and a field that vanishes from a result
+map inherits no governance while nothing raises -- the only symptom is a count nobody has
+reason to check. `_project_results` checks it three independent ways and refuses the
+response rather than trimming it.
+
+**DETERMINISM.** Two identical requests produce byte-identical bodies: keys in input
+order, a fixed key order inside every object, floats rounded to a fixed precision, and an
+ASCII-only renderer. The last one matters because this is a governance artifact that gets
+pasted into tickets and diffed.
+
+**DETERMINISTIC DEGRADATION.** Overload sheds with 503, the deadline answers 504, a
+matcher failure is a named 500. It never hangs. See `limits.py`.
+
+## Coupling that is deliberate, and how it is made safe
+
+Two private names on the application layer are read here, because the application layer
+exposes no public equivalent:
+
+  * `NexusMatcher._match_fields` -- the only way to match a LIST OF FIELDS. The public
+    `match_schema` takes a schema source and runs a parser; this endpoint's caller has
+    already parsed their schema and is sending fields. `tests/properties/test_conservation`
+    and three museum entries reach the same method for the same reason.
+  * `NexusMatcher._config` -- the weights `explain` reports, read off the LIVE matcher so
+    a tuned deployment gets a response that reproduces ITS numbers, not the shipped ones.
+    Same pattern, and same justification, as the CLI's `_MATCHER_CONFIG_ATTR`.
+
+Neither is left to fail obscurely: a missing attribute raises `ContractDriftError`, a 500
+that names both sides. And the weights are not trusted on their name alone -- when
+`explain` is requested the emitted numbers must reproduce the emitted confidence, or the
+response is refused. A governance document whose arithmetic does not close is worse than
+no document, because it is the one that gets used as evidence.
+
+A public `match_fields` on `NexusMatcher` would remove both couplings; that file belongs
+to another lane.
+"""
+
+from __future__ import annotations
+
+import json
+from collections import Counter
+from typing import TYPE_CHECKING, Any
+
+from fastapi import APIRouter, status
+from fastapi.responses import JSONResponse
+
+from nexus_matcher.domain.models.entities import SchemaField
+from nexus_matcher.presentation.api.errors import (
+    ConservationViolationError,
+    MalformedRequestError,
+    MatcherUnavailableError,
+    MatchFailedError,
+    RequestTooLargeError,
+    drift,
+)
+from nexus_matcher.presentation.api.limits import run_bounded
+from nexus_matcher.presentation.api.schemas import MatchRequest, MatchResponseView
+from nexus_matcher.shared.types.base import DataType
+
+if TYPE_CHECKING:
+    from nexus_matcher.domain.models.entities import MatchResult
+    from nexus_matcher.presentation.api.limits import BoundedWorkPool, MatchServiceLimits
+    from nexus_matcher.presentation.api.schemas import FieldSpec
+
+# =============================================================================
+# CONSTANTS
+# =============================================================================
+
+# Private application-layer names this module reads. Named constants rather than inline
+# strings so the coupling is greppable from one place when the other lane makes them
+# public -- H-006's shape is exactly a change whose two halves live in different lanes.
+_MATCH_FIELDS_ATTR = "_match_fields"
+_MATCHER_CONFIG_ATTR = "_config"
+
+# Decimals kept for every emitted number. Six, matching the CLI's JSON writer, and for the
+# same reason: with `explain` the response has to be self-checking, and an auditor
+# recomputing sum(scores * weights) at four decimals can disagree with the emitted
+# confidence in the fourth place -- indistinguishable from the tool getting it wrong.
+_PRECISION = 6
+
+# How far the recomputed weighted sum may sit from the emitted confidence before the
+# response is refused. Roughly two orders of magnitude of headroom over the worst-case
+# rounding of eleven terms: loose enough never to reject honest rounding, tight enough
+# that a real disagreement cannot pass.
+_REPRODUCTION_TOLERANCE = 10 ** -(_PRECISION - 1)
+
+# (response key, ScoreBreakdown attribute, MatchingConfig weight attribute).
+#
+# One table rather than five inline reads, so the SCORE-TO-WEIGHT PAIRING lives in a
+# single visible place: pairing a component with the wrong weight produces a response that
+# is self-consistently wrong, which is the worst failure an audit surface has. The first
+# key is `fusedRetrieval`, not `semantic`: the number is the min-max-normalised fused
+# retrieval score and is rank-relative, so calling it semantic claims 90% similarity and
+# delivers "ranked first among this field's candidates".
+_SCORE_COMPONENTS: tuple[tuple[str, str, str], ...] = (
+    ("fusedRetrieval", "fused_retrieval_score", "semantic_weight"),
+    ("lexical", "lexical_score", "lexical_weight"),
+    ("editDistance", "edit_distance_score", "edit_distance_weight"),
+    ("type", "type_compatibility_score", "type_weight"),
+    ("domain", "domain_score", "domain_weight"),
+)
+
+# Distinguishes "the attribute is absent" from "the attribute is None". The governance
+# contract needs both: an absent `MatchResult.governance` means the field has not landed
+# yet, while a present None means the entry genuinely has no code and the response must
+# carry an explicit null.
+_ABSENT = object()
+
+
+# =============================================================================
+# RESPONSE RENDERING
+# =============================================================================
+
+
+class DeterministicJSONResponse(JSONResponse):
+    """
+    Render exactly the dict the handler built: no re-ordering, no NaN, pure ASCII.
+
+    Starlette's default renderer is already compact and preserves insertion order, so two
+    of the three come free. The two changes are deliberate:
+
+    `allow_nan=False`. Python's json module emits bare `NaN` and `Infinity`, which are not
+    JSON. A Java client parsing that gets an exception in the middle of a governance
+    payload, which is a far worse failure than the 500 this raises instead.
+
+    `ensure_ascii=True`. The body becomes pure ASCII, so an accented business name travels
+    as an escape rather than as bytes that some intermediary re-encodes. Same choice, and
+    the same reason, as the CLI's JSON writer: `json.loads` returns the original string
+    either way, and the artifact is then byte-stable no matter whose console or log
+    pipeline it passes through.
+    """
+
+    def render(self, content: Any) -> bytes:
+        return json.dumps(
+            content,
+            ensure_ascii=True,
+            allow_nan=False,
+            indent=None,
+            separators=(",", ":"),
+        ).encode("ascii")
+
+
+# =============================================================================
+# MATCHER HANDLE
+# =============================================================================
+
+
+class MatcherHandle:
+    """
+    Holds the matcher the endpoints use -- and, when there is none, WHY.
+
+    Separated from the router because the matcher is built during application startup
+    (loading a dictionary means loading an encoder) while the routes are registered at
+    import time. Without the handle the routes would have to be conditional on startup
+    order, and an endpoint that exists only sometimes is an endpoint whose 404 means two
+    different things.
+    """
+
+    def __init__(self) -> None:
+        self._matcher: object | None = None
+        self._reason: str = (
+            "no dictionary is configured. Set NEXUS_API_DICTIONARY to a dictionary file "
+            "(.xlsx or .csv), or pass matcher=... to create_app()."
+        )
+
+    def bind(self, matcher: object) -> None:
+        """Install the matcher these endpoints will use."""
+        self._matcher = matcher
+
+    def record_failure(self, reason: str) -> None:
+        """Record why there is no matcher, so the 503 can say something actionable."""
+        self._matcher = None
+        self._reason = reason
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether matching can be served. Reported through /health/ready."""
+        return self._matcher is not None
+
+    def require(self) -> object:
+        """The matcher, or a 503 that names the reason there is not one."""
+        if self._matcher is None:
+            raise MatcherUnavailableError(
+                message=f"The matching service is not ready: {self._reason}",
+                details={"reason": self._reason},
+            )
+        return self._matcher
+
+
+# =============================================================================
+# TRANSLATION -- request in
+# =============================================================================
+
+
+def _to_schema_field(spec: FieldSpec) -> SchemaField:
+    """
+    One wire field to one domain field.
+
+    `parent_path` is not bookkeeping. Hierarchical context injected into the retrieval
+    query is the largest single accuracy factor measured on this task (+20 points of P@1),
+    so a caller who sends `customer.contact.email` gets a materially better answer than one
+    who sends `email` -- and dropping the derivation here would silently cost them that.
+
+    `flattened_name` is set to the caller's own path so the matcher's result keys ARE the
+    caller's keys. `_project_results` checks that independently of the order-based mapping,
+    which gives two oracles for the conservation law instead of one that agrees with itself.
+    """
+    parent, _, _leaf = spec.path.rpartition(".")
+    return SchemaField(
+        name=spec.name,
+        # from_string never raises: an unrecognised type normalises to UNKNOWN, which
+        # scores neutrally rather than rejecting a request over a type name this library
+        # has not seen. A caller's dialect is not their mistake.
+        data_type=DataType.from_string(spec.type),
+        full_path=spec.path,
+        parent_path=parent,
+        description=spec.doc,
+        source_metadata={"flattened_name": spec.path},
+    )
+
+
+# =============================================================================
+# TRANSLATION -- response out
+# =============================================================================
+
+
+def _governance_id(match: MatchResult) -> str:
+    """
+    The governance id this field inherits. ALWAYS populated -- that is the contract.
+
+    Absent attribute means the domain lane's `MatchResult.governance_id` has not landed
+    yet, and the documented promotion (`the dictionary entry id IS the governance id`)
+    gives the same answer. Present-but-empty is different: it means the field exists and
+    was not filled, so a caller would be told a field's governance is the empty string.
+    That is the NM-0005 failure wearing a value instead of a missing key, and it is
+    refused.
+    """
+    value = getattr(match, "governance_id", _ABSENT)
+    if value is _ABSENT:
+        return str(match.dictionary_entry.id)
+    if not value:
+        raise drift(
+            "MatchResult",
+            "governance_id",
+            "a matched field would be told its governance id is empty, which is a field "
+            "silently inheriting nothing.",
+        )
+    return str(value)
+
+
+def _governance_payload(match: MatchResult) -> dict[str, Any] | None:
+    """
+    The protection class, or None when the entry carries no code.
+
+    None is rendered as an explicit `null`, never omitted. "This entry has no protection
+    class" and "this response forgot to tell you" must not look the same to a client whose
+    next step is applying a classification.
+
+    Read by the attribute names in the shared contract rather than by importing the
+    dataclass, so this file works both before and after the domain lane lands
+    `domain/governance.py` -- and so a caller's own ProtectionClass-shaped object works
+    too. Every attribute is required: a partially-populated class is refused rather than
+    defaulted, because a defaulted `personalInformation: false` is a wrong answer to the
+    one question the caller asked.
+    """
+    protection_class = getattr(match, "governance", _ABSENT)
+    if protection_class is _ABSENT or protection_class is None:
+        return None
+
+    payload: dict[str, Any] = {}
+    for key, attribute, cast in (
+        ("code", "code", str),
+        ("name", "name", str),
+        ("classification", "classification", str),
+        ("personalInformation", "personal_information", bool),
+        ("directIdentifier", "direct_identifier", bool),
+    ):
+        value = getattr(protection_class, attribute, _ABSENT)
+        if value is _ABSENT:
+            raise drift(
+                type(protection_class).__name__,
+                attribute,
+                f"the {key!r} member of the governance payload cannot be emitted and the "
+                f"caller would apply an incomplete classification.",
+            )
+        payload[key] = cast(value)
+    return payload
+
+
+def _scoring_weights(matcher: object) -> dict[str, float]:
+    """
+    The weights that actually produced this run's confidences, read off the live matcher.
+
+    Falls back to the shipped defaults when the matcher does not expose its config, rather
+    than refusing: weights that reproduce every emitted confidence ARE the weights that
+    produced it, whichever object they came from, and `_verify_reproducible` is what
+    decides. That keeps the guarantee resting on arithmetic anyone can check instead of on
+    a private attribute name holding still.
+    """
+    config = getattr(matcher, _MATCHER_CONFIG_ATTR, None)
+    if config is None:
+        # Deferred: this pulls the whole matching stack, and importing it at module scope
+        # would make `import nexus_matcher.presentation.api.matching` pay for it.
+        from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+
+        config = MatchingConfig()
+
+    weights: dict[str, float] = {}
+    for key, _score_attr, weight_attr in _SCORE_COMPONENTS:
+        value = getattr(config, weight_attr, None)
+        if value is None:
+            raise drift(
+                type(config).__name__,
+                weight_attr,
+                f"the {key!r} weight cannot be emitted and the confidence cannot be "
+                f"reproduced from the response.",
+            )
+        weights[key] = round(float(value), _PRECISION)
+    return weights
+
+
+def _results_per_field(matcher: object) -> int:
+    """The server's cap on `top_k`, read off the live matcher's config."""
+    config = getattr(matcher, _MATCHER_CONFIG_ATTR, None)
+    value = getattr(config, "results_per_field", None)
+    if isinstance(value, int) and value >= 1:
+        return value
+
+    from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+
+    return MatchingConfig().results_per_field
+
+
+def _explain_payload(match: MatchResult, weights: dict[str, float]) -> dict[str, Any]:
+    """
+    Everything needed to recompute the confidence from the response alone.
+
+    `absoluteCosine` is carried because it is the ONLY number here comparable across
+    fields: `fusedRetrieval` is min-max normalised per field, so its 0.9 says "won this
+    field's shortlist", not "is 90% similar". It is null when the dense arm did not return
+    this candidate at all.
+    """
+    breakdown = match.score_breakdown
+    scores: dict[str, float] = {}
+    for key, score_attr, _weight_attr in _SCORE_COMPONENTS:
+        value = getattr(breakdown, score_attr, None)
+        if value is None:
+            raise drift(
+                type(breakdown).__name__,
+                score_attr,
+                f"the {key!r} component cannot be emitted and the confidence cannot be "
+                f"reproduced from the response.",
+            )
+        scores[key] = round(float(value), _PRECISION)
+
+    absolute_cosine = getattr(breakdown, "absolute_cosine", None)
+    return {
+        "scores": scores,
+        "weights": dict(weights),
+        "absoluteCosine": (
+            None if absolute_cosine is None else round(float(absolute_cosine), _PRECISION)
+        ),
+    }
+
+
+def _verify_reproducible(confidence: float, explain: dict[str, Any]) -> None:
+    """
+    Do the auditor's arithmetic before handing them the answer.
+
+    The whole promise of `explain` is that `sum(scores[k] * weights[k])`, clamped, comes
+    back to `confidence`. Checked here on the EMITTED numbers, so a response that cannot
+    keep it is never sent. It closes a class of drift no name matching can: a component
+    paired with the wrong weight, a sixth weighted signal this file knows nothing about,
+    or a matcher whose weights could not be read and whose confidences the shipped
+    defaults do not explain. All three produce a response that is self-consistently wrong.
+
+    Only requests that ASKED for `explain` are checked. Without it the response makes no
+    arithmetic claim, so a scoring change in another lane degrades one optional field
+    rather than taking matching down.
+
+    Clamped exactly as `_weighted_confidence` clamps, so a weight set summing above 1.0 is
+    not reported as an arithmetic failure that never happened.
+    """
+    scores = explain["scores"]
+    weights = explain["weights"]
+    total = sum(scores[key] * weight for key, weight in weights.items())
+    recomputed = round(min(max(total, 0.0), 1.0), _PRECISION)
+    if abs(recomputed - confidence) > _REPRODUCTION_TOLERANCE:
+        raise drift(
+            "the matcher's scoring",
+            "a reproducible confidence",
+            f"the emitted components and weights give {recomputed!r} while the emitted "
+            f"confidence is {confidence!r}.",
+        )
+
+
+def _candidate_payload(
+    match: MatchResult,
+    weights: dict[str, float] | None,
+) -> dict[str, Any]:
+    """
+    One candidate, with its keys in the contract's order.
+
+    The dict literal IS the wire order -- `DeterministicJSONResponse` does not sort -- so
+    the order below is load-bearing and must match `MatchCandidateView`.
+    """
+    entry = match.dictionary_entry
+    confidence = round(float(match.final_confidence), _PRECISION)
+    decision = match.decision
+    payload: dict[str, Any] = {
+        "rank": int(match.rank),
+        "governanceId": _governance_id(match),
+        "businessName": entry.business_name,
+        "definition": entry.definition,
+        "domain": entry.domain,
+        "governance": _governance_payload(match),
+        "confidence": confidence,
+        "decision": getattr(decision, "value", str(decision)),
+    }
+    if weights is not None:
+        explain = _explain_payload(match, weights)
+        _verify_reproducible(confidence, explain)
+        payload["explain"] = explain
+    return payload
+
+
+def _project_results(
+    specs: list[FieldSpec],
+    fields: list[SchemaField],
+    matched: dict[str, tuple[MatchResult, ...]],
+    top_k: int,
+    weights: dict[str, float] | None,
+) -> dict[str, list[dict[str, Any]]]:
+    """
+    THE CONSERVATION LAW, checked three ways, before anything is sent.
+
+    Each check is the negation of a way a column has actually been lost here:
+
+      COUNT     as many result entries as fields, so nothing evaporated
+      IDENTITY  the results at position i were computed for fields[i]
+      ADDRESS   the matcher's key is the caller's own path, so nothing became unreachable
+
+    IDENTITY compares by `is` rather than `==`, and the honest note about that is that
+    NOTHING HERE PROVES THE DIFFERENCE MATTERS: mutating it to `==` leaves every test
+    green. SchemaField is a frozen dataclass, so two distinct fields with identical
+    contents compare equal -- but this endpoint refuses duplicate paths before it ever
+    gets here, and two fields with different paths differ in `full_path`, so the case
+    where the two operators disagree is unreachable from the wire. `is` stays because it
+    is strictly stronger and costs nothing, not because a test defends it. Written down
+    rather than left as a confident comment, because a claim no mutation can falsify is
+    exactly the kind this repository has shipped as coverage twice.
+
+    IDENTITY and ADDRESS are genuinely independent oracles rather than one restated: the
+    first reads `MatchResult.schema_field`, the second reads the dict key the matcher
+    chose. An error would have to be present in both to survive, which is the H-004 shape
+    these are written to avoid.
+
+    A field with no candidates gets `[]`. Dropping it would be the exact defect: the
+    caller's map would be short one key and nothing would say so.
+    """
+    if len(matched) != len(fields):
+        raise ConservationViolationError(
+            message=(
+                f"{len(fields)} fields were sent and {len(matched)} came back. A field "
+                f"missing from the response inherits no governance and nothing would have "
+                f"said so, so the response was refused instead of returned short."
+            ),
+            details={"fields_in": len(fields), "results_out": len(matched)},
+        )
+
+    projected: dict[str, list[dict[str, Any]]] = {}
+    for (key, matches), spec, field in zip(matched.items(), specs, fields, strict=True):
+        if key != spec.path:
+            raise ConservationViolationError(
+                message=(
+                    f"result {key!r} is not addressable under the path the caller sent "
+                    f"({spec.path!r}), so the caller could not look up their own field."
+                ),
+                details={"expected_path": spec.path, "actual_key": key},
+            )
+        for match in matches:
+            if match.schema_field is not field:
+                raise ConservationViolationError(
+                    message=(
+                        f"the results under {spec.path!r} were computed for a different "
+                        f"field ({match.schema_field.full_path!r}), so this field would "
+                        f"inherit another column's governance."
+                    ),
+                    details={"path": spec.path, "computed_for": match.schema_field.full_path},
+                )
+        projected[spec.path] = [_candidate_payload(m, weights) for m in matches[:top_k]]
+
+    return projected
+
+
+# =============================================================================
+# THE SERVICE
+# =============================================================================
+
+
+class MatchService:
+    """Everything both match routes share; the routes differ only in their field cap."""
+
+    def __init__(
+        self,
+        handle: MatcherHandle,
+        limits: MatchServiceLimits,
+        pool: BoundedWorkPool,
+    ) -> None:
+        self._handle = handle
+        self._limits = limits
+        self._pool = pool
+
+    async def match(self, request: MatchRequest, max_fields: int) -> dict[str, Any]:
+        """Validate, match under the deadline, and project -- in that order."""
+        specs = request.field_specs
+
+        if len(specs) > max_fields:
+            raise RequestTooLargeError(
+                message=(
+                    f"{len(specs)} fields in one request exceeds this server's limit of "
+                    f"{max_fields}. Send them in chunks of at most {max_fields}."
+                ),
+                details={"fields": len(specs), "limit": max_fields},
+            )
+
+        # The response is a map keyed by the caller's own path, and a map cannot hold two
+        # entries for one key. Silently collapsing them is NM-0005 exactly -- one column
+        # inherits nothing and the caller sees a shorter map. Refusing is the only answer
+        # that keeps the promise, and it names the offending paths.
+        repeated = sorted(p for p, n in Counter(s.path for s in specs).items() if n > 1)
+        if repeated:
+            raise MalformedRequestError(
+                message=(
+                    f"Every field needs a distinct `path`, because the response is keyed "
+                    f"by it: {repeated!r} appear more than once. Two fields under one key "
+                    f"would leave one of them with no governance and no error."
+                ),
+                details={"duplicate_paths": repeated},
+            )
+
+        matcher = self._handle.require()
+
+        cap = _results_per_field(matcher)
+        if request.top_k > cap:
+            raise MalformedRequestError(
+                message=(
+                    f"top_k={request.top_k} exceeds this server's configured "
+                    f"results_per_field={cap}, so it could only ever return {cap} "
+                    f"candidates. Ask for at most {cap}, or raise results_per_field on "
+                    f"the server."
+                ),
+                details={"top_k": request.top_k, "results_per_field": cap},
+            )
+
+        fields = [_to_schema_field(spec) for spec in specs]
+        matched = await run_bounded(
+            self._pool,
+            lambda: _invoke_matcher(matcher, fields),
+            self._limits.deadline_seconds,
+        )
+
+        weights = _scoring_weights(matcher) if request.explain else None
+        return {"results": _project_results(specs, fields, matched, request.top_k, weights)}
+
+
+def _invoke_matcher(
+    matcher: object, fields: list[SchemaField]
+) -> dict[str, tuple[MatchResult, ...]]:
+    """
+    Call the matcher on the worker thread, converting any failure into a named 5xx.
+
+    Letting the raw exception escape also produces a 500, but an anonymous one, by a path
+    that depends on middleware ordering. The adopter's fallback keys on the status code
+    and their operator keys on the message; both deserve to be deterministic.
+    """
+    match_fields = getattr(matcher, _MATCH_FIELDS_ATTR, None)
+    if match_fields is None:
+        raise drift(
+            type(matcher).__name__,
+            _MATCH_FIELDS_ATTR,
+            "there is no way to match a list of fields and this endpoint cannot serve "
+            "anything at all.",
+        )
+
+    from nexus_matcher.shared.exceptions import NexusMatcherError
+
+    try:
+        return match_fields(fields)
+    except NexusMatcherError:
+        # Already carries its own code and status; re-wrapping would hide a 503 behind a
+        # 500 and send the caller's fallback down the wrong branch.
+        raise
+    except Exception as exc:
+        raise MatchFailedError(
+            message=(
+                f"Matching failed: {type(exc).__name__}: {exc}. No field was classified; "
+                f"treat this request as unanswered."
+            ),
+            details={"cause": type(exc).__name__},
+            cause=exc,
+        ) from exc
+
+
+# =============================================================================
+# ROUTER
+# =============================================================================
+
+_ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
+    413: {"description": "Too many fields for this server; chunk the request."},
+    422: {"description": "Malformed request. The body names the offending field."},
+    503: {"description": "No dictionary loaded, or the server shed this request."},
+    504: {"description": "The server-side deadline fired before matching finished."},
+}
+
+
+def create_matching_router(service: MatchService, limits: MatchServiceLimits) -> APIRouter:
+    """Mount both match routes onto one service."""
+    router = APIRouter(prefix="/api/v1", tags=["Matching"])
+
+    @router.post(
+        "/match",
+        status_code=status.HTTP_200_OK,
+        response_class=DeterministicJSONResponse,
+        # response_model is deliberately absent: the handler renders the body itself so
+        # that `explain` can be ABSENT rather than null while `governance` is null rather
+        # than absent. The schema is published through `responses` instead, and
+        # test_match_endpoint validates real bodies against it so the two cannot drift.
+        response_model=None,
+        responses={200: {"model": MatchResponseView}, **_ERROR_RESPONSES},
+        summary="Match schema fields to dictionary entries",
+        description=(
+            "One entry per input field, keyed by the caller's own `path`, in the order "
+            "sent. Every input field appears exactly once, with an empty list when "
+            "nothing matched it."
+        ),
+    )
+    async def match(request: MatchRequest) -> dict[str, Any]:
+        return await service.match(request, limits.max_fields)
+
+    @router.post(
+        "/match/batch",
+        status_code=status.HTTP_200_OK,
+        response_class=DeterministicJSONResponse,
+        response_model=None,
+        responses={200: {"model": MatchResponseView}, **_ERROR_RESPONSES},
+        summary="Match a chunk of schema fields",
+        description=(
+            "Identical to /match, with a higher field cap for chunked clients. The two "
+            "share one implementation so their semantics cannot drift apart."
+        ),
+    )
+    async def match_batch(request: MatchRequest) -> dict[str, Any]:
+        return await service.match(request, limits.max_batch_fields)
+
+    return router

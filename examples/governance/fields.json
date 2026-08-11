@@ -1,0 +1,223 @@
+{
+  "notice": "FICTIONAL EXAMPLE DATA. Gravel Bay Ferry Authority is invented. These are the schema fields the pack matches against glossary.csv.",
+  "schema": "gbf_booking_extract_v3 (fictional)",
+  "no_row_expects_REJECT_and_here_is_why": "REJECT is unreachable for a rank-1 match in the shipped configuration. final_confidence has a structural floor of semantic_weight * fusion_alpha = 0.70 * 0.90 = 0.63, and review_threshold is 0.50. No top match can fall below the floor, so no top match can be rejected. The two novel fields below therefore expect REVIEW. Measured on this pack: rank-1 confidence ranged 0.8058 to 0.8958 over all 26 fields. See README.md, 'The finding this pack exists to show'.",
+  "expectation_keys": {
+    "expected_id": "the glossary id the top-ranked match must carry, or null when NO glossary term is a correct answer for this field. When it is null the pack asserts only that the field was not auto-approved -- which entry the matcher happened to rank first is recorded, not required.",
+    "expected_decision": "the MatchDecision the top-ranked match must carry under the shipped configuration: AUTO_APPROVE, REVIEW or REJECT",
+    "why": "why this field is in the pack; the interesting rows say what would go wrong if the expectation moved",
+    "observed": "for the rows that do not have a right answer: what the shipped configuration actually ranked first, recorded so the trap is visible"
+  },
+  "fields": [
+    {
+      "flattenedName": "booking_passenger__legal_name",
+      "doc": "Full legal name of the passenger as printed on the sailing manifest.",
+      "dataType": "string",
+      "expected_id": "GBF-0001",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "the clean case: a direct identifier that should inherit SEALED_RESTRICTED"
+    },
+    {
+      "flattenedName": "booking_passenger__date_of_birth",
+      "doc": "Date of birth the passenger supplied when booking.",
+      "dataType": "date",
+      "expected_id": "GBF-0002",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "booking_passenger__email_address",
+      "doc": "Email address used to send sailing notices to the passenger.",
+      "dataType": "string",
+      "expected_id": "GBF-0003",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "booking_passenger__mobile_number",
+      "doc": "Mobile telephone number for disruption alerts.",
+      "dataType": "string",
+      "expected_id": "GBF-0004",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "booking_passenger__postal_address",
+      "doc": "Residential postal address held against the passenger account.",
+      "dataType": "string",
+      "expected_id": "GBF-0005",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "booking_payment_card_token",
+      "doc": "Vault token standing in for the payment card used to buy the fare.",
+      "dataType": "string",
+      "expected_id": "GBF-0006",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "booking_payment_card_last_four",
+      "doc": "Last four digits of the payment card, kept so a receipt can be found.",
+      "dataType": "string",
+      "expected_id": "GBF-0007",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "booking_refund_bank_account",
+      "doc": "Bank account number a cancelled fare is refunded into.",
+      "dataType": "string",
+      "expected_id": "GBF-0008",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "sailing_crew__member_id",
+      "doc": "Permanent staff identifier for a member of the vessel crew.",
+      "dataType": "string",
+      "expected_id": "GBF-0009",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "sailing_crew__certificate_number",
+      "doc": "Maritime competency certificate number held by the crew member.",
+      "dataType": "string",
+      "expected_id": "GBF-0010",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "sailing_crew__shift_assignment",
+      "doc": "Sailing and watch the crew member is rostered to work.",
+      "dataType": "string",
+      "expected_id": "GBF-0011",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "boarding_pass_serial",
+      "doc": "Serial printed on the boarding pass, unique to one passenger sailing.",
+      "dataType": "string",
+      "expected_id": "GBF-0012",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "booking_reference",
+      "doc": "Six character reference identifying the booking across the estate.",
+      "dataType": "string",
+      "expected_id": "GBF-0013",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "gate_scan_timestamp",
+      "doc": "Moment the boarding pass was scanned at the terminal gate.",
+      "dataType": "timestamp",
+      "expected_id": "GBF-0014",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "claim_salvage_reference",
+      "doc": "Reference of the insurance claim raised after an incident at sea.",
+      "dataType": "string",
+      "expected_id": "GBF-0015",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "claim_salvage_assessed_amount",
+      "doc": "Amount the assessor put on the salvage claim.",
+      "dataType": "decimal",
+      "expected_id": "GBF-0016",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "harbour_berth_fee_rate",
+      "doc": "Negotiated rate paid for a berth at a partner harbour.",
+      "dataType": "decimal",
+      "expected_id": "GBF-0017",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case: commercially sensitive but carries no personal information"
+    },
+    {
+      "flattenedName": "harbour_agreement_expiry_date",
+      "doc": "Date the commercial harbour agreement lapses unless renewed.",
+      "dataType": "date",
+      "expected_id": "GBF-0018",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "vessel_engine_temperature_c",
+      "doc": "Engine temperature reported on the vessel telemetry feed in celsius.",
+      "dataType": "float",
+      "expected_id": "GBF-0020",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case: operational data, the CREW_ONLY tier"
+    },
+    {
+      "flattenedName": "vessel_fuel_level_pct",
+      "doc": "Percentage of usable fuel remaining in the vessel tanks.",
+      "dataType": "float",
+      "expected_id": "GBF-0021",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "sailing_scheduled_departure_time",
+      "doc": "Departure time published in the sailing timetable.",
+      "dataType": "timestamp",
+      "expected_id": "GBF-0024",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case: the most open tier"
+    },
+    {
+      "flattenedName": "terminal_name",
+      "doc": "Public name of the ferry terminal.",
+      "dataType": "string",
+      "expected_id": "GBF-0027",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "clean case"
+    },
+    {
+      "flattenedName": "sailing_route_code",
+      "doc": "Short code identifying the scheduled route between two terminals.",
+      "dataType": "string",
+      "expected_id": "GBF-0028",
+      "expected_decision": "AUTO_APPROVE",
+      "why": "the UNCLASSIFIED case: the glossary entry carries no protection class, so the field inherits the open tier and no PI flags"
+    },
+    {
+      "flattenedName": "booking_passenger__legal_name_digest",
+      "doc": "Salted digest of the passenger legal name, used to join bookings without holding the name itself.",
+      "dataType": "string",
+      "expected_id": "GBF-0001",
+      "expected_decision": "REVIEW",
+      "why": "NEAR MISS. The top candidate is the full identifier, at 0.8292. Inheriting it would tag a pseudonymous digest as a direct identifier at SEALED_RESTRICTED, which is the costly direction: over-inheriting governance stops a lawful use of the data and is invisible until someone audits it. The field is not auto-approved, so a human decides."
+    },
+    {
+      "flattenedName": "lifejacket_locker_inspection_due_date",
+      "doc": "Date the next inspection of a lifejacket locker falls due.",
+      "dataType": "date",
+      "expected_id": null,
+      "expected_decision": "REVIEW",
+      "why": "NOVEL. Nothing in this glossary governs locker inspections, so the field must inherit nothing. Read the decision, never the score: this field's top match scores 0.8792, HIGHER than the near-miss above and higher than eight fields that are correct. What kept it out of AUTO_APPROVE was min_confidence_gap, not confidence -- its margin over the runner-up was 0.0384 against a required 0.10.",
+      "observed": "ranks GBF-0002 (Passenger Date Of Birth) first -- a date field pulling a SEALED_RESTRICTED direct identifier. Auto-approving it would have tagged a maintenance date as passenger identity."
+    },
+    {
+      "flattenedName": "galley_stock_reorder_quantity",
+      "doc": "Number of units of a galley stock line to reorder at the next resupply.",
+      "dataType": "integer",
+      "expected_id": null,
+      "expected_decision": "REVIEW",
+      "why": "NOVEL. Nothing in this glossary governs galley stock. Same shape as the row above: confidence 0.8058, margin 0.0362.",
+      "observed": "ranks GBF-0030 (Vessel Passenger Capacity) first -- the nearest 'a count of things' term in the glossary."
+    }
+  ]
+}
