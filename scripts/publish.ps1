@@ -5,8 +5,15 @@
 #   .\scripts\publish.ps1 test     # Publish to TestPyPI  
 #   .\scripts\publish.ps1 build    # Build only (no upload)
 
+# The bash twin, scripts/publish.sh, records the four defects both scripts shared and why
+# each presented as "nothing happened". The same fixes are applied here: resolve an
+# interpreter that can actually import nexus_matcher, check tools rather than installing
+# them, test before deleting anything, and NEVER treat an unanswerable prompt as a decline
+# that exits 0.
+
 param(
-    [string]$Target = "pypi"
+    [string]$Target = "pypi",
+    [switch]$Yes
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,28 +26,54 @@ function Write-Err { Write-Host "[ERROR] $args" -ForegroundColor Red }
 $scriptPath = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location (Join-Path $scriptPath "..")
 
-# Check dependencies
-Write-Info "Checking dependencies..."
-python -m pip install --quiet --upgrade pip build twine
+# The interpreter. Whichever `python` is on PATH is not necessarily one that has this
+# project installed, and every step below needs it importable.
+$python = $null
+$candidates = @(".venv\Scripts\python.exe", ".venvin\python")
+if (Get-Command python -ErrorAction SilentlyContinue) { $candidates += (Get-Command python).Source }
+foreach ($candidate in $candidates) {
+    if (-not (Test-Path $candidate)) { continue }
+    & $candidate -c "import nexus_matcher" 2>$null
+    if ($LASTEXITCODE -eq 0) { $python = $candidate; break }
+}
+if (-not $python) {
+    Write-Err "No interpreter found that can import nexus_matcher."
+    Write-Err "The tests, the version string and the preflight all need it importable."
+    Write-Err "    python -m venv .venv; .venv\Scripts\python.exe -m pip install -e '.[dev]'"
+    exit 1
+}
+Write-Info "Using interpreter: $python"
 
-# Clean previous builds
+# Tools are CHECKED, not installed. Upgrading pip in a system interpreter needs write
+# access a normal user does not have, and it aborted this script on its first line.
+$missing = @()
+foreach ($tool in @("build", "twine", "pytest")) {
+    & $python -c "import importlib.util,sys; sys.exit(0 if importlib.util.find_spec('$tool') else 1)"
+    if ($LASTEXITCODE -ne 0) { $missing += $tool }
+}
+if ($missing.Count -gt 0) {
+    Write-Err "Missing from ${python}: $($missing -join ', ')"
+    Write-Err "    $python -m pip install $($missing -join ' ')"
+    exit 1
+}
+
+# Tests run BEFORE anything is deleted, so a failure leaves the verified artifact intact.
+Write-Info "Running unit tests..."
+& $python -m pytest tests/unit -q --tb=short
+if ($LASTEXITCODE -ne 0) {
+    Write-Err "Tests failed. Nothing was built and dist/ is untouched."
+    exit 1
+}
+
 Write-Info "Cleaning previous builds..."
 if (Test-Path dist) { Remove-Item -Recurse -Force dist }
 if (Test-Path build) { Remove-Item -Recurse -Force build }
 Get-ChildItem -Filter "*.egg-info" | Remove-Item -Recurse -Force
 Get-ChildItem -Path src -Filter "*.egg-info" -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
 
-# Run tests
-Write-Info "Running tests..."
-pytest tests/unit -q --tb=short
-if ($LASTEXITCODE -ne 0) {
-    Write-Err "Tests failed! Aborting publish."
-    exit 1
-}
-
 # Build
 Write-Info "Building package..."
-python -m build
+& $python -m build
 
 # Show built packages
 Write-Info "Built packages:"
@@ -48,10 +81,10 @@ Get-ChildItem dist
 
 # Check package
 Write-Info "Checking package metadata..."
-twine check dist/*
+& $python -m twine check dist/*
 
 # Get version
-$version = python -c "import nexus_matcher; print(nexus_matcher.__version__)"
+$version = & $python -c "import nexus_matcher; print(nexus_matcher.__version__)"
 Write-Info "Package version: $version"
 
 if ($Target -eq "build") {
@@ -84,7 +117,7 @@ if ($wheels.Count -ne 1) {
     Write-Err "Expected exactly one wheel in dist/, found $($wheels.Count). Aborting publish."
     exit 1
 }
-python scripts/release_preflight.py --wheel $wheels[0].FullName
+& $python scripts/release_preflight.py --wheel $wheels[0].FullName
 if ($LASTEXITCODE -ne 0) {
     Write-Err "Release preflight failed! Aborting publish."
     Write-Err "It exits non-zero on any failed check; do not upload past it."
@@ -95,14 +128,26 @@ Write-Host ""
 
 if ($Target -eq "test") {
     Write-Warn "Publishing to TestPyPI"
-    $confirm = Read-Host "Continue? [y/N]"
+    if ($Yes) {
+        Write-Warn "Confirmation waived by -Yes"
+        $confirm = "y"
+    } elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        $confirm = Read-Host "Continue? [y/N]"
+    } else {
+        # Exit NON-ZERO. A publish that silently does nothing and reports success is
+        # indistinguishable from one that worked.
+        Write-Err "No terminal attached, so the confirmation prompt cannot be answered."
+        Write-Err "Nothing was uploaded. The artifacts in dist/ are built and preflighted."
+        Write-Err "    .\scripts\publish.ps1 -Yes"
+        exit 1
+    }
     if ($confirm -ne "y" -and $confirm -ne "Y") {
-        Write-Info "Aborted."
-        exit 0
+        Write-Info "Aborted at the confirmation prompt. Nothing was uploaded."
+        exit 1
     }
     
     Write-Info "Uploading to TestPyPI..."
-    twine upload --repository testpypi dist/*
+    & $python -m twine upload --repository testpypi dist/*
     
     Write-Host ""
     Write-Info "Published to TestPyPI!"
@@ -110,14 +155,26 @@ if ($Target -eq "test") {
 }
 else {
     Write-Warn "Publishing to PyPI (PRODUCTION)"
-    $confirm = Read-Host "Are you sure? [y/N]"
+    if ($Yes) {
+        Write-Warn "Confirmation waived by -Yes"
+        $confirm = "y"
+    } elseif ([Environment]::UserInteractive -and -not [Console]::IsInputRedirected) {
+        $confirm = Read-Host "Are you sure? [y/N]"
+    } else {
+        # Exit NON-ZERO. A publish that silently does nothing and reports success is
+        # indistinguishable from one that worked.
+        Write-Err "No terminal attached, so the confirmation prompt cannot be answered."
+        Write-Err "Nothing was uploaded. The artifacts in dist/ are built and preflighted."
+        Write-Err "    .\scripts\publish.ps1 -Yes"
+        exit 1
+    }
     if ($confirm -ne "y" -and $confirm -ne "Y") {
-        Write-Info "Aborted."
-        exit 0
+        Write-Info "Aborted at the confirmation prompt. Nothing was uploaded."
+        exit 1
     }
     
     Write-Info "Uploading to PyPI..."
-    twine upload dist/*
+    & $python -m twine upload dist/*
     
     Write-Host ""
     Write-Info "Published to PyPI!"
