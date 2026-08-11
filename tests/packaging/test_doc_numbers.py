@@ -293,7 +293,7 @@ def test_a_finding_quoting_a_non_ascii_document_still_renders():
     """
     The control that makes the subprocess test below mean something.
 
-    Today's 141 findings happen to quote only ASCII, so a checker with its transliteration
+    Today's findings happen to quote only ASCII, so a checker with its transliteration
     ripped out passes the cp437 run anyway -- green over text that never exercised the
     path. These documents are full of U+2264, U+2192, U+2014 and U+00D7 (`| <= 0.75 |`,
     `0.491 -> 0.691`, `93.6x`), and one row label carrying one of them is all it takes.
@@ -329,8 +329,8 @@ def test_the_report_survives_a_legacy_windows_console(codepage, mode):
     exiting non-zero looks exactly like a real failure, sending the reader somewhere else
     entirely.
 
-    `--report` is included because it is the widest text surface: it prints all 141 quoted
-    claims, where the plain run prints none of them. A pass on the summary alone would
+    `--report` is included because it is the widest text surface: it prints every quoted
+    claim, where the plain run prints none of them. A pass on the summary alone would
     prove nothing about the path that actually carries document content. Run under the
     real code page in a real subprocess -- asserting on the transliteration table would
     only test the table.
@@ -383,4 +383,31 @@ def test_the_report_is_deterministic_across_interpreters():
         assert output == reference, (
             f"report order differs between seeds {reference_seed} and {seed}"
         )
-    assert reference.count("\n") >= 100, "the report is too short for ordering to prove anything"
+    # This exists so a degenerate two-line report cannot pass by having no order to get
+    # wrong. It was a literal 100, then had to be lowered to 50 when the ledger legitimately
+    # shrank from 141 findings to 72 -- `docs/BENCHMARK_REGISTRY.md` was re-derived against
+    # its artifacts on 2026-08-11 and its 69 entries went away.
+    #
+    # A constant that has been lowered once will be lowered again, and the second time
+    # nobody will check whether the report shrank because a document was FIXED or because
+    # the checker stopped looking. So it is derived instead: the report must carry the
+    # findings the checker actually reported. Fix a document and both sides fall together;
+    # break the checker so it finds nothing and this goes red, which a floor of 50 would
+    # not have done until the report was almost empty.
+    _f, _u, report_counts = checker.run()
+    rendered = report_counts["MISMATCH"] + report_counts["BROKEN_REF"]
+    assert reference.count("\n") >= rendered, (
+        f"the report has {reference.count(chr(10))} lines but the checker found "
+        f"{rendered} renderable findings -- lines are being lost between finding and "
+        "rendering, so the order being asserted is not the order of the findings"
+    )
+    assert rendered >= 8, (
+        f"the checker rendered only {rendered} findings, so an ordering test over them "
+        "proves almost nothing. Either the documents are now genuinely clean -- in which "
+        "case delete this test and say so -- or the checker has stopped finding things."
+    )
+    # UNVERIFIABLE is deliberately NOT counted here: the report does not render it. That is
+    # itself a gap -- 18 claims are counted and then never listed, so a claim whose artifact
+    # disappears silently leaves the accounting rather than surfacing -- but it is the
+    # checker's gap, not this test's, and asserting on it here would just go red for the
+    # wrong reason. Recorded rather than papered over.

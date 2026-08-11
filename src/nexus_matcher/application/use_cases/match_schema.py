@@ -54,7 +54,10 @@ from nexus_matcher.domain.ports.retrieval import RerankCandidate, SparseDocument
 from nexus_matcher.domain.ports.vector_store import SearchResult, VectorDocument, VectorStoreConfig
 from nexus_matcher.domain.services.abbreviation import AbbreviationExpander
 from nexus_matcher.domain.services.alias_generation import expand_dictionary
-from nexus_matcher.domain.services.context_enricher import ContextEnricher
+from nexus_matcher.domain.services.context_enricher import (
+    HIERARCHY_SEPARATOR,
+    ContextEnricher,
+)
 from nexus_matcher.domain.services.domain_hierarchy import DomainMatcher
 from nexus_matcher.shared.types.base import (
     EntityId,
@@ -139,14 +142,62 @@ class MatchingConfig:
     results_per_field: int = 5
 
     # Whether to run abbreviation expansion over the QUERY text.
-    # Off by default: it measurably LOSES accuracy on the combined benchmark
-    # (P@1 0.691 with context enrichment alone vs 0.671 with expansion added,
-    # benchmarks/exp_query_repr.py). Once the parent-table context is present the
-    # embedding model can already resolve most abbreviations from context, while the
-    # expander's fixed dictionary fires on ambiguous short tokens and injects wrong
-    # words -- "st" -> "state" inside a street field, and so on. A wrong expansion is
-    # worse than no expansion. The expander is still used to enrich the DICTIONARY side
-    # where entries are longer and more predictable.
+    #
+    # Off by default, but the justification is WEAKER than it used to read here. The old
+    # comment cited "0.691 -> 0.671" from an unpaired comparison against a 793-pair
+    # dataset that is no longer the committed one. Re-measured paired on the full
+    # committed combined corpus (688/688, exact McNemar):
+    #     OFF 0.5814   ON 0.5654   delta -1.60 pts   b=24 c=13  p=0.099
+    # Negative point estimate, NOT a significant regression. Read this as "inconclusive,
+    # point estimate negative" -- not as "expansion is proven harmful". The default is
+    # still right: an unproven change to the largest accuracy factor in the pipeline is
+    # not one to enable for everybody by default.
+    #
+    # A SECOND paired full-corpus measurement of a NARROWER quantity exists and reads
+    # -1.16 pts, p = 0.2559 (15 gained, 23 lost, 38 discordant). It is dense retrieval
+    # only, on `parent + field` text, with no fusion, no lexical or type signals and no
+    # decision layer -- benchmarks/exp_governed_abbrev.py, condition
+    # `guessing_on_original`. Both are honest; they measure different things, and the
+    # -1.60 above is the one that describes this flag end to end. Recorded so the two do
+    # not drift into being quoted as disagreeing measurements of the same quantity.
+    #
+    # The mechanism behind the negative point estimate is the DICTIONARY, not the idea.
+    # `AbbreviationExpander.default()` carries a generic hardcoded list that fires on
+    # ambiguous short tokens and asserts the wrong long form -- expanding "ST" to "state"
+    # inside a street field, "NO" to "number" inside a negation flag. A wrong expansion
+    # is worse than no expansion, because the query only gets one vector.
+    #
+    # Callers whose schemas follow a GOVERNED abbreviation standard are the case this
+    # flag exists for, and the whole path is already plumbed -- pass your own catalog:
+    #
+    #     catalog = {"txn": "transaction", "amt": "amount"}   # your approved list
+    #     NexusMatcher(
+    #         ...,
+    #         abbreviation_expander=AbbreviationExpander(
+    #             AbbreviationDictionary.from_dict(catalog)
+    #         ),
+    #         config=MatchingConfig(expand_query_abbreviations=True),
+    #     )
+    #
+    # The expander is exact-lookup with passthrough: a token absent from the catalog is
+    # left alone, so a catalog is only as dangerous as its WRONG rows. Before enabling
+    # this, measure your catalog's wrong-rate against your own fields -- the fraction of
+    # rows asserting the wrong long form IN YOUR SCHEMA'S CONTEXT -- and watch for
+    # colliding short forms ("ST" as both state and street). Then re-run
+    # benchmarks/exp_calibration.py: a large P@1 shift moves the score distribution and
+    # can LOWER auto-approve precision at a fixed threshold.
+    #
+    # The expander is also used to enrich the DICTIONARY side, where entries are longer
+    # and more predictable; that use is unaffected by this flag.
+    #
+    # docs/guides/governed_abbreviations.md is the full write-up: the wiring above in
+    # runnable form, the measured shape of the trade (recovery tracks catalog coverage
+    # roughly linearly; a 5%-wrong catalog still recovers ~91%; break-even near 75%
+    # wrong; a 100%-wrong catalog is ~7 points WORSE than doing nothing), and the reason
+    # those recovery figures are an UPPER BOUND -- they come from a synthetic experiment
+    # in which the abbreviation was generated from the gold text, so expanding it
+    # reconstructs a near-identical string (683/688 and 1556/1556 caselessly identical).
+    # `from_config()` cannot reach this flag's catalog; it takes no expander.
     expand_query_abbreviations: bool = False
 
     # Index-time enrichment: how many fabricated technical spellings to index per
@@ -1033,13 +1084,39 @@ class NexusMatcher:
         `sname` carries almost no signal, while `satscores sname` is unambiguous. On the
         combined BIRD+OMOP benchmark this parent-path context is worth +20 points of
         P@1 -- by far the largest single accuracy factor in the pipeline.
+
+        Abbreviation expansion stays OFF by default (see `expand_query_abbreviations`).
+        When a caller does turn it on, it runs PER PARENT-PATH LEVEL rather than over the
+        whole enriched string, because the enriched string is not one identifier -- it is
+        several, separated by `HIERARCHY_SEPARATOR`. Expanding it whole let the separator
+        ride along on the token in front of it: the expander looked up `"accn,"`, comma
+        and all, missed, and passed it through raw, while the very same `accn` expanded
+        to `account` everywhere else in the same query. The token that failed to expand
+        was always a parent-path level -- precisely the part of the query carrying the
+        most signal. Measured on the FHIR corpus with a governed catalog: 619 of 1556
+        queries came out different, 96.3% of every query that has any parent-path
+        structure. (The shipped generic dictionary happens to contain none of these
+        tokens, so the defect is invisible on the committed benchmarks -- 0 of 2244
+        queries differ with `AbbreviationExpander.default()`. It fires with the governed
+        catalog that makes the flag worth enabling in the first place.)
+
+        The result is lowercased explicitly rather than left to the encoder. The expander
+        restores the case style of each token it replaces, so a descriptive phrase can
+        put capitals back into the query; today's BGE tokenizer is uncased and cannot
+        see them, but that is a property of the current encoder, not of this contract,
+        and swapping the encoder should not silently change the query text.
         """
         enriched_query = self._context_enricher.enrich(field)
 
         if not self._config.expand_query_abbreviations:
             return enriched_query
 
-        return self._abbreviation_expander.expand(enriched_query).expanded
+        levels = enriched_query.split(HIERARCHY_SEPARATOR)
+        expanded = [
+            self._abbreviation_expander.expand(level).expanded if level else level
+            for level in levels
+        ]
+        return HIERARCHY_SEPARATOR.join(expanded).lower()
 
     def _match_field(
         self,

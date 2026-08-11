@@ -31,10 +31,11 @@ NexusMatcher(
     reranker=None,
     schema_parser_registry=None,           # dict[str, SchemaParser]
     dictionary_loader_registry=None,       # dict[str, DictionaryLoader]
-    abbreviation_expander=None,
+    abbreviation_expander=None,            # AbbreviationExpander
     context_enricher=None,
     domain_matcher=None,
     config=None,                           # MatchingConfig
+    governance=None,                       # GovernanceVocabulary | str | Path
 )
 ```
 
@@ -42,13 +43,21 @@ NexusMatcher(
 `NexusMatcher()` with no arguments raises `TypeError`.
 
 ```python
-NexusMatcher.from_config(config: MatchingConfig | str | Path | None = None) -> NexusMatcher
+NexusMatcher.from_config(
+    config: MatchingConfig | str | Path | None = None,
+    governance: GovernanceVocabulary | str | Path | None = None,
+) -> NexusMatcher
 ```
 
 Returns a matcher wired with the **bundled int8 ONNX encoder** (falling back to
 sentence-transformers when the `embeddings` extra is installed, then to static
 embeddings), `InMemoryVectorStore`, `BM25Retriever`, the Avro and flattened-Avro parsers,
 and the Excel + CSV dictionary loaders.
+
+> **`from_config` does not take `abbreviation_expander`.** It builds one from the bundled
+> generic dictionary and there is no setter afterwards, so supplying your own
+> approved-abbreviation catalog requires the full constructor above. See
+> [governed abbreviations](guides/governed_abbreviations.md).
 
 `config` accepts a `MatchingConfig`, a path to a JSON or TOML file holding its fields, or
 `None` for the calibrated defaults. A file may wrap the fields in a `[matching]` table.
@@ -86,7 +95,7 @@ Frozen dataclass, `nexus_matcher.application.use_cases.match_schema.MatchingConf
 |---|---|---|
 | `dense_top_k` | 100 | Dense candidates retrieved |
 | `sparse_top_k` | 100 | BM25 candidates retrieved |
-| `fusion_alpha` | 0.90 | Dense weight in linear min-max fusion. Measured optimum — see `benchmarks/results/exp_fusion_combined.json` |
+| `fusion_alpha` | 0.90 | Dense weight in linear min-max fusion. Measured optimum — but the artifact behind it (`exp_fusion_combined.json`) is the only A-grade result **not re-run since the benchmark leakage fix**, so it is a 793-pair pre-fix measurement. The ordering it establishes (linear beats RRF, decisively) is robust; the exact optimum between 0.8 and 0.9 is a 1.6-point margin on a corpus that no longer exists. See [BENCHMARK_REGISTRY.md](BENCHMARK_REGISTRY.md#exp-fusion--combining-dense-and-sparse). |
 | `colbert_top_k` | 50 | Candidates passed to a ColBERT reranker, if one is supplied |
 | `cross_encoder_top_k` | 20 | Candidates passed to a cross-encoder reranker, if one is supplied |
 | `semantic_weight` | 0.70 | Confidence weights; sum to 1.0 |
@@ -98,7 +107,7 @@ Frozen dataclass, `nexus_matcher.application.use_cases.match_schema.MatchingConf
 | `review_threshold` | 0.50 | Below this, `REJECT` |
 | `min_confidence_gap` | 0.10 | Minimum margin over the runner-up required to auto-approve |
 | `results_per_field` | 5 | Matches returned per field |
-| `expand_query_abbreviations` | `False` | Query-side abbreviation expansion. Off because it was measured at **-2.0 points** of P@1: one wrong expansion corrupts the single query vector. |
+| `expand_query_abbreviations` | `False` | Query-side abbreviation expansion. Off because the evidence does not support turning it on — **not** because it is proven harmful. The "-2.0 points" an earlier revision of this table printed does not survive a paired test; re-measured on the full 688-pair corpus it is **-1.60 points, exact McNemar p = 0.099**: inconclusive, point estimate negative. The mechanism is the bundled *dictionary*, not the idea — it asserts wrong long forms on short tokens (`st` → state, `no` → number). Supply your own approved catalog and this flag becomes the largest lever in the pipeline: see [governed abbreviations](guides/governed_abbreviations.md). |
 | `dictionary_alias_count` | 0 | Dictionary-side alias generation. Off because the gain inverts with corpus size — +1.9 at 688 entries, **-13.7 at 10k and -18.8 at 30k**. Never enable without re-measuring at your own corpus size. |
 
 #### `BatchProcessor`
