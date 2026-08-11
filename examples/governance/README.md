@@ -45,6 +45,30 @@ Windows code page.
 | `labels.jsonl` | 42 labelled query → id pairs for threshold calibration. Names and types only, no descriptions: the harder case, and the one most schemas actually present. |
 | `feedback.jsonl` | 6 reviewer accept/reject events, folded back into the queue by command 5. |
 | `_pack.py` | Shared plumbing for the five commands. Not part of the library. |
+| `serve.sh`, `serve.ps1` | Three exports and a start command: this pack served over HTTP. Not one of the five. |
+
+## The same pack over HTTP
+
+```
+bash examples/governance/serve.sh          # or: pwsh examples/governance/serve.ps1
+```
+
+That exports `NEXUS_API_DICTIONARY`, `NEXUS_API_GOVERNANCE` and `NEXUS_API_FEEDBACK_PATH`
+at this directory's own files and starts `nexus-matcher api` on 127.0.0.1:8000. Then:
+
+```
+curl -s -X POST http://127.0.0.1:8000/api/v1/match \
+  -H 'Content-Type: application/json' \
+  -d '{"fields":[{"name":"legal_name","path":"booking.passenger.legal_name","doc":"Full legal name of the passenger as printed on the sailing manifest.","type":"string"}],"top_k":1}'
+```
+
+comes back with `GBF-0001` and the `MANIFEST_NAME` / `SEALED_RESTRICTED` class it confers.
+
+**The wire field names are `name`, `path`, `doc` and `type`, not the `flattenedName` and
+`dataType` in `fields.json`.** That file is this pack's own input format; the request model
+sets `extra="forbid"`, so copying a row out of it into a curl body is a 422 naming all three
+keys. The full contract is in
+[`docs/GOVERNANCE.md`](../../docs/GOVERNANCE.md#matching-over-http).
 
 ## The finding this pack exists to show
 

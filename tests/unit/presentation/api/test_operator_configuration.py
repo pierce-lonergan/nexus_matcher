@@ -32,6 +32,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from nexus_matcher.application import ingest
 from nexus_matcher.presentation.api.app import create_app
 
 # FICTIONAL EXAMPLE DATA. The Tallow Creek Grain Cooperative does not exist and neither
@@ -176,6 +177,66 @@ def test_a_glossary_with_no_protection_column_needs_no_vocabulary(tmp_path):
     candidate = response.json()["results"]["load.intake_weight"][0]
     assert candidate["governanceId"] == "TCG-0002"
     assert candidate["governance"] is None
+
+
+def test_the_glossary_is_read_exactly_once_at_startup(tmp_path, monkeypatch):
+    """
+    The cost the check's move down into `load_entries` existed to remove.
+
+    This module used to answer "does this glossary carry codes nobody can read?" by reading
+    the whole file a second time, just for its header, and `load_entries` then read it
+    again. Both reads happened on every startup with no `NEXUS_API_GOVERNANCE`, including
+    the overwhelmingly common one where there is no such column: finding nothing costs the
+    same full read as finding something. On a 30,000-row, 4.23 MB glossary that was 195 ms
+    of startup instead of 145 ms, and 19.9 MB of allocation for a `None`.
+
+    Counted rather than timed. `test_degradation.py` forbids latency assertions by name,
+    and the number of reads is the same claim made deterministically -- a second read
+    creeping back in fails this on a two-row file.
+    """
+    plain = tmp_path / "plain.csv"
+    plain.write_text(
+        "id,business_name,definition\nTCG-0002,Silo Intake Weight,Mass of grain on intake.\n",
+        encoding="utf-8",
+    )
+
+    reads: list[str] = []
+    original = ingest.read_source
+
+    def counting_read_source(source, **kwargs):
+        reads.append(str(source))
+        return original(source, **kwargs)
+
+    monkeypatch.setattr(ingest, "read_source", counting_read_source)
+
+    with TestClient(
+        create_app(configure_logs=False, environ={"NEXUS_API_DICTIONARY": str(plain)})
+    ) as client:
+        assert client.get("/health/ready").status_code == 200
+
+    assert reads == [str(plain)], f"the glossary was read {len(reads)} times: {reads}"
+
+
+def test_a_refusal_that_is_not_about_governance_keeps_its_own_advice(tmp_path):
+    """
+    The seam, from the side that would go wrong quietly.
+
+    The operator-grade sentence is appended by matching a phrase in what `load_entries`
+    raised, and `load_entries` raises ValueError for unrelated things too. Naming
+    NEXUS_API_GOVERNANCE on a glossary whose real problem is a missing business-name column
+    would send an operator to configure a vocabulary that was never the issue -- a worse
+    outcome than the bare library message, because it is confidently wrong.
+    """
+    nameless = tmp_path / "nameless.csv"
+    nameless.write_text("id,notes\nTCG-0003,nothing matchable here\n", encoding="utf-8")
+
+    with TestClient(
+        create_app(configure_logs=False, environ={"NEXUS_API_DICTIONARY": str(nameless)})
+    ) as client:
+        response = client.post("/api/v1/match", json={"fields": [{"name": "anything"}]})
+
+    assert response.status_code == 503, response.text
+    assert "NEXUS_API_GOVERNANCE" not in response.json()["error"]["message"]
 
 
 def test_the_feedback_path_from_the_environment_is_written_to(configured):

@@ -219,9 +219,9 @@ def request_fields() -> list[dict[str, Any]]:
     One field per glossary entry, plus one that matches nothing. The per-entry coverage is
     deliberate: it makes every declared code reachable as a RANK-1 candidate, so a test
     can assert the whole vocabulary passes through rather than only the two or three codes
-    that happen to surface. Ranks below the first are usually REJECT on this fixture, and
-    `MatchResult` clears the class on a REJECT -- so a test that read whichever candidates
-    came back would be asserting almost entirely about nulls.
+    that happen to surface. Ranks below the first are mostly REJECT on this fixture; those
+    candidates now carry their class too, so they are worth reading, but only the rank-1
+    sweep guarantees every declared code appears at all.
 
     The paths are NOT in sorted order, and not in reverse order either, so a response that
     sorted its keys is distinguishable from one that kept the caller's order.
@@ -360,9 +360,11 @@ def governed_match(
     these tests loudly instead of being mirrored by a look-alike. Only the numbers are
     fabricated, so that `explain` can be asserted against a hand-computed constant.
 
-    `decision` defaults to REVIEW rather than REJECT on purpose -- `MatchResult` clears
-    `governance` for a REJECT, so a REJECT fixture would silently test the null path while
-    claiming to test the populated one.
+    `decision` defaults to REVIEW because every caller of this helper reads rank 1, and
+    `MatchResult` still clears `governance` on a REJECTED RANK 1 -- so a REJECT default
+    would silently test the null path while claiming to test the populated one. That is
+    now the only rank it applies to: `rank=2, decision=REJECT` keeps its class, which is
+    what the rejected-runner-up test in `test_match_endpoint` reads.
     """
     sem, lex, edit, type_, domain = STAND_IN_SIGNALS
     return MatchResult(

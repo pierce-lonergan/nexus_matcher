@@ -1,0 +1,15 @@
+id: NM-0031
+symptom: "two catalog entries claiming one alias resolved positionally to the last declared, so a passenger-name row carrying a legacy code loaded at the open tier instead of the restricted one, with no problem reported and a strict load not refused"
+severity: HIGH
+fixed_in: 2.1.0
+gate_that_should_have_caught_it: "none -- duplicate CODES already raised, which made 'duplicates are refused' look covered; and no test declared one alias twice, because a dict literal in a test file cannot"
+gate_that_catches_it_now: "tests/museum/NM-0031/test_nm_0031.py, plus tests/unit/domain/test_governance.py"
+touches:
+  - src/nexus_matcher/domain/governance.py
+notes: >
+  NM-0005's harm -- a field losing the classification it should have inherited -- reached
+  through the CATALOG instead of through the row. The obvious fix does not work: a
+  duplicate check added to __init__ alone was implemented and measured, and it misses
+  byte-identical duplicate tokens, because from_json used to accumulate aliases into a dict
+  keyed by the raw string. Those collapse before __init__ can see them, and they are the
+  likeliest duplicate there is.

@@ -269,8 +269,9 @@ class MatchResult:
         decision: Classification decision
         performance: Performance metrics for this match
         governance: The protection class this match would confer, resolved through the
-            caller's vocabulary. None when the entry carries no code (the open tier) and
-            ALWAYS None for a REJECT -- see `__post_init__`.
+            caller's vocabulary. None when the entry carries no code (the open tier), and
+            also on a RANK-1 REJECT, which confers nothing -- see `__post_init__`. A
+            rejected runner-up keeps its class: no field inherits from rank 2.
         governance_id: The matched entry's id, which is the governance id. Always
             populated; derived from `dictionary_entry` when not supplied, and refused
             when supplied and different, because two answers to "which entry's class is
@@ -311,15 +312,33 @@ class MatchResult:
                 f"different answers to 'whose class is this?' is worse than none."
             )
 
-        # A REJECT INHERITS NOTHING, and that is enforced here rather than at the call
-        # site so it cannot be forgotten by the next one.
+        # A REJECTED RANK 1 INHERITS NOTHING, and that is enforced here rather than at the
+        # call site so it cannot be forgotten by the next one.
         #
-        # REJECT means "no entry in this glossary describes this field". A novel field --
-        # the case that most needs a human -- would otherwise arrive carrying the class of
-        # the least-bad candidate, which is a confident-looking classification derived
-        # from a match the matcher itself rejected. That is NM-0005's shape inverted:
-        # instead of losing a class it should have had, the field gains one it should not.
-        if self.decision == MatchDecision.REJECT and self.governance is not None:
+        # A rejected top match means "no entry in this glossary describes this field". A
+        # novel field -- the case that most needs a human -- would otherwise arrive
+        # carrying the class of the least-bad candidate, which is a confident-looking
+        # classification derived from a match the matcher itself rejected. That is
+        # NM-0005's shape inverted: instead of losing a class it should have had, the
+        # field gains one it should not.
+        #
+        # `rank == 1` is a CORRECTION, not the original rule. REJECT is a per-CANDIDATE
+        # verdict -- `_determine_decision` compares every rank against `review_threshold`
+        # -- but the justification above is a per-FIELD one, and a field inherits from
+        # rank 1 only. Unqualified, the strip also blanked the runner-ups: measured over
+        # the 26-field Gravel Bay pack at top_k=5, 66 of 104 runner-up candidates came
+        # back with no class although the indexed entry carried a real code, 16 of them
+        # direct identifiers. `decision` could not disambiguate the two nulls, because
+        # both read REJECT, so the wire said "no class" where it meant "withheld" -- and
+        # it deleted exactly the rank-1-versus-rank-2 comparison this class's own
+        # docstring says the field exists to provide.
+        #
+        # At the shipped thresholds the narrowed guard is LATENT: `review_threshold` is
+        # 0.50 and a rank-1 confidence cannot fall below `semantic_weight * fusion_alpha`
+        # = 0.63, so no top match can be rejected. It stays because that floor is a
+        # consequence of two tunable numbers, not a law; it fires for a caller who raises
+        # the threshold past it, which is what `TestRejectConfersNothing` constructs.
+        if self.rank == 1 and self.decision == MatchDecision.REJECT and self.governance is not None:
             object.__setattr__(self, "governance", None)
 
     @property

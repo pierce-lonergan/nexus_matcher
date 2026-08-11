@@ -204,3 +204,10 @@ nexus_matcher.zip
 # module and every install of it failed at `import nexus_matcher`.
 /models/
 /dist_test/
+
+# What examples/governance/run_pack.py and serve.sh WRITE, as opposed to what they read.
+# ANCHORED, for the reason the /models/ note above records. Committing it would put a
+# generated results.json under review as though it were an expectation, and
+# check_expectations.py already exits non-zero on the real one -- a stale copy in git
+# would be the second, unchecked answer.
+/examples/governance/out/

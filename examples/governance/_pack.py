@@ -128,9 +128,15 @@ def resolve_governance(match: Any, entries: dict[str, Any], vocabulary) -> tuple
     `source` and in results.json. An audit artifact that does not say where its
     governance came from is not an audit artifact.
 
-    REJECT is respected in both directions: `MatchResult.__post_init__` clears the class
-    on a rejected match, and so does the fallback, or the pack would attach a class to a
-    match the matcher refused.
+    A REJECTED RANK 1 is respected in both directions: `MatchResult.__post_init__` clears
+    the class on a rejected top match, and so does the fallback, or the pack would attach
+    a class to the very match the matcher refused.
+
+    `rank == 1` is load-bearing in that check. The domain model used to clear the class on
+    a reject at ANY rank and no longer does, because a field inherits from rank 1 only and
+    blanking the runner-ups deleted the comparison a reviewer decides on. A fallback still
+    clearing them would make results.json disagree with the service it exists to audit --
+    the one thing an audit artifact must never do.
     """
     entry_id = match.dictionary_entry.id
     promoted_id = getattr(match, "governance_id", None) or entry_id
@@ -138,7 +144,7 @@ def resolve_governance(match: Any, entries: dict[str, Any], vocabulary) -> tuple
     if carried is not None:
         return promoted_id, carried, "match_result"
 
-    if str(getattr(match.decision, "value", match.decision)) == "REJECT":
+    if match.rank == 1 and str(getattr(match.decision, "value", match.decision)) == "REJECT":
         return promoted_id, None, "match_result"
 
     code = getattr(entries.get(entry_id), "governance_code", None)

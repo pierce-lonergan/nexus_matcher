@@ -82,13 +82,26 @@ class TestNoMatcher:
         assert match.status_code == 503, match.text
         assert "does-not-exist.xlsx" in match.json()["error"]["message"]
 
-    def test_health_and_readiness_are_untouched_when_no_matcher_is_configured(self):
+    def test_a_health_only_deployment_now_has_to_declare_itself(self):
         """
-        The service was health-and-introspection only before this feature. Registering a
-        `matcher` component unconditionally would turn every existing /health/ready into
-        a 503 on upgrade -- a breaking change wearing a feature's clothes.
+        This assertion used to run the other way, and it was locking the defect in.
+
+        The reasoning was that registering `matcher` unconditionally would turn every
+        existing /health/ready into a 503 on upgrade. What it actually protected was the
+        deployment whose `NEXUS_API_DICTIONARY` never resolved: no component registered,
+        `all(())` is True, so readiness answered 200 while every match answered 503 --
+        the state a rollout is most likely to produce, and the one a rollout gate exists
+        to catch.
+
+        The health-only deployment is still supported; it just says so now. The knob is
+        inverted from the obvious `NEXUS_API_REQUIRE_MATCHER` on purpose: a knob whose
+        default is the unsafe value protects only the operators who remembered to set it.
         """
         with TestClient(app_for(None)) as client:
+            assert client.get("/health/ready").status_code == 503
+
+        declared = create_app(configure_logs=False, environ={"NEXUS_API_MATCHING_OPTIONAL": "true"})
+        with TestClient(declared) as client:
             ready = client.get("/health/ready")
 
         assert ready.status_code == 200, ready.text

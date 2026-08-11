@@ -9,6 +9,7 @@ Unit tests for API endpoints.
 import pytest
 from fastapi.testclient import TestClient
 
+from nexus_matcher import __version__
 from nexus_matcher.presentation.api.app import create_app
 
 
@@ -23,12 +24,19 @@ class TestHealthEndpoints:
     """Tests for health check endpoints."""
 
     def test_root_endpoint(self, client):
-        """Test root endpoint returns service info."""
+        """Test root endpoint returns service info.
+
+        Asserted against `__version__` rather than a literal. These two tests pinned
+        "2.0.0" and went on passing while the package moved to 2.1.0 -- they were not
+        checking that the service reports its version, they were checking that it reports
+        the same wrong one. A literal here is a second copy of the version, which is the
+        defect itself wearing a test's clothes.
+        """
         response = client.get("/")
         assert response.status_code == 200
         data = response.json()
         assert data["service"] == "nexus-matcher"
-        assert data["version"] == "2.0.0"
+        assert data["version"] == __version__
         assert "docs" in data
 
     def test_health_endpoint(self, client):
@@ -38,7 +46,7 @@ class TestHealthEndpoints:
         data = response.json()
         assert data["status"] in ("healthy", "degraded")
         assert "timestamp" in data
-        assert data["version"] == "2.0.0"
+        assert data["version"] == __version__
 
     def test_liveness_endpoint(self, client):
         """Test liveness probe."""

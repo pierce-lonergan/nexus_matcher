@@ -28,10 +28,21 @@ into the `{"error": {"code", "message", "details"}}` envelope the rest of the se
 uses. Raising `fastapi.HTTPException` instead would produce `{"detail": ...}` and give
 the same service two error shapes, which is the sort of thing a client library ends up
 handling with a string test.
+
+## And the failures nobody here chooses to raise
+
+That paragraph was true and insufficient, because the second envelope shipped anyway.
+Starlette raises `HTTPException` for an unknown path and for a wrong verb whether this
+module approves or not, and a census against a live app found 404, 405 and both health
+503s answering `{"detail": ...}` while every `/api/v1/*` failure answered `{"error":
+{...}}`. So `http_exception_handler` below renders THOSE into the same envelope: the
+choice of exception class is about which status and `code` a failure gets pinned to, not
+about which shape reaches the client, because a client only ever gets one shape.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -177,6 +188,68 @@ def drift(owner: str, attribute: str, consequence: str) -> ContractDriftError:
             f"{owner} have drifted."
         ),
         details={"owner": owner, "attribute": attribute},
+    )
+
+
+# =============================================================================
+# THE FAILURES THE FRAMEWORK RAISES
+# =============================================================================
+
+
+async def http_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    """
+    Render Starlette's own `HTTPException` into this service's one error envelope.
+
+    404 and 405 are raised by the router, not by any code in this package, so they were
+    the half of the two-envelope defect nobody could fix by choosing a better exception
+    class. The health probes raise `HTTPException` deliberately -- see `app.py` -- and
+    arrive here too.
+
+    ## `headers` is forwarded, and that is not housekeeping
+
+    A 405 on `PUT /api/v1/match` carries `Allow: POST`, which is how a client discovers
+    the verb without reading a document. `JSONResponse(status_code=..., content=...)` --
+    the obvious thing to copy from `validation_exception_handler` below -- drops it, so
+    unifying the envelope that way would trade a client-library annoyance for a protocol
+    defect. `getattr` rather than `exc.headers` because this is registered against a base
+    class and a caller may raise a bare one.
+
+    ## Why a `dict` detail is understood
+
+    `HTTPException(detail=...)` takes any object. A string is the message; a mapping
+    carrying `message` lets a raiser attach structured context -- which is how
+    `/health/ready` puts its component map in the body instead of answering "Service not
+    ready" and leaving the operator to guess which component is red.
+
+    ## The codes
+
+    Anything below 500 is the caller addressing this service wrongly, which is what
+    `API_INVALID_REQUEST` already means for a malformed body. 5xx gets the generic API
+    code and NOT `INITIALIZATION` (NEXUS-1002), whose docstring pins it to "no dictionary
+    is loaded": a probe 503 means the process has not finished starting, and sending an
+    operator down the dictionary branch for that is the mistake that class warns about.
+    """
+    status_code = int(getattr(exc, "status_code", 500))
+    raw_detail: Any = getattr(exc, "detail", "")
+
+    extra: dict[str, Any] = {}
+    if isinstance(raw_detail, Mapping):
+        message = str(raw_detail.get("message", ""))
+        extra = {str(key): value for key, value in raw_detail.items() if key != "message"}
+    else:
+        message = str(raw_detail)
+
+    code = ErrorCode.API_INVALID_REQUEST if status_code < 500 else ErrorCode.API
+    return JSONResponse(
+        status_code=status_code,
+        content={
+            "error": {
+                "code": code.value,
+                "message": message,
+                "details": {"status_code": status_code, **extra},
+            }
+        },
+        headers=getattr(exc, "headers", None),
     )
 
 

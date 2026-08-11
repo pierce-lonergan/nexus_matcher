@@ -1224,8 +1224,12 @@ class NexusMatcher:
                     # "rank 1 is a direct identifier and rank 2 is not" is usually the
                     # fact a reviewer decides on. `_index_dictionary` has already proven
                     # every indexed code resolves, so this cannot quietly return None for
-                    # a code the vocabulary simply does not know. MatchResult drops it for
-                    # a REJECT -- a novel field inherits nothing.
+                    # a code the vocabulary simply does not know. MatchResult drops it on
+                    # a REJECTED RANK 1 only -- a novel field inherits nothing. A rejected
+                    # runner-up KEEPS its class, because no field inherits from rank 2 and
+                    # blanking it deleted the rank-1-versus-rank-2 comparison this line
+                    # exists to provide: 66 of 104 runner-ups on the 26-field pack came
+                    # back classless although their entry carried a real code.
                     governance=self._governance.get(entry.governance_code),
                 )
             )

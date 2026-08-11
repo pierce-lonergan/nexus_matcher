@@ -4,7 +4,7 @@ POST /api/v1/feedback -- append-only recording of reviewer verdicts.
 
 ## Relationships
 # DEPENDS_ON → presentation/api/errors :: MatcherUnavailableError, MatchFailedError
-# DEPENDS_ON → presentation/api/schemas :: FeedbackRequest
+# DEPENDS_ON → presentation/api/schemas :: FeedbackRequest, ErrorResponse
 # USED_BY    → presentation/api/app :: mounted by create_app
 
 ## Recording is the whole scope, and that is a MEASURED decision
@@ -49,7 +49,11 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, status
 
 from nexus_matcher.presentation.api.errors import MatcherUnavailableError, MatchFailedError
-from nexus_matcher.presentation.api.schemas import FeedbackRequest, FeedbackResponseView
+from nexus_matcher.presentation.api.schemas import (
+    ErrorResponse,
+    FeedbackRequest,
+    FeedbackResponseView,
+)
 
 if TYPE_CHECKING:
     from nexus_matcher.presentation.api.matching import DeterministicJSONResponse as _Response
@@ -149,10 +153,29 @@ def create_feedback_router(
         status_code=status.HTTP_201_CREATED,
         response_class=response_class,
         response_model=None,
+        # Every failure names its BODY, not only its meaning. A description is prose and a
+        # generated client cannot deserialise prose: with the model missing here and
+        # present on both match routes, one Java client got a typed DTO for every way a
+        # match can fail and a bare `Map` for every way a verdict can -- from one service,
+        # one spec, one build step. `ErrorResponse` is the same envelope this route really
+        # sends, because `errors.py` renders all three of these.
         responses={
             201: {"model": FeedbackResponseView},
-            422: {"description": "Malformed record. The body names the offending field."},
-            503: {"description": "Feedback recording is not configured on this server."},
+            422: {
+                "model": ErrorResponse,
+                "description": "Malformed record. The body names the offending field.",
+            },
+            # Reachable, and the one a caller is least able to guess: an OSError on the
+            # append is answered 500 rather than 201, because a reviewer believing a
+            # verdict is on file when it is not is the worst outcome this route has.
+            500: {
+                "model": ErrorResponse,
+                "description": "The record could not be written. Nothing was recorded.",
+            },
+            503: {
+                "model": ErrorResponse,
+                "description": "Feedback recording is not configured on this server.",
+            },
         },
         summary="Record a reviewer's verdict on a match",
         description=(

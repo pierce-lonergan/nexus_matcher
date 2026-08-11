@@ -226,16 +226,77 @@ Real output:
 
 ## 7. The API server
 
+Started bare, the server has no dictionary and every match answers 503 naming the setting
+to change. Both shipped entry points call `create_app()` with no arguments, so the
+dictionary and the vocabulary are passed through the environment:
+
 ```bash
-nexus-matcher api
+export NEXUS_API_DICTIONARY=examples/governance/glossary.csv
+export NEXUS_API_GOVERNANCE=examples/governance/protection_classes.json
+nexus-matcher api --host 127.0.0.1 --port 8000
 ```
 
-The server exposes **health and introspection endpoints only**: `/`, `/health`,
-`/health/live`, `/health/ready`, `/health/startup`, plus `/docs`, `/redoc` and
-`/openapi.json`.
+`examples/governance/serve.sh` (and `serve.ps1`) is exactly that, plus
+`NEXUS_API_FEEDBACK_PATH` so `/api/v1/feedback` works too.
 
-**There is no HTTP matching endpoint.** Matching over HTTP is not implemented. Use the
-Python API or the CLI. See [docs/API_REFERENCE.md](docs/API_REFERENCE.md).
+The complete route table:
+
+| Method | Path | What it serves |
+|---|---|---|
+| POST | `/api/v1/match` | Up to 100 schema fields, keyed by the caller's own `path` |
+| POST | `/api/v1/match/batch` | The same contract with a 250-field cap |
+| POST | `/api/v1/feedback` | Appends a reviewer's verdict to an audit log |
+| GET | `/` | Service identity |
+| GET | `/health` | Health check |
+| GET | `/health/live` | Liveness probe |
+| GET | `/health/ready` | Readiness probe (503 if a registered component is not ready) |
+| GET | `/health/startup` | Startup probe (503 while starting) |
+| GET | `/docs`, `/redoc`, `/openapi.json` | Generated OpenAPI documentation |
+
+One request, run against the server started above:
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/v1/match \
+  -H 'Content-Type: application/json' \
+  -d '{"fields":[{"name":"legal_name","path":"booking.passenger.legal_name","doc":"Full legal name of the passenger as printed on the sailing manifest.","type":"string"}],"top_k":1}'
+```
+
+Real output, pretty-printed here — the response itself is one line, in exactly this key
+order, byte-identical between two identical requests:
+
+```json
+{
+  "results": {
+    "booking.passenger.legal_name": [
+      {
+        "rank": 1,
+        "governanceId": "GBF-0001",
+        "businessName": "Passenger Legal Name",
+        "definition": "The full legal name of a ticketed passenger as printed on the Gravel Bay sailing manifest.",
+        "domain": "Passenger",
+        "governance": {
+          "code": "MANIFEST_NAME",
+          "name": "Passenger manifest identity",
+          "classification": "SEALED_RESTRICTED",
+          "personalInformation": true,
+          "directIdentifier": true
+        },
+        "confidence": 0.904167,
+        "decision": "AUTO_APPROVE"
+      }
+    ]
+  }
+}
+```
+
+Read `decision`, not `confidence`. `confidence` is rank-relative and will move with any
+retrieval change — do not diff against the number above.
+
+The field keys are `name`, `path`, `doc` and `type` — **not** the `flattenedName` /
+`dataType` spellings used by `examples/governance/fields.json`, which is the pack's own
+input format and not the wire contract. Sending those gives a 422, on purpose. The whole
+contract, and why the 422 is deliberate, is in
+[docs/GOVERNANCE.md](docs/GOVERNANCE.md#matching-over-http).
 
 ---
 

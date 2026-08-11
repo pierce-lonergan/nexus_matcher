@@ -74,7 +74,11 @@ from nexus_matcher.presentation.api.errors import (
     drift,
 )
 from nexus_matcher.presentation.api.limits import run_bounded
-from nexus_matcher.presentation.api.schemas import MatchRequest, MatchResponseView
+from nexus_matcher.presentation.api.schemas import (
+    ErrorResponse,
+    MatchRequest,
+    MatchResponseView,
+)
 from nexus_matcher.shared.types.base import DataType
 
 if TYPE_CHECKING:
@@ -626,11 +630,45 @@ def _invoke_matcher(
 # ROUTER
 # =============================================================================
 
+# Every way these routes are allowed to fail, WITH the body each one sends.
+#
+# This table used to supply descriptions only, so `/openapi.json` described zero error
+# bodies on either match route while `ErrorResponse` sat unused elsewhere in the package
+# -- a generated Java client got a typed 200 and a `Map` for everything else.
+#
+# 500 is here and was not, although `errors.py` documents it as one of the five failure
+# modes and three exception classes return it (MatchFailedError,
+# ConservationViolationError, ContractDriftError). It is the status a client is least able
+# to guess, so it is the one worst to omit.
+#
+# The 422 entry OVERRIDES FastAPI's own HTTPValidationError, deliberately: `app.py`
+# installs `validation_exception_handler`, so this service never sends `{"detail": [...]}`
+# and publishing that model would be an actively false schema. The defect was only ever
+# that nothing replaced it.
 _ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
-    413: {"description": "Too many fields for this server; chunk the request."},
-    422: {"description": "Malformed request. The body names the offending field."},
-    503: {"description": "No dictionary loaded, or the server shed this request."},
-    504: {"description": "The server-side deadline fired before matching finished."},
+    413: {
+        "model": ErrorResponse,
+        "description": "Too many fields, or a body over this server's byte cap; chunk it.",
+    },
+    422: {
+        "model": ErrorResponse,
+        "description": "Malformed request. `details.violations` names the offending field.",
+    },
+    500: {
+        "model": ErrorResponse,
+        "description": (
+            "The matcher failed, or this layer refused a response it could not trust. "
+            "No field was classified; treat the request as unanswered."
+        ),
+    },
+    503: {
+        "model": ErrorResponse,
+        "description": "No dictionary loaded, or the server shed this request.",
+    },
+    504: {
+        "model": ErrorResponse,
+        "description": "The server-side deadline fired before matching finished.",
+    },
 }
 
 
@@ -642,6 +680,22 @@ def create_matching_router(service: MatchService, limits: MatchServiceLimits) ->
         "/match",
         status_code=status.HTTP_200_OK,
         response_class=DeterministicJSONResponse,
+        # The handler returns the RESPONSE rather than a dict, which short-circuits
+        # FastAPI's `serialize_response` and the `jsonable_encoder` walk inside it.
+        # Measured on a 250-field explain payload: 28.6 ms of encoding against 3.4 ms of
+        # rendering, the single largest item by internal time at 58,843 calls per request
+        # -- all of it on the event loop, so it was `/health/live` latency too. Bodies are
+        # byte-identical, verified across 12 shapes: the payload is already pure
+        # dict/list/str/int/float/bool/None, so the walk provably changed nothing.
+        #
+        # Two behaviour deltas come with it, both deliberate. `jsonable_encoder` was a
+        # lenient net (datetime to ISO, Decimal to float, set to list -- all of which
+        # `json.dumps` refuses), so a future non-primitive leaf is now a loud 500 instead
+        # of a silent coercion, which is the choice this module makes everywhere else.
+        # And returning a Response skips the merge of dependency-set response headers:
+        # inert today (there is not one `Depends(` in src/, and X-Request-ID is set in
+        # middleware) but a future dependency setting a header would lose it silently.
+        #
         # response_model is deliberately absent: the handler renders the body itself so
         # that `explain` can be ABSENT rather than null while `governance` is null rather
         # than absent. The schema is published through `responses` instead, and
@@ -655,8 +709,8 @@ def create_matching_router(service: MatchService, limits: MatchServiceLimits) ->
             "nothing matched it."
         ),
     )
-    async def match(request: MatchRequest) -> dict[str, Any]:
-        return await service.match(request, limits.max_fields)
+    async def match(request: MatchRequest) -> DeterministicJSONResponse:
+        return DeterministicJSONResponse(await service.match(request, limits.max_fields))
 
     @router.post(
         "/match/batch",
@@ -670,7 +724,7 @@ def create_matching_router(service: MatchService, limits: MatchServiceLimits) ->
             "share one implementation so their semantics cannot drift apart."
         ),
     )
-    async def match_batch(request: MatchRequest) -> dict[str, Any]:
-        return await service.match(request, limits.max_batch_fields)
+    async def match_batch(request: MatchRequest) -> DeterministicJSONResponse:
+        return DeterministicJSONResponse(await service.match(request, limits.max_batch_fields))
 
     return router

@@ -1,0 +1,12 @@
+id: NM-0030
+symptom: "sync() re-read the glossary with none of the options build_index used, so every indexed entry silently lost its protection code and the refusal gate that stops a self-contradicting row was bypassed"
+severity: HIGH
+fixed_in: 2.1.0
+gate_that_should_have_caught_it: "none -- 24 tests called build_index and not one of them passed governance=, so every sync test in the suite ran over a glossary with no codes to lose"
+gate_that_catches_it_now: "tests/museum/NM-0030/test_nm_0030.py, plus tests/unit/application/test_ingest.py::TestSyncRemembersHowTheIndexWasBuilt"
+touches:
+  - src/nexus_matcher/application/ingest.py
+notes: >
+  Same harm as NM-0028 -- a row whose stated tier contradicts its own code reaching the
+  index -- reached through the REFRESH path instead of the load path. NM-0028's gate was
+  real and stayed green throughout, because it only ever asked load_entries.

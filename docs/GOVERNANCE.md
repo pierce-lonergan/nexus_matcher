@@ -118,10 +118,31 @@ is not auto-approved, and that is the correct behaviour.
 | Attribute | Meaning |
 |---|---|
 | `governance_id` | The matched entry's id, which **is** the governance id. Always populated. |
-| `governance` | The `ProtectionClass` this match would confer, or `None` when the entry has no code and therefore sits at the open tier. |
+| `governance` | The `ProtectionClass` this match would confer, or `None`, which means one of two things — below. |
 
-A rejected match carries no class: `MatchResult` clears `governance` when the decision is
-`REJECT`, so a refused match cannot confer anything.
+`governance` is resolved on **every** candidate, not on rank 1 alone, because the fact that
+decides between rank 1 and rank 2 is usually which of the two is a direct identifier.
+
+So `None` carries two meanings, and `decision` does not separate them:
+
+- **The matched entry carries no code**, so it sits at the open tier and has nothing to
+  confer.
+- **This is the rank-1 candidate and the matcher rejected it.** A rejected top match means
+  no entry in this glossary describes the field, and a novel field — the case that most
+  needs a human — would otherwise arrive wearing the class of the least-bad candidate.
+  `MatchResult` clears the class there, and only there.
+
+**A rejected runner-up keeps the class its entry confers.** The rank qualifier is the rule,
+not a detail of it. Counted over `examples/governance/run_pack.py` on the 26-field pack at
+`top_k=5`: 79 of the 104 runner-up candidates are `REJECT`, 66 of those name an entry
+carrying a real code, and 16 of those are direct identifiers. Clearing on every `REJECT`
+blanked all 66, so a reviewer comparing rank 1 against rank 2 read `null` for both of the
+things they needed to tell apart — "this entry has no class" and "this entry's class was
+withheld" — on the comparison the field exists to make.
+
+The rank-1 clause does not fire at the shipped numbers: the structural floor described in
+the next section sits above `review_threshold`, so a top-1 match cannot be rejected. It is
+there for a caller who raises `review_threshold` past that floor.
 
 ## Reading the decision, not the score
 
@@ -139,6 +160,136 @@ Two consequences that matter for governance, both demonstrated in the example pa
 
 What separated the bad matches from the good ones on that pack was the **margin over the
 runner-up** (`min_confidence_gap`), not the confidence.
+
+## Matching over HTTP
+
+Everything above is reachable over HTTP. `create_app()` registers `POST /api/v1/match`,
+`POST /api/v1/match/batch` (identical contract, higher field cap) and `POST /api/v1/feedback`
+(appends a reviewer's verdict to an audit log; never fed back into ranking).
+
+Eleven sentences across six documents said otherwise, in the register this repository
+reserves for being honest about what is missing — which is exactly why they were believed.
+They are retracted, and `tests/packaging/test_documented_routes.py` now fails the build if a
+document denies a route `create_app()` registers.
+
+### Starting a server
+
+The vocabulary is caller-supplied and both shipped entry points — `nexus-matcher api` and
+`uvicorn ...app:create_app --factory` — call `create_app()` with no arguments, so the two
+files reach the server through the environment:
+
+```bash
+export NEXUS_API_DICTIONARY=examples/governance/glossary.csv
+export NEXUS_API_GOVERNANCE=examples/governance/protection_classes.json
+nexus-matcher api --host 127.0.0.1 --port 8000
+```
+
+[`examples/governance/serve.sh`](../examples/governance/serve.sh) and
+[`serve.ps1`](../examples/governance/serve.ps1) are exactly that, plus
+`NEXUS_API_FEEDBACK_PATH` so `/api/v1/feedback` works too. Without
+`NEXUS_API_DICTIONARY` the match routes answer **503** naming the setting.
+
+`NEXUS_API_GOVERNANCE` is the one worth checking twice, because forgetting it fails
+*quietly*: a server with a glossary and no vocabulary would answer **200** with
+`"governance": null` on every field — which is rule 3's "inherits nothing" and a
+misconfigured server wearing the same face. So the bootstrap refuses to bring a matcher up
+at all in that state. Verified against this pack: the process starts, `/health/ready` goes
+503, and every match answers 503 quoting the column it found —
+
+```
+examples/governance/glossary.csv has a protection-code column ('protection_class') and no
+vocabulary is configured to interpret it, so every match would come back with
+governance=null -- indistinguishable, to the caller, from a glossary that carries no
+classes at all. Set NEXUS_API_GOVERNANCE to the JSON file that declares those codes, or
+remove the column.
+```
+
+That check reads the glossary's header against the code-column aliases, so it closes the
+common case and not the general one: codes living under a column name the alias list does
+not recognise are still invisible to it.
+
+### The request contract, which is not the example pack's field names
+
+A request is `{"fields": [...], "top_k": 5, "explain": false}`, and each field is exactly
+these four keys:
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | yes | The column's own name. |
+| `path` | no | The caller's identifier for the field, **and the key the response is returned under**. Defaults to `name`. |
+| `doc` | no | Column comment or description. Real retrieval signal — an entry with an empty definition gives the encoder very little to work with. |
+| `type` | no | Source type name, normalised server-side. Unknown types are accepted. |
+
+**Send a dotted `path`.** The segment before the last dot becomes the retrieval query's
+parent context, and that is the single largest accuracy factor measured on this task
+(+20 points of P@1 — `benchmarks/results/exp_query_repr_combined.json`). `booking.passenger.legal_name`
+is worth more than `legal_name`, and it is also the key you look the answer up under.
+
+**These are not the key names in
+[`examples/governance/fields.json`](../examples/governance/fields.json).** That file uses
+`flattenedName` and `dataType`, which are the *pack's* input format, not the wire contract.
+`FieldSpec` sets `extra="forbid"` on purpose — a misspelled `documentation` silently ignored
+would drop the column comment and quietly cost accuracy with nothing to indicate why — so
+pasting a row from the pack into a request body is a **422**, and both reviewers who built
+against this pack hit exactly that. The body names all three problems:
+
+```json
+{"error": {"code": "NEXUS-8004",
+  "message": "The request body is not valid. See details.violations for the exact fields and why each was rejected.",
+  "details": {"status_code": 422, "violations": [
+    {"location": ["body", "fields", "0", "name"], "message": "Field required", "type": "missing"},
+    {"location": ["body", "fields", "0", "flattenedName"], "message": "Extra inputs are not permitted", "type": "extra_forbidden"},
+    {"location": ["body", "fields", "0", "dataType"], "message": "Extra inputs are not permitted", "type": "extra_forbidden"}]}}}
+```
+
+### One request, and what comes back
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/v1/match \
+  -H 'Content-Type: application/json' \
+  -d '{"fields":[{"name":"legal_name","path":"booking.passenger.legal_name","doc":"Full legal name of the passenger as printed on the sailing manifest.","type":"string"}],"top_k":1}'
+```
+
+Against the ferry pack, pretty-printed here — the response is one line, and two identical
+requests produce identical bytes:
+
+```json
+{
+  "results": {
+    "booking.passenger.legal_name": [
+      {
+        "rank": 1,
+        "governanceId": "GBF-0001",
+        "businessName": "Passenger Legal Name",
+        "definition": "The full legal name of a ticketed passenger as printed on the Gravel Bay sailing manifest.",
+        "domain": "Passenger",
+        "governance": {
+          "code": "MANIFEST_NAME",
+          "name": "Passenger manifest identity",
+          "classification": "SEALED_RESTRICTED",
+          "personalInformation": true,
+          "directIdentifier": true
+        },
+        "confidence": 0.904167,
+        "decision": "AUTO_APPROVE"
+      }
+    ]
+  }
+}
+```
+
+`results` carries **one key per input field, keyed by that field's own `path`, in the order
+sent** — a field nothing matched gets `[]`, never a missing key. That is rule 3 as a wire
+contract: a field cannot silently vanish from the map and inherit nothing unnoticed.
+
+`governance` is the protection class the matched entry confers, drawn from *your*
+`protection_classes.json`; `null` means the entry carries no code and sits at the open tier.
+`code`, `name` and `classification` are your vocabulary's own strings — the library defines
+none of them and does not type them as a closed set.
+
+Do not diff against `confidence`. It is the rank-relative number described above, it will
+move with any retrieval change (H-001), and `decision` is what carries the verdict. The
+value shown is what this pack produced on the day it was written, not a promise.
 
 ## Two hazards this feature sits inside
 

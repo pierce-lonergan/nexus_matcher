@@ -295,9 +295,10 @@ class TestGovernancePassthrough:
         being treated as personal data.
 
         Asserted over the RANK-1 candidates, one request field per glossary entry, so all
-        four codes are genuinely exercised. Sampling whatever came back would drift into
-        asserting mostly about nulls: below rank 1 this fixture is nearly all REJECT, and
-        a REJECT carries no class by design.
+        four codes are genuinely exercised rather than whichever two or three happen to
+        surface. Runner-ups carry their class too now -- see
+        `test_a_rejected_runner_up_still_carries_the_class_its_entry_confers` -- but only
+        the rank-1 sweep guarantees every DECLARED code appears somewhere.
         """
         top = {
             candidates[0]["governanceId"]: candidates[0]
@@ -323,9 +324,10 @@ class TestGovernancePassthrough:
         "no protection class" from "this response did not say", because only one of those
         is safe to act on.
 
-        Read off a candidate that was NOT rejected. A rejected match also carries no class
-        -- the domain clears it, so a novel field inherits nothing -- so asserting against
-        one would prove the reject rule and say nothing about the uncoded-entry rule.
+        Read off a RANK-1 candidate that was not rejected -- the one shape where the null
+        can only have come from the entry. A rejected rank 1 confers nothing whatever its
+        entry carries, so asserting there would prove that rule and say nothing about this
+        one.
         """
         uncoded = next(e for e in GLOSSARY if e.governance_code is None)
         candidate = post_match(real_client).json()["results"]["billing.tariff_band"][0]
@@ -367,6 +369,60 @@ class TestGovernancePassthrough:
             "rank 2 came back with no protection class while rank 1 had one"
         )
         assert candidates[1]["governance"]["code"] in FICTIONAL_VOCABULARY
+
+    def test_a_rejected_runner_up_still_carries_the_class_its_entry_confers(self, real_client):
+        """
+        `governance: null` must mean ONE thing on the wire, and `GovernanceView` says the
+        thing it means is "the matched entry carries no code".
+
+        It used to mean two. `MatchResult` cleared the class on ANY reject, and REJECT is
+        a per-candidate verdict, so on this fixture 18 of 30 candidates came back null
+        while their entry carried a real code -- `LWP-0001`, a direct identifier, among
+        them. `decision` did not separate the two cases, because the genuinely uncoded
+        candidates read REJECT as well, and a generated Java client could not learn the
+        second meaning from anywhere: the string "REJECT" appears nowhere in
+        `/openapi.json`. Same measurement on the 26-field Gravel Bay pack: 66 of 104.
+        """
+        code_by_id = {entry.id: entry.governance_code for entry in GLOSSARY}
+        rejected_but_coded = [
+            candidate
+            for candidates in post_match(real_client, top_k=5).json()["results"].values()
+            for candidate in candidates
+            if candidate["rank"] > 1
+            and candidate["decision"] == "REJECT"
+            and code_by_id[candidate["governanceId"]] is not None
+        ]
+
+        assert len(rejected_but_coded) >= 10, (
+            f"only {len(rejected_but_coded)} rejected runner-ups with a coded entry, so "
+            f"this fixture no longer covers the case the test was written for"
+        )
+        for candidate in rejected_but_coded:
+            assert candidate["governance"] is not None, candidate
+            assert candidate["governance"]["code"] == code_by_id[candidate["governanceId"]]
+
+    def test_a_rejected_rank_one_still_serialises_no_class_at_all(self):
+        """
+        The half that must NOT change, driven over HTTP because the projection is what a
+        caller sees and it reads `MatchResult.governance` directly.
+
+        Unreachable at the shipped thresholds -- `review_threshold` is 0.50 and a rank-1
+        confidence cannot fall below `semantic_weight * fusion_alpha` = 0.63 -- so this
+        raises the bar to reach it. Without that the guard would be untested by
+        construction, which is indistinguishable from being absent.
+        """
+        from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+
+        strict = MatchingConfig(results_per_field=5, review_threshold=0.99)
+        with client_for(build_api_matcher(config=strict)) as client:
+            top = post_match(client, top_k=5).json()["results"]["account.resident_nm"][0]
+
+        assert top["decision"] == "REJECT"
+        assert top["governanceId"] == "LWP-0001", "the rejected top match must carry a code"
+        assert top["governance"] is None, (
+            "a field whose best candidate the matcher rejected inherited that candidate's "
+            "class anyway"
+        )
 
 
 # =============================================================================
@@ -612,3 +668,48 @@ def test_the_published_openapi_model_describes_what_the_service_really_sends(rea
     schema = real_client.get("/openapi.json").json()
     match_200 = schema["paths"]["/api/v1/match"]["post"]["responses"]["200"]
     assert "MatchResponseView" in json.dumps(match_200), match_200
+
+
+def test_the_published_schema_states_both_meanings_of_a_null_governance(real_client):
+    """
+    A null `governance` means two different things -- the entry carries no code, or the
+    matcher REJECTED the top match -- and a Java client generated from `/openapi.json` can
+    only learn the second one if the spec says so.
+
+    It did not. The string "REJECT" appeared NOWHERE in `app.openapi()`, and `decision`
+    was published with no description at all, so the generated DTO documented one meaning
+    while the service shipped two. Asserted on the served spec rather than on the
+    docstring, because the spec is what the build step reads.
+    """
+    schemas = real_client.get("/openapi.json").json()["components"]["schemas"]
+    governance_doc = schemas["GovernanceView"]["description"]
+
+    assert "REJECT" in governance_doc and "rank" in governance_doc, governance_doc
+    assert "REJECT" in schemas["MatchCandidateView"]["properties"]["decision"]["description"]
+
+
+def test_the_body_is_rendered_without_fastapis_encoder_walking_it(real_client, monkeypatch):
+    """
+    The handlers return the Response, so `jsonable_encoder` never runs at all.
+
+    It used to: an `async def -> dict` handler ends in FastAPI's `serialize_response`,
+    which walks every leaf of the payload on the EVENT LOOP -- 28.6 ms against 3.4 ms of
+    rendering on a 250-field explain payload, 58,843 calls per request, and the largest
+    single item by internal time in a profile of this endpoint.
+
+    Patching the encoder to raise is the only assertion that separates "we no longer pay
+    for it" from "it happens to be fast on this machine today". A latency assertion would
+    be the flaky gate `test_degradation` forbids by name, and it would pass on the old
+    code whenever the box was quiet.
+    """
+    import fastapi.routing
+
+    def exploding_encoder(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("jsonable_encoder walked the response payload again")
+
+    monkeypatch.setattr(fastapi.routing, "jsonable_encoder", exploding_encoder)
+
+    response = post_match(real_client, explain=True)
+
+    assert response.status_code == 200, response.text
+    MatchResponseView.model_validate(response.json())

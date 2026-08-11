@@ -173,10 +173,30 @@ def add_timestamp(logger: WrappedLogger, method_name: str, event_dict: EventDict
     return event_dict
 
 
+@lru_cache(maxsize=1)
+def service_version() -> str:
+    """The running package version, from the one place that defines it.
+
+    `pyproject.toml` sets `dynamic = ["version"]` with `[tool.hatch.version] path =
+    src/nexus_matcher/__init__.py`, so `__version__` IS the version the wheel is built
+    with. Anything else spelling it out is a second copy that drifts -- and did: this
+    line and three in the API said "2.0.0" while the package was at 2.1.0, so every log
+    record and the `/health` payload identified the service as a release that had by then
+    been deleted from PyPI.
+
+    Imported inside the function, and cached, because this module is low-level enough to
+    be imported while `nexus_matcher/__init__` is still executing; deferring to first log
+    call resolves it well after that finishes.
+    """
+    from nexus_matcher import __version__
+
+    return __version__
+
+
 def add_service_info(logger: WrappedLogger, method_name: str, event_dict: EventDict) -> EventDict:
     """Add service metadata to log events."""
     event_dict["service"] = "nexus-matcher"
-    event_dict["version"] = "2.0.0"
+    event_dict["version"] = service_version()
     return event_dict
 
 

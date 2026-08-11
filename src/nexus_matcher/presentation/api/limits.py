@@ -47,6 +47,7 @@ from dataclasses import dataclass
 from typing import TypeVar
 
 from nexus_matcher.presentation.api.errors import DeadlineExceededError, OverloadedError
+from nexus_matcher.presentation.api.schemas import MAX_FIELD_SPEC_CHARS
 
 T = TypeVar("T")
 
@@ -61,11 +62,45 @@ T = TypeVar("T")
 # exists for the two entry points that cannot pass one.
 _ENV_PREFIX = "NEXUS_API_"
 
+# `FieldSpec`'s max_lengths count CHARACTERS; the wire carries UTF-8, where a character is
+# up to four bytes. Deriving the byte cap without this factor gives ~2.4 MB at the shipped
+# 250-field default and refuses bodies every declared bound accepts -- a 413 the caller
+# cannot reconcile with the schema they generated their client from.
+_UTF8_BYTES_PER_CHAR = 4
+
+# JSON framing around one field: four key names, eight quotes, commas and braces. 47 bytes
+# for `{"name":"","path":"","doc":"","type":""},` measured; 64 leaves room for escapes.
+_FRAMING_BYTES_PER_FIELD = 64
+
+# And around the whole body: `{"fields":[...],"top_k":5,"explain":true}`, plus slack for a
+# client that pretty-prints. Generous on purpose -- this number is a FLOOR under a cap, so
+# being over-generous costs a little memory headroom and being tight costs correctness.
+_FRAMING_BYTES = 1024
+
+
+def worst_case_body_bytes(max_batch_fields: int) -> int:
+    """
+    The largest body this service's own declared bounds admit, in bytes.
+
+    Derived, never typed as a literal. This is a FLOOR under any byte cap rather than a
+    guess at reasonable traffic: below it, a body that `MatchRequest` and `FieldSpec` both
+    accept is refused before either of them sees it, and the caller is left holding a 413
+    that contradicts the schema they generated their client from. ~9.4 MiB at the shipped
+    250-field default; the largest body a realistic client sends is 2.36 MB.
+
+    One thing it does NOT cover, said out loud: a client that escapes every character as
+    `\\uXXXX` puts six bytes on the wire per character, so a body inside its declared
+    bounds can still exceed this. `NEXUS_API_MAX_BODY_BYTES` is the escape hatch, and the
+    413 names the cap it hit.
+    """
+    per_field = MAX_FIELD_SPEC_CHARS * _UTF8_BYTES_PER_CHAR + _FRAMING_BYTES_PER_FIELD
+    return max_batch_fields * per_field + _FRAMING_BYTES
+
 
 @dataclass(frozen=True)
 class MatchServiceLimits:
     """
-    The four numbers that bound this service, and the reasoning behind each default.
+    The numbers that bound this service, and the reasoning behind each default.
 
     Attributes:
         deadline_seconds: How long a caller may wait before the server answers 504.
@@ -84,6 +119,19 @@ class MatchServiceLimits:
         max_batch_fields: Cap for POST /api/v1/match/batch. 250 is the chunk size the
             chunked client sends, so the documented client works against the default and
             a client that ignores its own chunking gets a 413 that says the limit.
+        max_body_bytes: Cap on the RAW REQUEST BODY, enforced by `BodySizeLimitMiddleware`
+            before the body is buffered or parsed. None -- the default -- derives it from
+            `max_batch_fields` and `FieldSpec`'s own max_lengths, so raising the field cap
+            raises the byte cap with it. An explicit value is an escape hatch, not the
+            source of truth: an operator who raises NEXUS_API_MAX_BATCH_FIELDS and leaves
+            a stale byte cap behind would get a 413 naming the wrong limit, which is why
+            `__post_init__` refuses the pair rather than the number.
+
+            Note this object is SHARED by both match routes, so /api/v1/match inherits a
+            byte cap derived from the batch route's 250 fields -- 2.5x looser than its own
+            100-field limit needs. That is the right trade: the cap exists to stop an
+            unparsed body from exhausting memory, and its own `max_fields` 413 still fires
+            on anything that gets through.
     """
 
     deadline_seconds: float = 25.0
@@ -91,6 +139,7 @@ class MatchServiceLimits:
     max_queued: int = 32
     max_fields: int = 100
     max_batch_fields: int = 250
+    max_body_bytes: int | None = None
 
     def __post_init__(self) -> None:
         """
@@ -99,6 +148,9 @@ class MatchServiceLimits:
         A non-positive deadline would make every request time out; a non-positive worker
         count would make every request hang forever waiting for a worker that does not
         exist. Both are silent until traffic arrives, which is the worst time to find out.
+
+        `max_body_bytes` is checked against `max_batch_fields` rather than on its own,
+        because a byte cap only means anything relative to the field cap it has to admit.
         """
         if self.deadline_seconds <= 0:
             raise ValueError(f"deadline_seconds must be > 0, got {self.deadline_seconds!r}")
@@ -110,6 +162,28 @@ class MatchServiceLimits:
             raise ValueError(f"max_fields must be >= 1, got {self.max_fields!r}")
         if self.max_batch_fields < 1:
             raise ValueError(f"max_batch_fields must be >= 1, got {self.max_batch_fields!r}")
+        if self.max_body_bytes is not None:
+            floor = worst_case_body_bytes(self.max_batch_fields)
+            if self.max_body_bytes < floor:
+                raise ValueError(
+                    f"{_ENV_PREFIX}MAX_BODY_BYTES={self.max_body_bytes!r} is below the "
+                    f"{floor} bytes a max_batch_fields={self.max_batch_fields} request "
+                    f"may legitimately carry, so this server would answer 413 to bodies "
+                    f"every other limit it publishes accepts. Unset it to derive the cap, "
+                    f"or lower {_ENV_PREFIX}MAX_BATCH_FIELDS to match."
+                )
+
+    @property
+    def body_byte_cap(self) -> int:
+        """
+        The byte cap actually enforced: the operator's override, else the derived floor.
+
+        One name for the effective number, so the middleware cannot be handed the raw
+        `max_body_bytes` and silently enforce None.
+        """
+        if self.max_body_bytes is not None:
+            return self.max_body_bytes
+        return worst_case_body_bytes(self.max_batch_fields)
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> MatchServiceLimits:
@@ -136,12 +210,23 @@ class MatchServiceLimits:
                     f"{cast.__name__}. Unset it to use the default {fallback!r}."
                 ) from exc
 
+        # Absent means DERIVE, which is not the same as any number an operator could type
+        # -- so this one cannot go through `_read`'s fallback, which would have to pick a
+        # literal and make the environment the source of truth for the cap.
+        raw_body_bytes = env.get(f"{_ENV_PREFIX}MAX_BODY_BYTES")
+        configured_body_bytes = (
+            None
+            if raw_body_bytes is None or not raw_body_bytes.strip()
+            else int(_read("MAX_BODY_BYTES", int, 0))
+        )
+
         return cls(
             deadline_seconds=float(_read("DEADLINE_SECONDS", float, cls.deadline_seconds)),
             max_workers=int(_read("MAX_WORKERS", int, cls.max_workers)),
             max_queued=int(_read("MAX_QUEUED", int, cls.max_queued)),
             max_fields=int(_read("MAX_FIELDS", int, cls.max_fields)),
             max_batch_fields=int(_read("MAX_BATCH_FIELDS", int, cls.max_batch_fields)),
+            max_body_bytes=configured_body_bytes,
         )
 
 

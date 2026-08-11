@@ -16,6 +16,7 @@ Two behaviours here are worth more than the rest:
 from __future__ import annotations
 
 import json
+from typing import Any, ClassVar
 
 import pytest
 
@@ -403,6 +404,192 @@ class TestThreeLineAPI:
 
         assert gamma_id in index.entries
         assert np.allclose(index.vectors[index.order.index(gamma_id)], gamma_vector)
+
+
+class _ConstantProvider:
+    """
+    An encoder-shaped object that returns one fixed vector.
+
+    Everything in `TestSyncRemembersHowTheIndexWasBuilt` is about BOOKKEEPING -- which
+    options a refresh re-reads the source with, and what the report says -- so the bundled
+    model would add seconds per test and a dependency on what a vector means. Nothing below
+    reads a vector back.
+    """
+
+    dimension = 4
+    model_name = "constant"
+
+    def embed_documents(self, texts):
+        import numpy as np
+
+        return np.ones((len(list(texts)), self.dimension), dtype="float32")
+
+
+class TestSyncRemembersHowTheIndexWasBuilt:
+    """
+    `sync(index, source)` must re-read the source the way `build_index` read it.
+
+    `GlossaryIndex` stored the provider and nothing else, so every other option went out
+    of scope the moment `build_index` returned -- and `sync`'s own docstring example is
+    `sync(index, "glossary.xlsx")` with no options at all. The governance vocabulary is the
+    member that mattered: measured on a byte-identical file, a 30-entry index built with
+    27 coded entries came back with 0 and reported `=30 unchanged`. Nothing errored,
+    because there is nothing wrong with a glossary that has no vocabulary.
+
+    Worse than the loss: `load_entries`' refusal gate went with it, so a row whose stated
+    tier contradicts its own code raised from `build_index` and loaded silently through
+    `sync`. That half is pinned in tests/museum/NM-0030.
+
+    The vocabulary here is fictional -- Thornbury Water Authority does not exist. This
+    library ships no taxonomy; what is under test is the STRUCTURE.
+    """
+
+    VOCABULARY: ClassVar[dict[str, Any]] = {
+        "open_classification": "Open",
+        "classes": [
+            {
+                "code": "METERID",
+                "name": "Meter Serial Identifier",
+                "classification": "Sealed",
+                "personal_information": True,
+                "direct_identifier": True,
+            },
+            {
+                "code": "PUBMAP",
+                "name": "Published Network Map Reference",
+                "classification": "Open",
+                "personal_information": False,
+                "direct_identifier": False,
+            },
+        ],
+    }
+
+    HEADER = "Term,Business Definition,Protection Class\n"
+    METER = "Meter Serial,The serial number stamped on a water meter,METERID\n"
+    MAIN = "Trunk Main Reference,Identifier of a trunk main on the published map,PUBMAP\n"
+
+    @pytest.fixture
+    def source(self, tmp_path):
+        p = tmp_path / "glossary.csv"
+        p.write_text(self.HEADER + self.METER + self.MAIN, encoding="utf-8")
+        return p
+
+    def _built(self, source, **kwargs):
+        return ingest.build_index(
+            source, provider=_ConstantProvider(), governance=self.VOCABULARY, **kwargs
+        )
+
+    def _codes(self, index):
+        return {e.business_name: e.governance_code for e in index.entries.values()}
+
+    def test_the_vocabulary_survives_a_no_change_sync(self, source):
+        """THE DEFECT, at the boundary a caller uses. The file did not change at all."""
+        index = self._built(source)
+        assert self._codes(index) == {"Meter Serial": "METERID", "Trunk Main Reference": "PUBMAP"}
+
+        report = ingest.sync(index, source)
+
+        assert self._codes(index) == {"Meter Serial": "METERID", "Trunk Main Reference": "PUBMAP"}
+        assert report.unchanged == 2
+        assert report.governance_changed == []
+
+    def test_the_column_mapping_survives_too(self, tmp_path):
+        """
+        The same hole, in the member that failed loudly by accident. Dropping `columns`
+        here raises "could not find a business-name or definition column" -- which is only
+        luck: on a glossary whose headers happen to be inferable it would instead change
+        every derived id and report the whole file added and removed.
+        """
+        p = tmp_path / "odd.csv"
+        p.write_text("colA,colB\nMeter Serial,The serial number\n", encoding="utf-8")
+        index = ingest.build_index(
+            p,
+            provider=_ConstantProvider(),
+            columns={"business_name": "colA", "definition": "colB"},
+        )
+
+        report = ingest.sync(index, p)
+
+        assert report.unchanged == 1
+        assert report.added == [] and report.removed == []
+
+    def test_a_code_that_moved_is_reported(self, source):
+        index = self._built(source)
+        meter_id = next(i for i, e in index.entries.items() if e.business_name == "Meter Serial")
+        source.write_text(
+            self.HEADER + self.METER.replace("METERID", "PUBMAP") + self.MAIN, encoding="utf-8"
+        )
+
+        report = ingest.sync(index, source)
+
+        assert report.governance_changed == [meter_id]
+        assert self._codes(index)["Meter Serial"] == "PUBMAP"
+
+    def test_a_code_the_steward_blanked_is_reported_and_NOT_refused(self, source):
+        """
+        Deliberately not a refusal. Blanking a protection-code cell is a legitimate source
+        edit -- a code retired, a row reclassified as uncoded -- and refusing it would
+        leave `sync` unable to process a file a steward is entitled to write. It is
+        REPORTED, which is what the wiring bug that motivated a refusal actually needed.
+        """
+        index = self._built(source)
+        source.write_text(
+            self.HEADER + self.METER.replace("METERID", "") + self.MAIN, encoding="utf-8"
+        )
+
+        report = ingest.sync(index, source)
+
+        assert len(report.governance_changed) == 1
+        assert self._codes(index)["Meter Serial"] is None
+
+    def test_the_report_line_says_so(self, source):
+        """
+        The line every caller prints. A code moving does not move the content hash -- see
+        `content_hash` -- so without this the whole event reads as `=2 unchanged`.
+        """
+        index = self._built(source)
+        source.write_text(
+            self.HEADER + self.METER.replace("METERID", "PUBMAP") + self.MAIN, encoding="utf-8"
+        )
+
+        assert "1 governance changed" in str(ingest.sync(index, source))
+
+    def test_a_new_row_is_not_also_reported_as_a_governance_change(self, source):
+        """An added entry is reported once, as added. Saying it twice is noise."""
+        index = self._built(source)
+        source.write_text(
+            self.HEADER + self.METER + self.MAIN + "Meter Location,Where a meter sits,PUBMAP\n",
+            encoding="utf-8",
+        )
+
+        report = ingest.sync(index, source)
+
+        assert len(report.added) == 1
+        assert report.governance_changed == []
+
+    def test_an_explicit_argument_overrides_what_was_remembered(self, source):
+        """
+        Remembering is a default, not a lock. Turning governance off is still available;
+        it is now a decision -- two keywords, both of them the caller's -- rather than the
+        accident of omitting one.
+        """
+        index = self._built(source)
+
+        report = ingest.sync(index, source, governance=None, governance_strict=False)
+
+        assert self._codes(index) == {"Meter Serial": None, "Trunk Main Reference": None}
+        assert len(report.governance_changed) == 2
+
+    def test_turning_the_vocabulary_off_alone_is_refused(self, source):
+        """
+        The unread-code-column guard reaches this path too, and has to: `sync` re-reads a
+        glossary that still carries codes, and dropping the vocabulary is exactly how every
+        entry in the index lost its class in the first place.
+        """
+        index = self._built(source)
+
+        with pytest.raises(ValueError, match="protection-code column"):
+            ingest.sync(index, source, governance=None)
 
 
 class TestStableIdentity:

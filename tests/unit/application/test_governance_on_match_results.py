@@ -11,8 +11,10 @@ Four properties, each with a silent failure mode:
 
   1. `governance_id` is always populated, and always names the matched entry
   2. `governance` is resolved on EVERY returned candidate, not only rank 1
-  3. a REJECT confers NOTHING -- a novel field must never inherit the class of the
-     least-bad candidate the matcher itself rejected
+  3. a REJECTED RANK 1 confers NOTHING -- a novel field must never inherit the class of
+     the least-bad candidate the matcher itself rejected. A rejected RUNNER-UP keeps its
+     class: no field inherits from rank 2, and the class is the whole reason a reviewer
+     can compare it against rank 1.
   4. indexing entries whose codes the wired vocabulary cannot resolve is refused, rather
      than degrading to `governance=None` on every match
 
@@ -22,6 +24,8 @@ on a learned embedding.
 """
 
 from __future__ import annotations
+
+import math
 
 import numpy as np
 import pytest
@@ -76,9 +80,9 @@ THORNBURY = {
 # The query's components ARE the four cosines. They are spaced so the fixture exercises
 # every case this file is about at once: the top three clear `review_threshold` (0.50) and
 # the fourth does not, and the UNCODED entry lands at rank 2 -- inside the reviewed set --
-# so "an entry with no code confers no class" is proved on a match that was not rejected.
-# Were the uncoded entry last, the REJECT rule alone would satisfy that test and it would
-# prove nothing about the open tier.
+# so "an entry with no code confers no class" is proved on a candidate that is neither
+# rank 1 nor rejected, which leaves the open tier as the only thing that could have
+# produced the null.
 _VECTORS = {
     "Meter Serial": (1.0, 0.0, 0.0, 0.0),
     "Depot Rota Note": (0.0, 1.0, 0.0, 0.0),
@@ -142,7 +146,7 @@ FIELD = SchemaField(
 )
 
 
-def _matcher(governance=THORNBURY, entries=ENTRIES) -> NexusMatcher:
+def _matcher(governance=THORNBURY, entries=ENTRIES, config=None) -> NexusMatcher:
     matcher = NexusMatcher(
         embedding_provider=_StubProvider(),
         # No sparse retriever and no reranker: the fused score is then exactly the min-max
@@ -151,16 +155,47 @@ def _matcher(governance=THORNBURY, entries=ENTRIES) -> NexusMatcher:
         vector_store=InMemoryVectorStore(
             VectorStoreConfig(collection_name="dictionary", dimension=4)
         ),
-        config=MatchingConfig(results_per_field=4),
+        config=config if config is not None else MatchingConfig(results_per_field=4),
         governance=governance,
     )
     matcher._index_dictionary(entries)
     return matcher
 
 
+def _thresholded(review_threshold: float) -> MatchingConfig:
+    """This file's config with the REVIEW/REJECT bar moved and nothing else touched."""
+    return MatchingConfig(results_per_field=4, review_threshold=review_threshold)
+
+
+# The rank-1 confidence this fixture produces, WRITTEN OUT from the shipped weights rather
+# than read back off the matcher: an expectation derived from the code under test is an
+# identity, and an identity holds just as well when both sides are wrong (H-004). The stub
+# above puts the top entry's vector alone in its own dimension, which fixes every signal:
+#
+#   fused 0.9 | lexical 1.0 | edit 0.0 | type 1.0 | domain 0.5
+#   0.70*0.9 + 0.05*1.0 + 0.05*0.0 + 0.05*1.0 + 0.15*0.5
+#   = 0.630 + 0.050 + 0.000 + 0.050 + 0.075 = 0.805
+#
+# That leading 0.630 is `MatchingConfig.minimum_achievable_confidence` itself --
+# semantic_weight * fusion_alpha -- which is why the tests below have to RAISE
+# `review_threshold` to reach a rank-1 REJECT at all.
+RANK_1_CONFIDENCE = 0.805
+
+# A bar above every confidence this fixture can produce, so rank 1 is REJECTED and the
+# rule that clears its class is actually exercised. Nothing reaches that state at the
+# shipped 0.50 -- see `test_the_rank_one_guard_is_latent_at_the_shipped_thresholds`.
+REJECTING_CONFIG = _thresholded(0.95)
+
+
 @pytest.fixture(scope="module")
 def matches() -> tuple[MatchResult, ...]:
     return tuple(_matcher()._match_field(FIELD))
+
+
+@pytest.fixture(scope="module")
+def rejected_matches() -> tuple[MatchResult, ...]:
+    """The same four candidates under a threshold no rank can clear: all four REJECT."""
+    return tuple(_matcher(config=REJECTING_CONFIG)._match_field(FIELD))
 
 
 # =============================================================================
@@ -247,12 +282,22 @@ class TestGovernanceClass:
         A consumer deciding between rank 1 and rank 2 needs to see that one is a direct
         identifier and the other is not. That is usually the deciding fact, and having it
         on rank 1 alone makes the comparison impossible without a second lookup.
+
+        EVERY candidate, rejected ones included. This used to filter the rejects out, and
+        the filter is what hid the defect: rank 4 here carries PUBMAP and came back null,
+        and on the 26-field Gravel Bay pack 66 of 104 runner-ups did the same -- 20 of
+        them direct identifiers -- while `decision` read REJECT on the genuinely uncoded
+        ones too, so the two nulls were indistinguishable on the wire.
         """
-        reviewable = [m for m in matches if not m.is_rejected]
-        assert len(reviewable) >= 2, "fixture must return more than one non-rejected match"
-        assert all(
-            m.governance is not None for m in reviewable if m.dictionary_entry.governance_code
+        coded = [m for m in matches if m.dictionary_entry.governance_code]
+        assert len(coded) >= 2, "fixture must return more than one coded match"
+        assert any(m.is_rejected for m in coded), (
+            "no coded candidate was REJECTED, so the pre-filter this test dropped would "
+            "still have passed and this proves nothing about it"
         )
+        assert all(m.governance is not None for m in coded), {
+            m.dictionary_entry.id: (m.rank, m.decision.value, m.governance) for m in coded
+        }
 
     def test_the_ranks_carry_DIFFERENT_classes(self, matches):
         """
@@ -269,7 +314,8 @@ class TestGovernanceClass:
         """
         uncoded = next(m for m in matches if m.dictionary_entry.id == "TWA-1002")
         assert uncoded.decision is not MatchDecision.REJECT, (
-            "a rejected match confers nothing anyway, so this would prove nothing"
+            "keep this case on a candidate that was not rejected, so its null can only "
+            "have come from the entry carrying no code"
         )
         assert uncoded.dictionary_entry.governance_code is None
         assert uncoded.governance is None
@@ -277,23 +323,56 @@ class TestGovernanceClass:
 
 
 # =============================================================================
-# A REJECT INHERITS NOTHING
+# A REJECTED RANK 1 INHERITS NOTHING
 # =============================================================================
 
 
 class TestRejectConfersNothing:
-    def test_a_rejected_match_carries_no_class(self, matches):
-        rejected = [m for m in matches if m.is_rejected]
-        assert rejected, (
-            "the fixture produced no REJECT, so this file proves nothing about them -- "
-            f"decisions were {[m.decision.value for m in matches]}"
+    """
+    The rule is about the field, and a field inherits from RANK 1 only.
+
+    `_determine_decision` compares every rank against `review_threshold`, so REJECT is a
+    per-CANDIDATE verdict; the reason for clearing the class is a per-FIELD one. Applied
+    unqualified it deleted the runner-up's class as well -- which no field inherits, and
+    which is precisely the fact `MatchResult`'s own docstring says the field exists to
+    carry.
+    """
+
+    def test_a_rejected_rank_one_carries_no_class(self, rejected_matches):
+        top = rejected_matches[0]
+        assert top.decision is MatchDecision.REJECT, (
+            "the fixture produced no rank-1 REJECT, so this proves nothing -- decisions "
+            f"were {[m.decision.value for m in rejected_matches]}"
         )
-        for match in rejected:
-            assert match.governance is None, (
-                f"{match.dictionary_entry.id} was REJECTED and still confers "
-                f"{match.governance}. A novel field would inherit the class of the "
-                f"least-bad candidate the matcher itself rejected."
-            )
+        assert top.dictionary_entry.governance_code == "METERID", (
+            "the rejected top match must carry a code, or a null here proves nothing"
+        )
+        assert top.governance is None, (
+            f"{top.dictionary_entry.id} was the REJECTED top match and still confers "
+            f"{top.governance}. A novel field would inherit the class of the least-bad "
+            f"candidate the matcher itself rejected."
+        )
+
+    def test_a_rejected_runner_up_KEEPS_its_class(self, rejected_matches):
+        """
+        The direction the unqualified rule got wrong, and the reason this item was raised.
+
+        Nothing inherits from rank 3. Blanking its class removed the only fact that made
+        it comparable with rank 1, and left two different meanings behind one
+        indistinguishable `null` -- "this entry has no code" and "this candidate was
+        rejected" -- with `decision` reading REJECT in both.
+        """
+        third = rejected_matches[2]
+        assert (third.rank, third.is_rejected) == (3, True)
+        assert third.dictionary_entry.governance_code == "USAGE"
+        assert third.governance is not None and third.governance.code == "USAGE"
+
+    def test_a_rejected_runner_up_with_no_code_still_confers_nothing(self, rejected_matches):
+        """The null that is REAL, kept distinguishable from the one above."""
+        second = rejected_matches[1]
+        assert (second.rank, second.is_rejected) == (2, True)
+        assert second.dictionary_entry.governance_code is None
+        assert second.governance is None
 
     def test_a_rejected_match_still_says_which_entry_it_was(self, matches):
         """
@@ -308,16 +387,42 @@ class TestRejectConfersNothing:
         Constructed directly, with a class explicitly handed in. It is dropped anyway --
         so a future call site that forgets cannot reintroduce the defect.
         """
-        assert (
-            _hand_built(decision=MatchDecision.REJECT, governance=_class("METERID")).governance
-            is None
+        rejected_top = _hand_built(
+            rank=1, decision=MatchDecision.REJECT, governance=_class("METERID")
         )
+        assert rejected_top.governance is None
+
+    def test_the_domain_model_leaves_a_rejected_runner_up_alone(self):
+        """The narrowing, on the model itself rather than only through the matcher."""
+        runner_up = _hand_built(rank=2, decision=MatchDecision.REJECT, governance=_class("METERID"))
+        assert runner_up.governance is not None and runner_up.governance.code == "METERID"
 
     def test_a_non_rejected_match_keeps_the_class_it_was_given(self):
         """The control. A rule that dropped governance unconditionally would satisfy the above."""
         for decision in (MatchDecision.REVIEW, MatchDecision.AUTO_APPROVE):
             kept = _hand_built(decision=decision, governance=_class("METERID"))
             assert kept.governance is not None and kept.governance.code == "METERID"
+
+    def test_the_rank_one_guard_is_latent_at_the_shipped_thresholds(self, matches):
+        """
+        Said out loud, because a guard nothing can reach looks exactly like a guard that
+        does not work.
+
+        `minimum_achievable_confidence` is `semantic_weight * fusion_alpha` = 0.63 and
+        `review_threshold` ships at 0.50, so no rank-1 match can score low enough to be
+        rejected -- which is also why every fixture above has to raise the bar. Narrowing
+        the strip to rank 1 therefore turned a rule that fired on every rejected runner-up
+        into one that fires NOWHERE at the shipped defaults. That is the intended trade:
+        it is a safety net for a caller who raises `review_threshold` past the floor, and
+        this is where it goes red if either number moves and makes rank-1 REJECT reachable
+        again without anyone having thought about it.
+        """
+        shipped = MatchingConfig()
+        assert shipped.review_threshold < shipped.minimum_achievable_confidence, (
+            f"review_threshold {shipped.review_threshold} is now at or above the rank-1 "
+            f"floor {shipped.minimum_achievable_confidence}, so a rank-1 REJECT ships"
+        )
+        assert not [m for m in matches if m.rank == 1 and m.is_rejected]
 
     def test_a_field_nothing_matches_produces_no_result_to_inherit_from(self):
         """
@@ -327,6 +432,48 @@ class TestRejectConfersNothing:
         such a field, so it reaches a human rather than being silently unclassified.
         """
         assert _matcher(governance=None, entries=[])._match_field(FIELD) == []
+
+
+# =============================================================================
+# THE LINE THAT DECIDES WHETHER THE GUARD ABOVE CAN FIRE
+# =============================================================================
+
+
+class TestTheReviewRejectBoundary:
+    """
+    `confidence >= review_threshold` is REVIEW; strictly below it is REJECT.
+
+    Pinned here rather than left to the decision tests because THIS file is the one that
+    depends on it: it is the only way a rank-1 REJECT exists to be guarded against, so a
+    boundary that quietly moved would make every REJECT test above vacuous. Both halves
+    are recorded as unpinned holes in `docs/mutation_survivors.md` -- the `>=` -> `>`
+    mutant survived, and so did moving `review_threshold` off 0.50.
+    """
+
+    def test_a_confidence_exactly_AT_the_threshold_is_reviewed_and_keeps_its_class(self):
+        top = _matcher(config=_thresholded(RANK_1_CONFIDENCE))._match_field(FIELD)[0]
+
+        assert top.final_confidence == RANK_1_CONFIDENCE, (
+            f"this fixture's rank-1 confidence moved to {top.final_confidence!r}; "
+            f"re-derive RANK_1_CONFIDENCE from the weights before trusting the boundary"
+        )
+        assert top.decision is MatchDecision.REVIEW, "the comparison is >=, not >"
+        assert top.governance is not None and top.governance.code == "METERID"
+
+    def test_one_ulp_of_threshold_higher_and_the_same_candidate_is_rejected(self):
+        """
+        The control on the test above: without it, "REVIEW at the threshold" would also
+        pass on a candidate sitting comfortably clear of it, and would say nothing about
+        where the boundary actually is. One unit in the last place is as close as two
+        floats get.
+        """
+        top = _matcher(config=_thresholded(math.nextafter(RANK_1_CONFIDENCE, 1.0)))._match_field(
+            FIELD
+        )[0]
+
+        assert top.final_confidence == RANK_1_CONFIDENCE
+        assert top.decision is MatchDecision.REJECT
+        assert top.governance is None
 
 
 # =============================================================================
@@ -372,12 +519,12 @@ def _class(code: str):
     return GovernanceVocabulary.from_json(THORNBURY).get(code)
 
 
-def _hand_built(*, decision: MatchDecision, **overrides) -> MatchResult:
+def _hand_built(*, decision: MatchDecision, rank: int = 1, **overrides) -> MatchResult:
     """A MatchResult built without the matcher, to pin the DOMAIN model's own rules."""
     return MatchResult(
         schema_field=FIELD,
         dictionary_entry=ENTRIES[0],
-        rank=1,
+        rank=rank,
         final_confidence=0.9,
         score_breakdown=ScoreBreakdown(),
         decision=decision,

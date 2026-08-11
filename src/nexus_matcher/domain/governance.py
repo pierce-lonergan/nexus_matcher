@@ -49,6 +49,12 @@ code, and an alias mapping to JSON `null` declares a token to be noise that must
 dropped. Both are explicit, so "we quietly dropped something" is not a thing that can
 happen unnoticed.
 
+One token means one thing. A token declared twice pointing at two different targets --
+whether by two classes, by two spellings that normalise alike, or by a class overriding a
+top-level `null` -- REFUSES the load. It used to resolve to whichever declaration came
+last, which is a coin toss deciding whether a field inherits a restricted tier or an open
+one. Restating the same mapping is not a conflict and stays legal.
+
 ## The JSON the caller supplies
 
 ```json
@@ -78,6 +84,7 @@ uses, so an unconfigured vocabulary cannot be mistaken for a configured one.
 from __future__ import annotations
 
 import json
+import unicodedata
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import lru_cache
@@ -106,7 +113,8 @@ OPEN_CLASSIFICATION = "UNCLASSIFIED"
 # still an edge; it just hides from `import nexus_matcher.domain`).
 #
 # `CLASSIFICATION_COLUMN_ALIASES` is the FREE-TEXT tier column, historically
-# `COLUMN_ALIASES["protection_level"]` and moved here unchanged.
+# `COLUMN_ALIASES["protection_level"]` and moved here almost unchanged -- see the note on
+# "pii" below for the one member that had to leave.
 CODE_COLUMN_ALIASES: tuple[str, ...] = (
     "governancecode",
     "protectionclass",
@@ -116,6 +124,20 @@ CODE_COLUMN_ALIASES: tuple[str, ...] = (
     "dataclasscode",
     "governanceclass",
 )
+# "pii" is deliberately NOT in this tuple, and used to be. It came over with the rest of
+# `COLUMN_ALIASES["protection_level"]`, where it was harmless: as a free-text tier alias, a
+# column named "PII" was just another place somebody might write a tier. Under the
+# derivation invariant the same membership asserts something else entirely -- that a row
+# under a `PII` column claims its TIER is "Yes" -- so `term,definition,governance_code,PII`
+# refused every coded row with a contradiction the row had never stated, and whether the
+# load survived depended on whether some other tier column happened to be there to mask it.
+#
+# The silent half is why it had to move rather than just be dropped. When an earlier tier
+# alias WAS present, "pii" lost the tier race and was then read by nothing, so a row
+# claiming personal information against a class declaring `personal_information: false`
+# reported nothing at all -- while `personal_data`, `is_personal_data` and
+# `contains_personal_data` all reported it. It is a flag column; it now lives with the
+# other flag columns below.
 CLASSIFICATION_COLUMN_ALIASES: tuple[str, ...] = (
     "protectionlevel",
     "classification",
@@ -123,7 +145,6 @@ CLASSIFICATION_COLUMN_ALIASES: tuple[str, ...] = (
     "governance",
     "governancestatus",
     "confidentiality",
-    "pii",
     "securityclassification",
 )
 
@@ -141,6 +162,8 @@ _PI_COLUMN_ALIASES: tuple[str, ...] = (
     "ispersonaldata",
     "ispersonalinformation",
     "containspersonaldata",
+    "pii",
+    "ispii",
 )
 _DIRECT_ID_COLUMN_ALIASES: tuple[str, ...] = (
     "directidentifier",
@@ -149,14 +172,74 @@ _DIRECT_ID_COLUMN_ALIASES: tuple[str, ...] = (
     "directidentifierflag",
 )
 
+# Every column name any of the four resolvers above can claim, behind the memoised
+# predicate `_is_governance_column` below.
+#
+# `problems_with()` keys its column-resolution cache on the subset of a row's keys that
+# passes that predicate, rather than on the whole row. CSV and Excel hand every row the same
+# key tuple, so the whole-row key worked and hid the problem; JSON, JSONL and
+# iterable-of-dicts sources hand each row back verbatim, so a sparse exporter produces one
+# cache entry per COMBINATION OF PRESENT COLUMNS, and twelve optional columns is 4096 of
+# them. The LRU is 64 wide, so one shape past that every lookup evicts the entry it is
+# about to need and the hit rate goes to zero -- a cliff, not a slope.
+#
+# Measured over 30,000 rows, whole-row key -> filtered key (median of 5): 1 shape
+# 34.2 -> 40.4 ms, 64 shapes 36.5 -> 44.0, 65 shapes 137.9 -> 44.5, 256 shapes
+# 147.5 -> 45.6, 4096 shapes 170.3 -> 48.2.
+#
+# Filtering is NOT free, and saying so is the point: it costs ~6 ms per 30k rows on the
+# uniform CSV shape, because it looks at every key of every row instead of hashing the
+# tuple whole. That is the trade -- a flat ~18% on the path that was already fine, to
+# delete a 3.5x cliff on the path that is not, inside an offline load that takes ~45 s.
+_ALL_GOVERNANCE_ALIASES: frozenset[str] = frozenset(
+    CODE_COLUMN_ALIASES
+    + CLASSIFICATION_COLUMN_ALIASES
+    + _PI_COLUMN_ALIASES
+    + _DIRECT_ID_COLUMN_ALIASES
+)
+
 _TRUE_WORDS = frozenset({"true", "yes", "y", "1", "t"})
 _FALSE_WORDS = frozenset({"false", "no", "n", "0", "f"})
 
 
+@lru_cache(maxsize=4096)
+def _norm_key_text(name: str) -> str:
+    """The memoised core of `_norm_key`, and of `_is_governance_column` below.
+
+    Keyed on a `str` rather than on the caller's object, because `True` and `1` are equal
+    and hash equal -- an object-keyed cache would answer `'1'` for a column literally named
+    `True`."""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
+
+
 def _norm_key(name: Any) -> str:
-    """Normalise a COLUMN name. Mirrors `ingest._norm_key`; kept local so the domain can
-    resolve its own columns without importing the application layer."""
-    return "".join(ch for ch in str(name).lower() if ch.isalnum())
+    """
+    Normalise a COLUMN name. Mirrors `ingest._norm_key`; kept local so the domain can
+    resolve its own columns without importing the application layer.
+
+    Memoised, because column names repeat massively -- a 30k-row glossary carries the same
+    dozen of them 30,000 times.
+
+    Deliberately NOT Unicode-normalised, unlike `_norm_code` below. This function has to
+    agree character for character with `ingest._norm_key` or the validator and the loader
+    read the same file differently, and `test_the_two_resolvers_agree` exists to catch the
+    day one of them changes without the other.
+    """
+    return _norm_key_text(name if isinstance(name, str) else str(name))
+
+
+@lru_cache(maxsize=4096)
+def _is_governance_column(name: str) -> bool:
+    """
+    Whether a column is one of the four this module reads, as ONE memoised lookup.
+
+    `problems_with()` runs this over every key of every row to build its cache key, so it is
+    the hottest thing in the module -- 450,000 calls on a 30k-row glossary with fifteen
+    columns. Folding the normalisation and the membership test into a single cached
+    predicate rather than doing `_norm_key(k) in _ALL_GOVERNANCE_ALIASES` per key was
+    measured at roughly half the cost of the two-step form.
+    """
+    return _norm_key_text(name) in _ALL_GOVERNANCE_ALIASES
 
 
 def _norm_code(value: Any) -> str:
@@ -168,14 +251,30 @@ def _norm_code(value: Any) -> str:
     three ways, and treating them as three codes would reject perfectly good rows. Note
     the consequence: a token that is nothing but punctuation normalises to the empty
     string and is therefore ABSENT, not unknown.
+
+    NFC first, because a combining accent is not alphanumeric and this function strips it.
+    An accented code therefore had two normalised forms -- the composed one an editor
+    types and the decomposed one macOS's filesystem and several exporters emit -- which
+    look identical everywhere a human reads them. Reproduced: a catalog declaring both
+    loaded as TWO classes with two different tiers, and `codes` showed the same word twice.
+    Which tier a row inherited then depended on which byte sequence its exporter chose.
     """
-    return "".join(ch for ch in str(value).upper() if ch.isalnum())
+    text = value if isinstance(value, str) else str(value)
+    return "".join(ch for ch in unicodedata.normalize("NFC", text).upper() if ch.isalnum())
 
 
 def _norm_tier(value: Any) -> str:
-    """Normalise a classification TIER for comparison only. The declared spelling is what
-    gets reported; this exists so "Sealed " and "sealed" are not a contradiction."""
-    return " ".join(str(value).split()).casefold()
+    """
+    Normalise a classification TIER for comparison only. The declared spelling is what
+    gets reported; this exists so "Sealed " and "sealed" are not a contradiction.
+
+    NFC for the same reason as `_norm_code`, and it bites harder here: `casefold()` does
+    not normalise, so a decomposed accent in the row against a composed one in the catalog
+    reads as a row contradicting itself, and at the default `governance_strict` that
+    REFUSES the entire glossary over two words that render identically.
+    """
+    text = value if isinstance(value, str) else str(value)
+    return " ".join(unicodedata.normalize("NFC", text).split()).casefold()
 
 
 def _as_bool(value: Any) -> bool | None:
@@ -242,12 +341,28 @@ class _GovernanceColumns(NamedTuple):
 @lru_cache(maxsize=64)
 def _governance_columns(columns: tuple[str, ...]) -> _GovernanceColumns:
     """
-    Resolve a row's column names once per HEADER, not once per row.
+    Resolve a row's GOVERNANCE column names once per shape, not once per row.
 
     `problems_with()` takes a row, so a naive implementation re-derives the mapping for
-    every row of a 30k-entry glossary. Memoising on the header tuple keeps the published
-    signature while paying for the resolution once; `ingest.load_entries` already hoists
-    exactly this kind of per-mapping work out of its row loop for the same reason.
+    every row of a 30k-entry glossary. Memoising keeps the published signature while paying
+    for the resolution once; `ingest.load_entries` already hoists exactly this kind of
+    per-mapping work out of its row loop for the same reason.
+
+    The caller filters the row's keys through `_is_governance_column` before calling, so the
+    key is the governance columns rather than the whole row -- see `_ALL_GOVERNANCE_ALIASES`
+    for the numbers. A TUPLE and not a frozenset: two spellings can normalise to the same key
+    and `normalised` below lets the last one win, so the order has to be the row's own.
+    Measured across six processes under `PYTHONHASHSEED=random`, a frozenset key resolved
+    the governance column three different ways, which would let the same file be refused on
+    one run and accepted on the next.
+
+    Do NOT hoist this to the header instead. `read_source` builds a header as the UNION of
+    every row's keys, so on a merged export where some rows spell it "Governance Code" and
+    others "Protection Class", a header-level resolver reads a column those rows do not
+    have. Demonstrated on a two-row file with an undeclared code in the second spelling:
+    refused today, and loaded SILENTLY under the hoist, carrying no code and not even a
+    `governance_code_raw`. Per-row resolution is the only thing checking heterogeneous
+    sources at all, and it is worth far more than the 0.4% of an index build it costs.
 
     Resolution is done HERE, over the tuples above, rather than by calling
     `ingest.map_columns`. Those are the same tuples the loader uses -- it imports them from
@@ -298,10 +413,24 @@ class GovernanceVocabulary:
         self,
         classes: Iterable[ProtectionClass] = (),
         open_classification: str = OPEN_CLASSIFICATION,
-        aliases: Mapping[str, str | None] | None = None,
+        aliases: Mapping[str, str | None] | Iterable[tuple[str, str | None]] | None = None,
     ) -> None:
         by_code: dict[str, ProtectionClass] = {}
         for protection_class in classes:
+            # The type check is here and not only in `from_json` because `from_json` is the
+            # friendly message and this is the invariant nothing walks past. It accepted
+            # `ProtectionClass(code=None)`: `_norm_code(None)` is 'NONE', so the empty-code
+            # check below never fired, and a class asserting it had NO code became the class
+            # every glossary cell spelling "none" inherited.
+            for field, value in (
+                ("code", protection_class.code),
+                ("classification", protection_class.classification),
+            ):
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError(
+                        f"a protection class has a {field} of {value!r}; it must be a "
+                        f"non-blank string. Coercing it would invent a class nobody declared."
+                    )
             key = _norm_code(protection_class.code)
             if not key:
                 raise ValueError("a protection class has an empty code")
@@ -312,8 +441,33 @@ class GovernanceVocabulary:
                 )
             by_code[key] = protection_class
 
+        # Aliases arrive as PAIRS, and every declaration in the file is one pair.
+        #
+        # `from_json` used to accumulate them into a dict keyed by the raw token, which
+        # collapsed byte-identical duplicates before this loop could ever see them -- and
+        # byte-identical is the likeliest duplicate there is, a maintainer copying a token
+        # verbatim from one part of a file to another. A duplicate-check added here alone
+        # was implemented and measured: it missed exactly those. Hence pairs.
+        #
+        # What the silence cost: two classes claiming one legacy spelling resolved
+        # positionally to whichever was declared LAST, so a restricted class and an open
+        # class both claiming "PAX-NM-OLD" loaded the passenger-name row as the open tier,
+        # with no problems reported and a strict load not refused. That is NM-0005's harm
+        # -- a field losing the classification it should have inherited -- reached through
+        # the catalog instead of through the row. In the other direction, a `null` "drop
+        # this token" declaration was silently promoted into a real class, contradicting
+        # this module's own docstring promise that quiet dropping cannot happen unnoticed.
+        declarations: Iterable[tuple[str, str | None]]
+        if aliases is None:
+            declarations = ()
+        elif isinstance(aliases, Mapping):
+            declarations = aliases.items()
+        else:
+            declarations = aliases
+
         resolved: dict[str, str | None] = {}
-        for token, target in (aliases or {}).items():
+        as_written: dict[str, str] = {}
+        for token, target in declarations:
             key = _norm_code(token)
             if not key:
                 raise ValueError(f"alias {token!r} normalises to nothing")
@@ -322,15 +476,29 @@ class GovernanceVocabulary:
                     f"alias {token!r} collides with the declared code "
                     f"{by_code[key].code!r}; an alias cannot shadow a real class"
                 )
-            if target is None:
-                resolved[key] = None
-                continue
-            target_key = _norm_code(target)
-            if target_key not in by_code:
+            target_key: str | None = None
+            if target is not None:
+                target_key = _norm_code(target)
+                if target_key not in by_code:
+                    raise ValueError(
+                        f"alias {token!r} points at {target!r}, which is not a declared code"
+                    )
+            if key in resolved and resolved[key] != target_key:
+                # Both spellings, as the caller wrote them: a normalised key is not
+                # searchable in their own file. Restating the SAME mapping is allowed --
+                # a rule that could not tell a restatement from a conflict would get worked
+                # around by deleting the restatement that documented the intent. This also
+                # handles null for free: None != 'CREWROSTER' conflicts, None == None does
+                # not.
                 raise ValueError(
-                    f"alias {token!r} points at {target!r}, which is not a declared code"
+                    f"alias {as_written[key]!r} is declared twice pointing at two "
+                    f"different things -- {as_written[key]!r} -> "
+                    f"{_alias_target_label(resolved[key], by_code)}, then {token!r} -> "
+                    f"{_alias_target_label(target_key, by_code)}. One of them would "
+                    f"silently win, so declare it once."
                 )
             resolved[key] = target_key
+            as_written.setdefault(key, token)
 
         if not str(open_classification).strip():
             raise ValueError("open_classification cannot be blank")
@@ -377,41 +545,55 @@ class GovernanceVocabulary:
         raw_classes, open_tier, raw_aliases = _split_document(document)
 
         classes: list[ProtectionClass] = []
-        alias_table: dict[str, str | None] = {
-            str(token): (None if target is None else str(target))
-            for token, target in raw_aliases.items()
-        }
+        # A LIST of pairs, not a dict. See the alias loop in `__init__` for why the dict
+        # was the bug rather than the storage.
+        alias_pairs: list[tuple[str, str | None]] = []
+        for token, target in raw_aliases.items():
+            if not isinstance(token, str) or not token.strip():
+                raise ValueError(
+                    f"alias token {token!r} is not a non-blank string; the keys of "
+                    f"'aliases' are the legacy tokens a glossary row can carry"
+                )
+            if target is not None and not isinstance(target, str):
+                raise ValueError(
+                    f"alias {token!r} points at {target!r}, which is "
+                    f"{type(target).__name__}; it must be a declared code or null"
+                )
+            alias_pairs.append((token, target))
 
         for index, raw in enumerate(raw_classes):
             if not isinstance(raw, Mapping):
                 raise ValueError(
                     f"protection class #{index} is {type(raw).__name__}, not an object"
                 )
-            code = str(raw.get("code", "")).strip()
-            if not code:
-                raise ValueError(f"protection class #{index} has no 'code'")
-            name = str(raw.get("name", "")).strip() or code
-            classification = str(raw.get("classification", "")).strip()
-            if not classification:
-                raise ValueError(
-                    f"protection class {code!r} has no 'classification'. The tier is what "
-                    f"a matched field inherits; a class without one cannot classify."
-                )
-            enhancement = raw.get("enhancement")
+            code = _required_text(
+                raw,
+                "code",
+                f"protection class #{index}",
+                "The code is the token a glossary row carries; there is nothing to derive "
+                "a tier from without one.",
+            )
+            subject = f"protection class {code!r}"
+            classification = _required_text(
+                raw,
+                "classification",
+                subject,
+                "The tier is what a matched field inherits; a class without one cannot classify.",
+            )
             classes.append(
                 ProtectionClass(
                     code=code,
-                    name=name,
+                    name=(_optional_text(raw, "name", subject) or "").strip() or code,
                     classification=classification,
                     personal_information=_required_bool(raw, "personal_information", code),
                     direct_identifier=_required_bool(raw, "direct_identifier", code),
-                    enhancement=None if enhancement is None else str(enhancement),
+                    enhancement=_optional_text(raw, "enhancement", subject),
                 )
             )
-            for token in raw.get("aliases", ()) or ():
-                alias_table[str(token)] = code
+            for token in _alias_tokens(raw, subject):
+                alias_pairs.append((token, code))
 
-        return cls(classes=classes, open_classification=open_tier, aliases=alias_table)
+        return cls(classes=classes, open_classification=open_tier, aliases=alias_pairs)
 
     @classmethod
     def empty(cls) -> GovernanceVocabulary:
@@ -504,7 +686,9 @@ class GovernanceVocabulary:
             the vocabulary's, because a message that reports only "invalid" sends the
             reader back to two files to work out which side is wrong.
         """
-        columns = _governance_columns(tuple(str(k) for k in row))
+        columns = _governance_columns(
+            tuple(name for name in map(str, row) if _is_governance_column(name))
+        )
         if columns.code is None:
             return []
 
@@ -512,10 +696,33 @@ class GovernanceVocabulary:
         status, protection_class = self._lookup(raw_code)
 
         if status == "unknown":
-            known = ", ".join(sorted(self.codes)) or "none -- no vocabulary is configured"
+            # The token and the SIZE of the vocabulary, never the vocabulary itself.
+            #
+            # `", ".join(sorted(self.codes))` used to sit here, in a branch that runs once
+            # per defective ROW, building an identical list every time -- and `codes` is a
+            # property that constructs a fresh frozenset per access. Measured over 30,000
+            # unknown-code rows: 50 ms at 9 classes, 726 ms at 400, 804 ms at 800, against a
+            # valid-code path that is flat at ~35 ms. Now flat at ~36 ms at every size.
+            #
+            # Caching the joined string does NOT fix it -- measured, still linear, because
+            # interpolating a 4,000-character list into 30,000 f-strings copies it 30,000
+            # times. Nor does caching touch the larger cost: under `governance_strict=False`,
+            # the escape hatch this module's own refusal message recommends, every one of
+            # those strings is RETAINED in `source_metadata`. Measured with tracemalloc at
+            # 400 classes: 127.1 MB holding one distinct value, against 7.4 MB now.
+            #
+            # The declared list belongs in the load summary, which is built once. Keep the
+            # exact phrase "no vocabulary is configured": two tests assert it by name,
+            # because "configured nothing" and "configured permissively" are different
+            # answers and the message is the only place a reader learns which one they have.
+            declared = (
+                f"{len(self._by_code)} code(s) are declared"
+                if self._by_code
+                else "no vocabulary is configured"
+            )
             return [
                 f"protection code {str(raw_code).strip()!r} is not in the configured "
-                f"vocabulary, so it is rejected rather than stored (declared codes: {known})"
+                f"vocabulary, so it is rejected rather than stored ({declared})"
             ]
 
         if protection_class is None:
@@ -573,7 +780,12 @@ def _split_document(
             f"a governance vocabulary must be a JSON object or array, got {type(document).__name__}"
         )
 
-    open_tier = str(document.get("open_classification") or OPEN_CLASSIFICATION)
+    # `or OPEN_CLASSIFICATION` already handled a null correctly; only a dict or a list
+    # slipped through, to be stringified into a Python repr and shipped as somebody's tier.
+    # A blank string is still left to `__init__`, which refuses it by name rather than
+    # quietly substituting the sentinel.
+    declared_open = _optional_text(document, "open_classification", "the vocabulary document")
+    open_tier = declared_open if declared_open else OPEN_CLASSIFICATION
     aliases = document.get("aliases") or {}
     if not isinstance(aliases, Mapping):
         raise ValueError("'aliases' must be an object mapping a legacy token to a code or null")
@@ -595,6 +807,103 @@ def _split_document(
         "no protection classes found. Supply them as a 'classes' array, as a bare array, "
         "or as a mapping of code -> attributes."
     )
+
+
+def _required_text(raw: Mapping[str, Any], key: str, subject: str, why: str) -> str:
+    """
+    Read a catalog string that CARRIES the classification, refusing to guess.
+
+    `_required_bool` below has refused to guess since it was written. The two fields that
+    actually decide what a field inherits had no such check, and the coercion ran before
+    the emptiness test: `str(None)` is `'None'`, which is not empty, so neither guard fired.
+
+    Both failures were silent and both were reproduced. A `"code": null` produced the code
+    `'None'`, which then matched every glossary cell spelling "none" or "N/A-as-none" -- so
+    a field asserting it has NO code inherited that class and `problems_with()` returned
+    `[]`. A `"classification": null` derived the literal tier `'None'`, which is a `str` and
+    therefore shipped over the wire as a tier nobody defined; worse, honest rows stating
+    their real tier then contradicted it, and `governance_strict` refused the whole load
+    blaming the glossary for a defect in the catalog.
+
+    Applies to `code` and `classification` ONLY. Everything else optional goes through
+    `_optional_text`, because null is a documented, load-bearing value in the rest of the
+    file -- see the note there.
+    """
+    value = raw.get(key)
+    if value is None:
+        # Distinguished from absent on purpose. "You wrote null" points at the line; "you
+        # have no 'code'" sends the reader looking for a key that is right in front of them.
+        if key in raw:
+            raise ValueError(f"{subject} has a {key!r} of null; it must be a string. {why}")
+        raise ValueError(f"{subject} has no {key!r}. {why}")
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{subject} has a {key!r} of {value!r}, which is {type(value).__name__}; "
+            f"it must be a string. {why}"
+        )
+    if not value.strip():
+        raise ValueError(f"{subject} has no {key!r}. {why}")
+    return value.strip()
+
+
+def _optional_text(raw: Mapping[str, Any], key: str, subject: str) -> str | None:
+    """
+    Read an optional catalog string. Absent or null means absent; anything non-string is a
+    defect rather than something to stringify.
+
+    Null stays MEANINGFUL here, which is why this is a second helper and not a flag on the
+    first. A single "reject null" rule applied to the field list this fix started from
+    rejects this repo's own example pack: five of its nine classes declare
+    `"enhancement": null`, and its alias map declares `"n/a": null` and `"tbc": null`. Both
+    are documented ways for a caller to say "nothing here" out loud, which is the whole
+    posture of this module.
+    """
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"{subject} has a {key!r} of {value!r}, which is {type(value).__name__}; "
+            f"it must be a string or null"
+        )
+    return value
+
+
+def _alias_tokens(raw: Mapping[str, Any], subject: str) -> list[str]:
+    """
+    A class's own alias list, refusing the two shapes that silently half-work.
+
+    The bare string is the one that mattered. `"aliases": "LEGACY-METER"` is iterable, so
+    the loop walked it CHARACTER BY CHARACTER and declared L, E, G, A, C, Y and M as
+    aliases of the class. Single-character aliases match nothing a glossary carries, so the
+    legacy spelling the caller was trying to declare stays unknown and every row using it
+    is refused -- for a reason that appears nowhere in their file.
+    """
+    declared = raw.get("aliases")
+    if declared is None:
+        return []
+    if isinstance(declared, (str, bytes)) or not isinstance(declared, Sequence):
+        raise ValueError(
+            f"{subject} has an 'aliases' of {declared!r}, which is "
+            f"{type(declared).__name__}; it must be a list of tokens. A bare string would "
+            f"be read one character at a time."
+        )
+    tokens: list[str] = []
+    for position, token in enumerate(declared):
+        if not isinstance(token, str) or not token.strip():
+            raise ValueError(
+                f"{subject} has an alias at position {position} of {token!r}; every alias "
+                f"must be a non-blank string"
+            )
+        tokens.append(token)
+    return tokens
+
+
+def _alias_target_label(target_key: str | None, by_code: Mapping[str, ProtectionClass]) -> str:
+    """How an alias target reads in a message: the code in its DECLARED spelling, or null."""
+    if target_key is None:
+        return "null (declaring the token droppable noise)"
+    return repr(by_code[target_key].code)
 
 
 def _required_bool(raw: Mapping[str, Any], key: str, code: str) -> bool:

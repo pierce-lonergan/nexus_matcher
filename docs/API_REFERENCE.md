@@ -8,7 +8,7 @@ Contents:
 
 1. [Python API](#python-api) — the primary and only benchmarked interface
 2. [CLI](#cli)
-3. [REST API](#rest-api) — health and introspection only
+3. [REST API](#rest-api) — matching, feedback, health and introspection
 4. [Domain types](#domain-types)
 5. [Not implemented](#not-implemented)
 
@@ -170,26 +170,105 @@ is also created for `uvicorn nexus_matcher.presentation.api.app:app`.
 
 | Method | Path | Response |
 |---|---|---|
-| GET | `/` | `{"service": "nexus-matcher", "version": "2.0.0", "docs": "/docs"}` |
+| POST | `/api/v1/match` | `MatchResponseView` — `results`, one entry per input field, keyed by the caller's own `path`, in the order sent. Field cap `NEXUS_API_MAX_FIELDS` (default 100). |
+| POST | `/api/v1/match/batch` | Identical contract and one shared implementation; the only difference is the cap, `NEXUS_API_MAX_BATCH_FIELDS` (default 250). |
+| POST | `/api/v1/feedback` | **201** and `FeedbackResponseView` — the stored record echoed back, server `receivedAt` included. Appended to `NEXUS_API_FEEDBACK_PATH`; **503** when that is unset, **422** on a malformed record, **500** when the append itself fails. |
+| GET | `/` | `{"service": "nexus-matcher", "version": …, "docs": "/docs"}`. `version` is the installed package's `__version__`, resolved at startup — this document used to print a literal here, and a literal is a second copy that drifts. |
 | GET | `/health` | `HealthResponse` — `status`, `timestamp`, `version`, `checks.uptime_seconds`. `status` is `healthy` unless a registered component is unhealthy, then `degraded`. |
 | GET | `/health/live` | `{"status": "alive"}` — Kubernetes liveness probe |
 | GET | `/health/ready` | `ReadinessResponse` — `ready`, `timestamp`, `components`. Returns **503** if any registered component is not ready. |
 | GET | `/health/startup` | `{"status": "started", "startup_time": ...}`. Returns **503** while starting. |
 | GET | `/docs`, `/redoc`, `/openapi.json` | Generated OpenAPI documentation |
 
+### The matching request body
+
+`FieldSpec` sets `extra="forbid"`, so an unrecognised key is a **422** rather than a
+silently dropped input — a misspelled `documentation` would drop the column comment, and
+the column comment is real retrieval signal.
+
+| Key | Required | Meaning |
+|---|---|---|
+| `name` | yes | The column's own name. |
+| `path` | no | The caller's identifier, and the key the response is keyed by. Defaults to `name`. A **dotted** path is strongly preferred: the segment before the last dot becomes the query's parent context, the single largest accuracy factor measured on this task. |
+| `doc` | no | Column comment or description. |
+| `type` | no | Source type name, normalised server-side. Unknown types are accepted. |
+
+Plus `top_k` (default 5; a value above the server's `results_per_field` is a 422 naming
+the cap) and `explain` (default false).
+
+Worked request, response and failure modes: [GOVERNANCE.md](GOVERNANCE.md#matching-over-http).
+
+Both match routes answer **503** until a dictionary is loaded — see
+[DEPLOYMENT.md](DEPLOYMENT.md#2-environment-configuration) for the variables that load one.
+
+### Published failure responses
+
+Enumerated from a live `/openapi.json`, not from this document's memory: **15 non-2xx
+responses across 5 routes**, every one of them `ErrorResponse`. So a generated client gets
+the same typed DTO — `{"error": {"code", "message", "details"}}` — on every documented
+failure, and never a bare map on some of them.
+
+The two match routes publish an identical set; they are one implementation behind two field
+caps.
+
+| Route | Status | Code | When |
+|---|---|---|---|
+| `POST /api/v1/match`, `POST /api/v1/match/batch` | **413** | `NEXUS-8004` | Two different refusals under one status. More fields than the route's cap: `details.fields` and `details.limit`. Or a raw body over the server's byte cap, answered by middleware *before* the body is parsed: `details.limit_bytes`, `details.observed_bytes` and `details.source` (`content-length` or `stream`). |
+| `POST /api/v1/match`, `POST /api/v1/match/batch` | **422** | `NEXUS-8004` | Malformed request; `details.violations` names the offending field. |
+| `POST /api/v1/match`, `POST /api/v1/match/batch` | **500** | `NEXUS-6000`, `NEXUS-1003` | The matcher failed (`NEXUS-6000`, `details.cause`), this layer refused a response whose field count or keys did not conserve (`NEXUS-6000`, `details.fields_in` and `details.results_out`), or the matcher object has drifted from what this surface calls (`NEXUS-1003`). No field was classified — treat the request as unanswered, not as a partial answer. |
+| `POST /api/v1/match`, `POST /api/v1/match/batch` | **503** | `NEXUS-1002`, `NEXUS-8000` | No dictionary loaded (`NEXUS-1002`), or the request was shed by admission control with the pool already full (`NEXUS-8000`, `details.capacity` and `details.in_flight`). |
+| `POST /api/v1/match`, `POST /api/v1/match/batch` | **504** | `NEXUS-6002` | `NEXUS_API_DEADLINE_SECONDS` (default 25.0) fired before matching finished; `details.deadline_seconds`. The work may still be running — the deadline promises a response, not a stop. |
+| `POST /api/v1/feedback` | **422** | `NEXUS-8004` | Malformed record. |
+| `POST /api/v1/feedback` | **500** | `NEXUS-6000` | The append failed; `details.cause`. **Nothing was recorded** — do not treat the verdict as filed. |
+| `POST /api/v1/feedback` | **503** | `NEXUS-1002` | `NEXUS_API_FEEDBACK_PATH` is unset. |
+| `GET /health/ready` | **503** | `NEXUS-8000` | Not ready; `details.components` names the component that is red. |
+| `GET /health/startup` | **503** | `NEXUS-8000` | Startup has not completed; no component has reported in yet. |
+
+**413 and 504 are the two a client author cannot guess**, which is why they were the
+expensive omission: a Java client generated from a spec that published neither has no branch
+for the status the chunking path depends on, and none for the one that ends a long request.
+
+`GET /health` and `GET /health/live` publish no failure at all, because neither can fail:
+`/health` answers 200 with `status: "degraded"` when a component is red, and `/health/live`
+returns a constant. Do not point a rollout gate at either — see the readiness paragraph
+below.
+
+**404 and 405 are answered but not published**, and they cannot be: they are raised by the
+router, so no path object in the spec owns them. They carry the same `{"error": {…}}`
+envelope as everything above, and the 405 keeps its `Allow` header.
+
 Middleware and behaviour that does exist:
 
 - Request-ID middleware. Reads `X-Request-ID` or generates one; echoes `X-Request-ID`
-  and `X-Response-Time-Ms` on every response.
-- CORS, currently `allow_origins=["*"]` — narrow this before exposing the service.
-- Exception handlers mapping `NexusMatcherError` to its status code and everything else
-  to a 500 with error code `NEXUS-1000`.
+  and `X-Response-Time-Ms` on every response — verified on 200, 201, 404, 405, 413, 422,
+  500, 503 and 504. The 413 is answered by the body-size middleware, which sits *outside*
+  this one, so it stamps the two headers itself and hands its id down in the ASGI scope;
+  that is what makes the client's 413 and the server's log line for the same request
+  joinable on one id.
+- CORS, only when `NEXUS_API_CORS_ORIGINS` names the origins that may use a browser.
+  Empty is the default and mounts no `CORSMiddleware` at all; methods are narrowed to
+  `GET`, `POST`, `OPTIONS`; `NEXUS_API_CORS_ALLOW_CREDENTIALS=true` alongside `*` is
+  refused at startup rather than quietly reflecting the caller's own origin.
+- Exception handlers mapping `NexusMatcherError` to its status code and any unhandled
+  exception to a 500 with error code `NEXUS-1000`. Two more join them so that one service
+  answers in one shape: a `StarletteHTTPException` handler renders 404, 405 and the health
+  503s (the 405 keeps its `Allow: POST`), and a `RequestValidationError` handler replaces
+  FastAPI's `{"detail": [...]}`. Every failure body is `{"error": {code, message,
+  details}}` — verified: 404, 405 and 422 all have exactly the top-level key `error`.
 
-The `components` map reported by `/health/ready` is populated in the lifespan handler
-with hardcoded `True` values for `api`, `config`, `vector_store` and `cache`. It does
-**not** currently probe a real vector store or cache connection — the code paths that
-would do so are empty `try` blocks. Treat readiness as "the process started", not "the
-dependencies are reachable".
+The `components` map reported by `/health/ready` carries `api`, `config` and `matcher`.
+`api` and `config` are still hardcoded `True`. `matcher` is a real check: it is `False`
+when no dictionary loaded, which is the misconfiguration a rollout is most likely to
+produce, and the map is repeated in the 503 body so an operator can see which component is
+red rather than only that something is. Under `NEXUS_API_MATCHING_OPTIONAL` it disappears
+from the map when no dictionary was configured, and survives as a non-gating `False` when
+one *was* named and failed to load — the opt-out excuses a deployment that wants no
+matcher, not one whose matcher is broken.
+
+`vector_store` and `cache` were removed from the map. They were set `True` inside `try`
+blocks whose bodies were comments, so they could never be anything else, and a component
+that cannot fail is a claim rather than a check. Nothing here probes a vector store or a
+cache connection today.
 
 ---
 
@@ -273,13 +352,13 @@ It is listed here so that nobody re-derives it from an old copy.
 
 | Documented previously | Reality |
 |---|---|
-| `POST /match` | No matching endpoint exists. Matching over HTTP is not implemented. |
-| `POST /batch` | Not implemented. Use `BatchProcessor` in-process. |
+| `POST /match` | The path is `/api/v1/match` (see the route table above). This row previously denied the endpoint; that denial is retracted. |
+| `POST /batch` | The path is `/api/v1/match/batch`. `BatchProcessor` remains the in-process route. |
 | `GET/POST/PUT/DELETE /dictionary`, `GET /dictionary/{id}` | No dictionary CRUD endpoints. |
 | `POST /cache/clear`, `GET /cache/stats` | No cache endpoints. |
 | `GET /metrics` (Prometheus) | Not routed. A `PrometheusMetrics` backend class exists in `nexus_matcher.shared.metrics`, but no endpoint exposes it. |
 | `GET /ready` | The path is `/health/ready`. |
-| API key auth via `NEXUS_API_KEY` / `X-API-Key` | No authentication dependency is attached to any route. The OpenAPI description text mentions it; the code does not implement it. |
+| API key auth via `NEXUS_API_KEY` / `X-API-Key` | No authentication dependency is attached to any route, and `/openapi.json` carries no `securitySchemes`. The description used to offer the header and name the variable; it now says the service ships unauthenticated and repeats neither, so nobody sends a credential believing it is checked. |
 | Rate limiting | No rate-limiting middleware is installed. |
 | `nexus-matcher batch-match` | Not a CLI command. The commands are `match`, `sync`, `api`, `info`. |
 | `NexusMatcher(config_path="config.yaml")` | Not a valid constructor call. |

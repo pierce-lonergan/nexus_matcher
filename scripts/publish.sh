@@ -60,6 +60,35 @@ if [[ "$TARGET" == "build" ]]; then
     exit 0
 fi
 
+# ---------------------------------------------------------------------------
+# Release preflight -- the gate that stands between this artifact and PyPI.
+#
+# `twine check` reads the metadata. It cannot see any of what shipped broken in
+# 2.0.0: a console script installed without the dependencies it needs, a CLI that
+# crashed on a legacy Windows codepage, an `__all__` entry that broke
+# `from nexus_matcher import *` on a default install. Only .github/workflows/publish.yml
+# ran release_preflight.py, so the CI path was gated and THIS path -- the one a human
+# uses, under time pressure, when CI is red or slow -- was not.
+#
+# `--wheel` rather than letting the preflight build its own: the point is to check the
+# file that is about to be uploaded. A preflight that builds a second wheel proves
+# something about a file nobody publishes, which is the same class of mistake as the
+# stale `dist/` artifact that a review read as evidence of a shipped release.
+# ---------------------------------------------------------------------------
+log_info "Running release preflight on the wheel that will be uploaded..."
+shopt -s nullglob
+WHEELS=(dist/*.whl)
+shopt -u nullglob
+if [[ ${#WHEELS[@]} -ne 1 ]]; then
+    log_error "Expected exactly one wheel in dist/, found ${#WHEELS[@]}. Aborting publish."
+    exit 1
+fi
+if ! python scripts/release_preflight.py --wheel "${WHEELS[0]}"; then
+    log_error "Release preflight failed! Aborting publish."
+    log_error "It exits non-zero on any failed check; do not upload past it."
+    exit 1
+fi
+
 # Confirm before publishing
 echo ""
 if [[ "$TARGET" == "test" ]]; then
