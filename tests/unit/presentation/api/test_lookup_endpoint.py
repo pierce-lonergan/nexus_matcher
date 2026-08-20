@@ -82,7 +82,17 @@ RESPONSE_KEYS = ("results", "missing", "vocabulary")
 # is named here as scoring -- and until somebody decides which,
 # `test_the_entry_surface_is_the_candidate_surface_minus_the_match` says so out loud.
 MATCH_ONLY_CANDIDATE_KEYS = frozenset(
-    {"rank", "confidence", "decision", "absoluteScore", "explain"}
+    {
+        "rank",
+        "confidence",
+        "decision",
+        "absoluteScore",
+        "explain",
+        # Where the ANSWER came from -- retrieval, or a human who already decided this
+        # column. A statement about how one field was matched, which a glossary row
+        # cannot have: an entry sitting in a dictionary was not answered by anything.
+        "provenance",
+    }
 )
 
 

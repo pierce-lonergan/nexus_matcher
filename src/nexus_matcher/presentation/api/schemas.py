@@ -32,11 +32,17 @@ built against.
 
 from __future__ import annotations
 
+from enum import Enum
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from nexus_matcher.domain.models.entities import FieldDecision
+from nexus_matcher.domain.services.review_evidence import (
+    Agreement,
+    Separation,
+    max_qualifier_segments,
+)
 from nexus_matcher.shared.types.base import MatchDecision
 
 # =============================================================================
@@ -92,6 +98,19 @@ MAX_REQUEST_SIGNAL_CHARS = 524_288
 # module owns it. `MAX_REQUEST_SIGNAL_CHARS` is exported so that fix is a one-line change
 # there rather than a second literal.
 MAX_FIELD_SPEC_CHARS = _MAX_NAME + _MAX_PATH + _MAX_DOC + _MAX_TYPE + _MAX_FIELD_SIGNAL_CHARS
+
+# The ceiling on `consistency_qualifier_segments`, DERIVED from the path bound rather than
+# typed.
+#
+# It used to be the literal 8, which is a guess wearing a bound's clothes: it refused
+# nothing this endpoint can distinguish and admitted five values it cannot. A concept key
+# is built from the caller's own `path`, which is capped at `_MAX_PATH` characters, and
+# `max_qualifier_segments` turns a character budget into the largest number of qualifier
+# segments that can still change a key -- past that point the grouping slices the same
+# segment list and produces byte-identical keys, so a larger value is inert rather than
+# refused. Deriving it means a change to `_MAX_PATH` moves this with it instead of leaving
+# a stale literal that says a value is out of range when the paths grew past it.
+MAX_QUALIFIER_SEGMENTS = max_qualifier_segments(_MAX_PATH)
 
 
 def _signal_map_chars(value: Any, depth: int = 0) -> int:
@@ -293,6 +312,63 @@ class MatchRequest(BaseModel):
             "overrides the same key. The abbreviation overlay belongs here rather than on "
             "a field: it is a catalog, and it is scoped to this one request -- nothing "
             "about it survives into the next. " + _SIGNALS_DESCRIPTION
+        ),
+    )
+    # The two evidence flags. Both default false and both are strictly ADDITIVE: with
+    # neither set the response is byte-identical to the one this service sent before they
+    # existed, which `test_review_evidence_wire.TestAdditive` asserts on the bytes rather
+    # than on parsed JSON, because a re-ordering survives a parse and this body is diffed.
+    contrast: bool = Field(
+        default=False,
+        description=(
+            "Include a pairwise contrast between each field's rank 1 and rank 2: which "
+            "signals separated them, by how much, and whether any single one of them "
+            "accounts for the margin. Answers 'why not the other one', which the "
+            "per-candidate `explain` block cannot -- it describes one candidate, and a "
+            "reviewer's question is a subtraction. Independent of `explain`: the contrast "
+            "carries the differences it needs, so a caller can have the comparison without "
+            "the full weight breakdown on every candidate."
+        ),
+    )
+    consistency: bool = Field(
+        default=False,
+        description=(
+            "Include a cross-field consistency report: columns this request believes are "
+            "the same business concept, and whether their rank-1 answers agree. REPORTING "
+            "ONLY -- nothing in `results` or `fieldDecisions` changes, whatever it finds.\n\n"
+            "UNPROVEN, AND OFF BY DEFAULT FOR THAT REASON. The grouping that decides which "
+            "columns are 'the same concept' has been measured against schemas whose answers "
+            "are known by construction, and on a repeated-leaf schema -- one leaf name "
+            "governed separately in each of ~30 domains, the shape this feature was "
+            "proposed for -- the loosest key scores pair-precision 0.0233 and emits four "
+            "groups of which FOUR ARE COLLISIONS and none is a concept. Read "
+            "`consistency_qualifier_segments` before turning this on."
+        ),
+    )
+    consistency_qualifier_segments: int = Field(
+        default=1,
+        ge=0,
+        le=MAX_QUALIFIER_SEGMENTS,
+        description=(
+            "How many of a column's nearest DECLARED path segments join its leaf in the "
+            "concept key.\n\n"
+            "1 -- the default -- means two columns are one concept only when they share a "
+            "leaf AND the record they hang off. On every schema in this repository's "
+            "generated corpus that setting produces NO GROUPS AT ALL, so it reports "
+            "nothing and can therefore claim nothing false. It is the default because the "
+            "alternative was measured and is worse: at 0 the key is the leaf alone, which "
+            "scores pair-precision 0.86-1.00 on a parent-diverse mixture and 0.0233 on a "
+            "repeated-leaf schema, where all four groups it emits merge distinct concepts. "
+            "No setting of this parameter, or of any other, reaches precision above 0.024 "
+            "while reporting anything at all on that shape -- established by searching 684 "
+            "policies, not by observing one fixture.\n\n"
+            "Segments are boundaries you declared (dots, or the `__` array boundary), never "
+            "single underscores -- those are tokens inside a segment. A flattened name from "
+            "a nested-but-array-free schema therefore has ONE segment, and every value of "
+            "this parameter produces the same key for it. Values above the deepest path in "
+            "your request are inert rather than refused; the ceiling is derived from the "
+            "`path` length bound and is the largest value that can change any key this "
+            "endpoint accepts."
         ),
     )
 
@@ -524,6 +600,19 @@ class SourceMetadataView(BaseModel):
     )
 
 
+class MatchProvenanceView(str, Enum):
+    """Where a candidate came from. The library's OWN vocabulary, so it closes.
+
+    A caller-supplied vocabulary must never close -- a generated client that refuses a
+    value a newer deployment sends is worse than one that carries it. This is the opposite
+    case: these two values are decided here, and a third would be a change this library
+    made deliberately.
+    """
+
+    RETRIEVAL = "RETRIEVAL"
+    APPROVED_PAIR = "APPROVED_PAIR"
+
+
 class MatchCandidateView(BaseModel):
     """One candidate for one field. `explain` is absent unless the request asked for it."""
 
@@ -591,6 +680,30 @@ class MatchCandidateView(BaseModel):
             "back from `GET /api/v1/lookup/{id}` for the same id, so a caller can feed a "
             "looked-up entry and a matched one into one code path. Present on every "
             "candidate, with an empty `values` when the entry carries none."
+        )
+    )
+    # APPENDED after `sourceMetadata`, same rule as every member above it: `explain` stays
+    # the last key of the object.
+    #
+    # This member exists because `confidence` alone CANNOT identify where an answer came
+    # from. The bypass writes `confidence = 1.0`, and shipped source used to assert that
+    # value was "outside the range the model can produce" -- it is not. The default weights
+    # sum to exactly 1.0 and every signal caps at 1.0, so ordinary retrieval reaches 1.0
+    # whenever all five are maximal; two independent constructions did it. A reviewer's
+    # answer and a very good match were indistinguishable on `(confidence, decision)`.
+    #
+    # A value that says where the answer came from cannot collide with a score, which is
+    # why this is a member rather than a cleverer sentinel. Closed set: these are the
+    # library's own vocabulary, not the caller's.
+    provenance: MatchProvenanceView = Field(
+        description=(
+            "Where this candidate came from. `RETRIEVAL` means the pipeline scored it; "
+            "`APPROVED_PAIR` means a reviewer decided it and matching was skipped. Read "
+            "this, NOT `confidence`, to tell the two apart: a retrieved candidate can "
+            "legitimately reach `confidence` 1.0, so the number is not a discriminator. "
+            "An `APPROVED_PAIR` candidate carries no `absoluteScore` and no `explain`, "
+            "because nothing measured it -- absent rather than zero, since zero would be "
+            "a measurement nobody took. Present on every candidate, never null."
         )
     )
     explain: ExplainView | None = None
@@ -743,6 +856,316 @@ class ScoringContractView(BaseModel):
     )
 
 
+class SignalDifferenceView(BaseModel):
+    """
+    One weighted signal's contribution to the margin between rank 1 and rank 2.
+
+    `delta` is EXACTLY the subtraction a reader would do on the two candidates'
+    `explain.scores` entries -- both operands are rounded to the published precision
+    before they are subtracted, so a reviewer redoing it by hand gets this number and not
+    one that disagrees in the last place.
+    """
+
+    signal: str = Field(
+        description=(
+            "The signal's name, the same key it carries in `explain.scores` and `explain.weights`."
+        )
+    )
+    topScore: float
+    runnerUpScore: float
+    delta: float = Field(description="`topScore - runnerUpScore`. Negative where rank 2 won it.")
+    weight: float = Field(
+        description="The live matcher's weight for this signal, as `explain.weights` reports it."
+    )
+    weightedDelta: float = Field(
+        description=(
+            "`delta * weight`: this signal's share of the confidence gap. The shares sum "
+            "to `confidenceGap`, and the service refuses the response rather than send one "
+            "where they do not."
+        )
+    )
+    separating: bool = Field(
+        description=(
+            "False when the two scores differ by no more than `contrast.resolution` -- the "
+            "smallest difference the published numbers can express. A signal that is not "
+            "separating is never named as a cause: a reason invisible in the artifact the "
+            "reviewer is holding is an invented one."
+        )
+    )
+    deciding: bool = Field(
+        description=(
+            "True when removing this signal's contribution would leave rank 2 level with "
+            "or ahead of rank 1. Arithmetic, not judgement -- and it can be true of none "
+            "of them, which means no single signal carried the margin. Always false on a "
+            "`TIED` contrast, where nothing decided the order."
+        )
+    )
+
+
+class ContrastView(BaseModel):
+    """
+    Rank 1 against rank 2 for one field: what separated them and what decided it.
+
+    ## The question this answers, and the one `explain` answers
+
+    `explain` reports why the winner scored what it did. A reviewer looking at a
+    surprising match does not want a weight breakdown -- the weights are the same for
+    every candidate and are already published. They want to know why not the other one,
+    and that is a subtraction between two candidates rather than a description of one.
+
+    ## What is deliberately NOT claimed
+
+    A difference at or below `contrast.resolution` is not reported as separating and can
+    never be named as a cause. When the whole margin is at or below it, `separation` is
+    `TIED`, `largestDifference` is null and `decidingSignals` is empty: the order came
+    from the matcher's own sort, and dressing a sort order up as a finding is how a
+    review surface starts producing reasons that are not reasons. The per-signal
+    differences are still reported on a tie, because two signals that disagree and cancel
+    is precisely the case worth seeing.
+
+    ## The two facts that are not about scoring at all
+
+    `governanceDiffers` and `domainDiffers` come from the two dictionary ENTRIES rather
+    than from any signal, and they are usually what settles a review: that rank 1 is a
+    direct-identifier class and rank 2 is not is the deciding fact far more often than a
+    fourth-decimal score difference is. They are read from the entries' own codes, so a
+    rank-1 REJECT -- which carries no class by design -- does not read as "these two are
+    classified differently".
+    """
+
+    topGovernanceId: str
+    runnerUpGovernanceId: str
+    topConfidence: float
+    runnerUpConfidence: float
+    confidenceGap: float = Field(
+        description=(
+            "`topConfidence - runnerUpConfidence`. Comparable WITHIN this field only -- "
+            "see `contrast.comparability` -- because `confidence` is, and a difference is "
+            "no more comparable than its operands."
+        )
+    )
+    signalGap: float = Field(
+        description=(
+            "The same margin reached the other way: the sum of every `weightedDelta`. "
+            "Published so the arithmetic can be checked from the response alone. The "
+            "service verifies the two against each other and refuses to answer rather than "
+            "send a contrast that does not close."
+        )
+    )
+    # CLOSED, and a named component, for the same reason `MatchDecision` and
+    # `FieldDecision` are: this is the LIBRARY'S OWN word for a state it computes, not a
+    # caller's taxonomy, so the set of values is ours to freeze and a generated client is
+    # entitled to a real enum for it. Nothing caller-supplied closes anywhere on this wire
+    # -- governance codes, protection classes, tiers, domains and concepts all stay open
+    # strings -- and this does not widen that rule, it applies it consistently.
+    separation: Separation = Field(
+        description=(
+            "`SEPARATED` when the margin exceeds `contrast.resolution`; `TIED` when it does "
+            "not, meaning the two candidates are level in every number this response "
+            "publishes and the ordering between them came from the matcher's sort."
+        )
+    )
+    largestDifference: str | None = Field(
+        description=(
+            "The separating signal with the largest weighted difference -- the headline "
+            "answer to 'what separated these two'. Null on a `TIED` contrast, and null when "
+            "no signal differs by more than the resolution."
+        )
+    )
+    decidingSignals: list[str] = Field(
+        description=(
+            "Every signal whose removal would leave rank 2 level with or ahead of rank 1. "
+            "EMPTY IS A REAL ANSWER and the common one on a wide margin: it means no single "
+            "signal carried it. Always empty on a `TIED` contrast."
+        )
+    )
+    governanceDiffers: bool = Field(
+        description=(
+            "Whether the two entries carry different protection codes. Read from the "
+            "entries, not from the resolved `governance` on the candidates, so a rank-1 "
+            "REJECT does not read as a difference that is not there."
+        )
+    )
+    domainDiffers: bool = Field(description="Whether the two entries declare different domains.")
+    signals: list[SignalDifferenceView] = Field(
+        description=(
+            "One entry per weighted signal, LARGEST WEIGHTED DIFFERENCE FIRST, with ties "
+            "broken by the order the signals are declared in so two identical requests "
+            "order this list identically."
+        )
+    )
+
+
+class ContrastReportView(BaseModel):
+    """
+    The contrast block: one entry per input field, present only when `contrast` was asked
+    for.
+
+    `fields` carries EVERY input path in the order it was sent, exactly like `results` and
+    `fieldDecisions`, with an explicit null for a field that has no runner-up to contrast.
+    "This field had one candidate" and "this pass skipped it" must not look alike.
+    """
+
+    resolution: float = Field(
+        description=(
+            "The smallest difference the numbers in this response can express, which is "
+            "the precision every published float is rounded to. Nothing below it is "
+            "reported as separating and nothing below it is named as a cause."
+        )
+    )
+    comparability: dict[str, Any] = Field(
+        description=(
+            "The scale contract for the contrast's own numbers, in the vocabulary "
+            "`scoring.comparabilityScopesNarrowestFirst` publishes. `confidenceGap` names "
+            "the scope of the gap; `signals` names the scope of each signal's `delta` and "
+            "`weightedDelta`. Derived from `scoring.comparability` rather than restated, so "
+            "a number whose scope changes cannot keep a stale entry here."
+        )
+    )
+    fields: dict[str, ContrastView | None] = Field(
+        description=(
+            "One entry per input field, keyed and ordered exactly like `results`. Null "
+            "where the field has fewer than two candidates."
+        )
+    )
+
+
+class ConceptGroupView(BaseModel):
+    """
+    One group of columns this request believes are the same business concept, and the
+    answers they got.
+
+    `majorityGovernanceId` IS NOT AN INSTRUCTION. It is published so a reviewer can see
+    where the weight of evidence sits; nothing in this library applies it, and
+    `consistency.promotionApplied` is false for that reason.
+    """
+
+    concept: str = Field(
+        description=(
+            "The concept key, as a printable label: the qualifier segments, the leaf's "
+            "normalised tokens, its class word and the data type, separated by `|`. Stable "
+            "for a given request and grouping policy, so it can be quoted in a ticket, but "
+            "it is a grouping artifact rather than a name anyone chose -- do not key a "
+            "downstream system on it."
+        )
+    )
+    fields: list[str] = Field(description="The group's members, in the order they were sent.")
+    answers: dict[str, str | None] = Field(
+        description=(
+            "Each member's rank-1 governance id, or null where the field has no answer to "
+            "give -- no candidates, or a `fieldDecisions` verdict of NO_MATCH, which "
+            "inherits nothing. A null is SILENCE, not a dissenting answer: counting it as "
+            "one would report a disagreement in a group where only one column was answered."
+        )
+    )
+    distinctAnswers: int = Field(description="How many different non-null answers the group got.")
+    # CLOSED, and a named component -- see the note on `ContrastView.separation`.
+    agreement: Agreement = Field(
+        description=(
+            "`AGREE` when two or more members answered and all agree, `DISAGREE` when two "
+            "or more answered and they do not, `UNDECIDED` when fewer than two members "
+            "answered at all. `UNDECIDED` is deliberately not `AGREE`: one answer and five "
+            "blanks is not five columns confirming each other.\n\n"
+            "A `DISAGREE` is only evidence about the matcher if the GROUP is real. Read it "
+            "beside `distinctAnswers`: a group whose `distinctAnswers` approaches its "
+            "member count is a collision in the grouping, not a contradiction in the "
+            "answers. Measured on a repeated-leaf schema at `qualifierSegments` 0, four of "
+            "four `DISAGREE` findings were that."
+        )
+    )
+    majorityGovernanceId: str | None = Field(
+        description=(
+            "The modal answer within the group, or null when no single answer holds a "
+            "plurality. Evidence, never an instruction -- see this model's docstring."
+        )
+    )
+    majorityCount: int = Field(
+        description="How many members gave the majority answer; 0 when there is none."
+    )
+
+
+class ConsistencyReportView(BaseModel):
+    """
+    The consistency block, present only when `consistency` was asked for.
+
+    ## Why this is deployable without labelled data
+
+    Fields are matched one at a time and independently, which throws away a constraint
+    that costs nothing to check: two columns that are the same concept should get the same
+    answer. Nothing enforces that, and -- the part that matters -- nothing NOTICES when it
+    fails. Detecting the disagreement does not require knowing which answer is right,
+    which is what makes this shippable today.
+
+    ## Why it reports and does not override
+
+    Promoting a group's majority is a decision that can be wrong in a NEW way: it can move
+    a correct answer to an incorrect one, which surfacing a disagreement cannot.
+    `promotionApplied` is false and is published as a fact about this response rather than
+    left implicit.
+
+    ## Grouping is the whole difficulty, and IT IS NOT SOLVED
+
+    Too loose and distinct concepts merge, which MANUFACTURES disagreement and fills a
+    reviewer's queue with findings that were never real. Too tight and nothing groups.
+
+    Measured against generated schemas whose answers are known by construction, pair-wise,
+    over the columns the fixture has a single unambiguous answer for:
+
+        profile             qualifierSegments   precision   recall   groups   collisions
+        repeated-leaf                       0      0.0233   1.0000        4        4 of 4
+        repeated-leaf                    >= 1         n/a   0.0000        0             -
+        parent-diverse mix                  0      0.8571-      0.0647-     -    0-2 of 30+
+                                                   1.0000       0.1371
+        parent-diverse mix               >= 1         n/a   0.0000        0             -
+
+    On the repeated-leaf shape -- one leaf name governed separately in each of ~30 domains,
+    which is the construction this feature was proposed for -- the loose key merges 87
+    columns spanning 29 distinct correct answers and reports them as contradicting each
+    other. Every one of the four findings it produces is a false positive. Searching all
+    684 policies in the published space finds none that reports anything on that shape at a
+    precision above 0.024.
+
+    SO THE DEFAULT REPORTS NOTHING RATHER THAN REPORTING WRONGLY. `consistency` is off, and
+    when it is switched on `consistency_qualifier_segments` defaults to 1, which emits no
+    group on any generated profile. The loose key is one integer away for a deployment that
+    has measured its own schemas, and the numbers are on the parameter.
+
+    HOW TO READ A FINDING YOU DID ASK FOR. `grouping` publishes the policy that produced
+    these groups, because a finding cannot be judged without the rule that made it. Compare
+    every group's `distinctAnswers` against its member count: when the two are close the
+    group is a collision and the disagreement is the grouping's, not the matcher's.
+    """
+
+    grouping: dict[str, Any] = Field(
+        description=(
+            "The policy these groups were built under: `qualifierSegments`, "
+            "`includeDataType`, `orderSensitive` and `minGroupSize`. Published because a "
+            "finding cannot be judged without the rule that produced it."
+        )
+    )
+    groupsFound: int
+    fieldsGrouped: int = Field(
+        description=(
+            "How many of this request's fields fell into a group of two or more. A column "
+            "that shares its concept with nothing else is not reported: it cannot disagree "
+            "with anyone."
+        )
+    )
+    groupsDisagreeing: int = Field(description="How many groups have `agreement` of DISAGREE.")
+    promotionApplied: bool = Field(
+        description=(
+            "Always false. This block changed nothing in `results` or `fieldDecisions`, "
+            "and states so machine-readably rather than leaving a consumer to infer it."
+        )
+    )
+    groups: list[ConceptGroupView] = Field(
+        description=(
+            "The groups, ordered by where their first member appeared in the request, so "
+            "two identical requests produce the same list."
+        )
+    )
+
+
 class MatchResponseView(BaseModel):
     """
     The whole response: one list per input field, keyed by the caller's own `path`.
@@ -779,6 +1202,13 @@ class MatchResponseView(BaseModel):
         )
     )
     scoring: ScoringContractView
+    # APPENDED, and OPTIONAL, for the two reasons every other addition to this model was:
+    # the four keys above are the shape a Java client has already generated against, and
+    # appending is the only additive edit to a key order. Absent -- not null -- unless the
+    # request asked for the block, so a caller who did not ask gets the body they got
+    # before these existed, byte for byte.
+    contrast: ContrastReportView | None = None
+    consistency: ConsistencyReportView | None = None
 
 
 class FeedbackResponseView(BaseModel):

@@ -12,9 +12,11 @@ import org.junit.jupiter.api.Test;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
@@ -69,6 +71,84 @@ class RequestSerialisationTest {
 
         assertFalse(node.has("top_k"));
         assertFalse(node.has("explain"));
+        assertFalse(node.has("contrast"));
+        assertFalse(node.has("consistency"));
+        assertFalse(
+                node.has("consistency_qualifier_segments"),
+                "a client that sent its own copy of every default would pin this artifact to the "
+                        + "defaults of the server it was written against. Whether a deployment "
+                        + "sends the evidence blocks is the deployment's decision");
+    }
+
+    @Test
+    @DisplayName("the evidence knobs are snake_case too, including the long one")
+    void evidenceKnobsSpellTheWireNames() throws Exception {
+        JsonNode node = mapper.valueToTree(
+                MatchRequest.of(List.of(FieldSpec.of("a", "t.a")))
+                        .withContrast(true)
+                        .withConsistency(true)
+                        .withConsistencyQualifierSegments(0));
+
+        assertTrue(node.get("contrast").asBoolean());
+        assertTrue(node.get("consistency").asBoolean());
+        assertEquals(0, node.get("consistency_qualifier_segments").asInt());
+        assertFalse(
+                node.has("consistencyQualifierSegments"),
+                "the request half of the contract is snake_case; camelCase is the RESPONSE half");
+    }
+
+    @Test
+    @DisplayName("asking for a grouping policy does not silently ask for the report")
+    void theGroupingDialDoesNotTurnTheReportOn() throws Exception {
+        JsonNode node = mapper.valueToTree(
+                MatchRequest.of(List.of(FieldSpec.of("a"))).withConsistencyQualifierSegments(0));
+
+        assertEquals(0, node.get("consistency_qualifier_segments").asInt());
+        assertFalse(
+                node.has("consistency"),
+                "the knob and the block are separate on the wire, and a request that never asks "
+                        + "for the report should not start receiving one because a policy was set");
+    }
+
+    @Test
+    @DisplayName("every wither keeps every other knob, so a re-chunked 413 asks the same question")
+    void withersPreserveEveryOtherKnob() {
+        // The failure this pins is silent and specific: a `with*` that rebuilds the record and
+        // passes null for a knob it was not changing. The caller then gets a request that is
+        // subtly not the one they built -- and the case that matters most is withFields, which is
+        // what the retry loop calls to re-chunk a 413. Half a batch answered under different
+        // knobs than the other half is not a batch anybody can read.
+        MatchRequest full = MatchRequest.of(List.of(FieldSpec.of("a", "t.a")))
+                .withTopK(3)
+                .withExplain(true)
+                .withSignals(Map.of("domain", "Passenger"))
+                .withContrast(true)
+                .withConsistency(true)
+                .withConsistencyQualifierSegments(2);
+
+        List<MatchRequest> rebuilt = List.of(
+                full.withTopK(4),
+                full.withExplain(false),
+                full.withContrast(false),
+                full.withConsistency(false),
+                full.withConsistencyQualifierSegments(1),
+                full.withFields(List.of(FieldSpec.of("b", "t.b"))));
+
+        for (MatchRequest request : rebuilt) {
+            assertNotNull(request.topK(), "top_k was dropped by a wither that does not own it");
+            assertNotNull(request.explain(), "explain was dropped");
+            assertNotNull(request.signals(), "signals was dropped");
+            assertNotNull(request.contrast(), "contrast was dropped");
+            assertNotNull(request.consistency(), "consistency was dropped");
+            assertNotNull(
+                    request.consistencyQualifierSegments(),
+                    "consistency_qualifier_segments was dropped");
+        }
+
+        MatchRequest rechunked = full.withFields(List.of(FieldSpec.of("b", "t.b")));
+        assertEquals(3, rechunked.topK());
+        assertEquals(Map.of("domain", "Passenger"), rechunked.signals());
+        assertEquals(2, rechunked.consistencyQualifierSegments());
     }
 
     @Test
@@ -81,7 +161,8 @@ class RequestSerialisationTest {
                 null,
                 true,
                 "a.reviewer",
-                "2026-08-11T09:00:00Z"));
+                "2026-08-11T09:00:00Z",
+                null));
 
         assertEquals("booking.passenger.legal_name", node.get("field").asText());
         assertFalse(node.has("fieldPath"));

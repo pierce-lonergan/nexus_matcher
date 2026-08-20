@@ -36,11 +36,26 @@ NexusMatcher(
     domain_matcher=None,
     config=None,                           # MatchingConfig
     governance=None,                       # GovernanceVocabulary | str | Path
+    feedback_consumer=None,                # FeedbackConsumer
 )
 ```
 
 `embedding_provider` and `vector_store` are positional-or-keyword and **required**.
 `NexusMatcher()` with no arguments raises `TypeError`.
+
+> **`feedback_consumer` is opt-in and the shipped default consumes nothing.** It takes a
+> `nexus_matcher.domain.ports.review_feedback.FeedbackConsumer` — an object that is
+> allowed to answer for a field *before* retrieval runs, from a reviewer's recorded
+> verdicts. Nothing in this package constructs one: `from_config()` does not take it and
+> `create_app()` does not build it, so the only way to attach one is to pass it here. With
+> `None` the matcher is bound to no consumer and every field is matched by retrieval
+> exactly as it was before the parameter existed.
+>
+> It is *read*, not merely accepted — `load_dictionary()` binds the consumer to the
+> freshly indexed entries on every index, and `match_schema()` consults it per field. That
+> distinction is the whole reason this block is gated:
+> `tests/packaging/test_documented_construction.py` compares this signature against the
+> real `__init__`, because `config_path` was once accepted here and never read.
 
 ```python
 NexusMatcher.from_config(
@@ -185,7 +200,7 @@ is also created for `uvicorn nexus_matcher.presentation.api.app:app`.
 
 | Method | Path | Response |
 |---|---|---|
-| POST | `/api/v1/match` | `MatchResponseView` — four top-level keys in this order: `results` (one entry per input field, keyed by the caller's own `path`, in the order sent), `vocabulary`, `fieldDecisions` (one verdict per column, the only place `NO_MATCH` is expressible) and `scoring`. Each candidate carries `absoluteScore` beside `confidence`. Every key is spelled out under [The matching response](#the-matching-response) rather than restated here. Field cap `NEXUS_API_MAX_FIELDS` (default 100). |
+| POST | `/api/v1/match` | `MatchResponseView` — four top-level keys in this order: `results` (one entry per input field, keyed by the caller's own `path`, in the order sent), `vocabulary`, `fieldDecisions` (one verdict per column, the only place `NO_MATCH` is expressible) and `scoring`, plus `contrast` and `consistency` **appended when the request asks for them**. Each candidate carries `absoluteScore` beside `confidence`. Every key is spelled out under [The matching response](#the-matching-response) rather than restated here. Field cap `NEXUS_API_MAX_FIELDS` (default 100). |
 | POST | `/api/v1/match/batch` | Identical contract and one shared implementation; the only difference is the cap, `NEXUS_API_MAX_BATCH_FIELDS` (default 250). |
 | POST | `/api/v1/feedback` | **201** and `FeedbackResponseView` — the stored record echoed back, server `receivedAt` included. Appended to `NEXUS_API_FEEDBACK_PATH`; **503** when that is unset, **422** on a malformed record, **500** when the append itself fails. |
 | POST | `/api/v1/lookup` | `LookupResponseView` — `results` maps every id you sent, once and in the order sent, to an entry or an explicit `null`; `missing` names exactly the nulls; `vocabulary` is the same block `/match` carries. No score, no rank, no decision. Id cap `NEXUS_API_MAX_BATCH_FIELDS`; **413** over it, **422** on a duplicate, blank or oversized id, **503** with no dictionary. |
@@ -265,9 +280,22 @@ shipped caps, so lowering a cap under real data fails there.
 | `path` | no | The caller's identifier, and the key the response is keyed by. Defaults to `name`. A **dotted** path is strongly preferred: the segment before the last dot becomes the query's parent context, the single largest accuracy factor measured on this task. |
 | `doc` | no | Column comment or description. |
 | `type` | no | Source type name, normalised server-side. Unknown types are accepted. |
+| `signals` | no | Query signals for this one field — a map, not free text. A field-level key beats the request-level key of the same name, and the two merge **key by key**, so a request-level overlay and a field-level entity coexist. |
 
-Plus `top_k` (default 5; a value above the server's `results_per_field` is a 422 naming
-the cap) and `explain` (default false).
+Plus the request-level knobs, all optional and all defaulted server-side:
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `top_k` | 5 | Candidates per field. Above the server's `results_per_field` is a **422** naming the cap. |
+| `explain` | false | The score components and weights behind each confidence. |
+| `signals` | `{}` | Request-level query signals, applied to every field unless that field overrides the same key. The abbreviation overlay belongs here rather than on a field: it is a catalog, and it is scoped to this one request. |
+| `contrast` | false | Append the [`contrast` block](#contrast--why-not-the-other-one). |
+| `consistency` | false | Append the [`consistency` block](#consistency-and-why-it-is-off). |
+| `consistency_qualifier_segments` | 1 | The grouping key `consistency` uses. Bounded `0..MAX_QUALIFIER_SEGMENTS`, which the server **derives** from its own `path` length limit rather than declaring as a literal. A negative value is a 422; a value deeper than your deepest path is inert. |
+
+Both request keys and both blocks are **strictly additive**. With `contrast` and
+`consistency` unset the response is byte-identical to the one this service sent before they
+existed.
 
 Worked request, response and failure modes: [GOVERNANCE.md](GOVERNANCE.md#matching-over-http).
 
@@ -288,6 +316,10 @@ already knew.
 | `vocabulary` | The caller's own `openClassification` and tier ladder, echoed back. | Without it a `"governance": null` cannot be read. |
 | `fieldDecisions` | **One verdict per column**, under the same keys in the same order. Vocabulary: `AUTO_APPROVE`, `REVIEW`, `REJECT`, **`NO_MATCH`**. | The per-candidate `decision` cannot express `NO_MATCH`. See below. |
 | `scoring` | What every number in this body *means*: which are comparable across fields, which floors are in force, and what metric produced `absoluteScore`. | A governance artifact whose numbers can only be interpreted by reading this library's source is not one. |
+
+Two further keys are **appended, and only when the request asks for them**:
+`contrast` and `consistency`, in that order. A request that asks for neither gets the four
+keys above and nothing else, which is why they are appended rather than inserted.
 
 `fieldDecisions` and `results` are checked against each other before the response is sent;
 a body where one covers a field the other does not is refused rather than returned.
@@ -442,8 +474,15 @@ behind two field caps.
 
 #### The candidate
 
-Ten keys, in this order: `rank`, `governanceId`, `businessName`, `definition`, `domain`,
-`governance`, `confidence`, `decision`, `absoluteScore`, `sourceMetadata`.
+Eleven keys, in this order: `rank`, `governanceId`, `businessName`, `definition`,
+`domain`, `governance`, `confidence`, `decision`, `absoluteScore`, `sourceMetadata`,
+`provenance`. A twelfth, `explain`, is appended when the request asks for it.
+
+`provenance` is `RETRIEVAL` or `APPROVED_PAIR`, and it is the ONLY way to tell a
+scored candidate from one a reviewer decided. Do not use `confidence` for that: the
+weights sum to exactly 1.0 and every signal caps at 1.0, so ordinary retrieval can
+reach 1.0 — the same value the approved-pair path writes. An `APPROVED_PAIR`
+candidate carries no `absoluteScore` and no `explain`, because nothing measured it.
 
 | Key | Type | Meaning |
 |---|---|---|
@@ -711,6 +750,195 @@ when you want it travelling with the verdicts it produced.
 > a one-field match was the only way to read one. That was true and is no longer: an
 > operator who could not see the active floor could not tell an emitted `NO_MATCH` from a
 > field the matcher simply had nothing for.
+
+### Contrast — why not the other one
+
+`"contrast": true` on the request appends one block. It answers the question `explain`
+cannot: `explain` describes why the winner scored what it did, using weights that are the
+same for every candidate and are already published, while a reviewer looking at a
+surprising match wants to know **why not the other one** — which is a subtraction between
+two candidates rather than a description of one. The two are independent; you can have the
+comparison without a weight breakdown on every candidate.
+
+Captured from the live pack, one field of three, two signals of five:
+
+```json
+{
+  "resolution": 1e-06,
+  "comparability": {
+    "confidenceGap": "WITHIN_FIELD",
+    "signals": {"fusedRetrieval": "WITHIN_FIELD", "lexical": "ACROSS_FIELDS", "editDistance": "ACROSS_FIELDS", "type": "ACROSS_FIELDS", "domain": "ACROSS_FIELDS"}
+  },
+  "fields": {
+    "published.terminal.name": {
+      "topGovernanceId": "GBF-0027",
+      "runnerUpGovernanceId": "GBF-0001",
+      "topConfidence": 0.884091,
+      "runnerUpConfidence": 0.598656,
+      "confidenceGap": 0.285435,
+      "signalGap": 0.285436,
+      "separation": "SEPARATED",
+      "largestDifference": "fusedRetrieval",
+      "decidingSignals": [],
+      "governanceDiffers": true,
+      "domainDiffers": true,
+      "signals": [
+        {"signal": "fusedRetrieval", "topScore": 1.0, "runnerUpScore": 0.593317, "delta": 0.406683, "weight": 0.7, "weightedDelta": 0.284678, "separating": true, "deciding": false},
+        {"signal": "editDistance", "topScore": 0.181818, "runnerUpScore": 0.166667, "delta": 0.015151, "weight": 0.05, "weightedDelta": 0.000758, "separating": true, "deciding": false}
+      ]
+    }
+  }
+}
+```
+
+| Key | Meaning |
+|---|---|
+| `resolution` | The smallest difference the numbers in this response can express — the precision every published float is rounded to. **Derived** from the serialiser's own precision, not typed as a constant. Nothing below it is reported as separating and nothing below it is named as a cause. |
+| `comparability` | The scale contract for the contrast's own numbers, in the vocabulary `scoring.comparabilityScopesNarrowestFirst` publishes. `confidenceGap` names the scope of the gap; `signals` names the scope of each signal's `delta` and `weightedDelta`. Derived from `scoring.comparability` rather than restated, so a number whose scope changes cannot leave a stale entry here. |
+| `fields` | **Every input path, keyed and ordered exactly like `results`**, with an explicit `null` where the field has fewer than two candidates. "This field had one candidate" and "this pass skipped it" must not look alike. |
+
+Inside one contrast:
+
+| Key | Meaning |
+|---|---|
+| `topGovernanceId`, `runnerUpGovernanceId` | The two entries being compared. The runner-up is read from the **full** match list, not the `top_k` slice, so a caller who asks for one candidate is still told what the one they cannot see was. |
+| `topConfidence`, `runnerUpConfidence` | Their confidences, at `resolution`. |
+| `confidenceGap` | `topConfidence - runnerUpConfidence`. Comparable **within this field only**, because `confidence` is — a difference is no more comparable than its operands. |
+| `signalGap` | The same margin reached the other way: the sum of every `weightedDelta`. Published so the arithmetic can be checked from the response alone. The service verifies the two against each other and **refuses to answer** rather than send a contrast that does not close. The two can sit a unit of the last place apart — 0.285435 against 0.285436 above — because both operands of every delta are rounded before being subtracted; the server's own tolerance is one order above `resolution`. |
+| `separation` | `SEPARATED` when the margin exceeds `resolution`; `TIED` when it does not, meaning the two are level in every number this response publishes and the ordering came from the matcher's sort. An open string, not a closed enum. |
+| `largestDifference` | The separating signal with the largest weighted difference — the headline answer. `null` on a `TIED` contrast and when no signal differs by more than `resolution`. |
+| `decidingSignals` | Every signal whose removal would leave rank 2 level with or ahead of rank 1. **Empty is a real answer and the common one on a wide margin** — it means no single signal carried it, as above, where `fusedRetrieval` accounts for 0.2847 of a 0.2854 margin and removing it still leaves rank 1 ahead. Always empty on a `TIED` contrast. |
+| `governanceDiffers`, `domainDiffers` | Read from the two glossary **entries**, not from any signal, and usually what settles a review. Taken from the entries' own codes, so a rank-1 `REJECT` — which confers no class by design — does not read as a difference that is not there. |
+| `signals` | One entry per weighted signal, largest weighted difference first, ties broken by declaration order so two identical requests order the list identically. |
+
+Inside one signal difference: `signal` (the same key it carries in `explain.scores` and
+`explain.weights`), `topScore`, `runnerUpScore`, `delta` (`topScore - runnerUpScore`,
+negative where rank 2 won it), `weight`, `weightedDelta` (`delta * weight`), `separating`
+(false when the two differ by no more than `resolution`; a signal that is not separating is
+never named as a cause) and `deciding`.
+
+### Consistency, and why it is off
+
+`"consistency": true` appends a second block: which columns this request believes are the
+same business concept, and whether their rank-1 answers agree. It is **reporting only** —
+nothing in `results` or `fieldDecisions` changes, whatever it finds, and `promotionApplied`
+states that machine-readably rather than leaving a consumer to infer it.
+
+**It is off by default because its grouping was measured and the measurement came back
+negative.** The idea is sound: fields are matched one at a time and independently, and
+nothing notices when two columns that are the same concept get different answers. Detecting
+that needs no labelled data. But everything depends on the grouping rule, and the rule is a
+heuristic over column names:
+
+- at the default `consistency_qualifier_segments` of **1** — a leaf groups only with a leaf
+  under the same declared parent — it emits **no group at all** on every profile in this
+  repository's generated corpus. It reports nothing, and therefore claims nothing false;
+- at **0**, the leaf alone, it scores 0.86–1.00 pair-precision on a parent-diverse mixture
+  and **0.0233 at recall 1.00** on a repeated-leaf schema — one leaf governed separately in
+  ~30 domains, which is the shape the feature was proposed for. There it emitted four groups
+  containing **zero concepts and four collisions**: 87 columns spanning 29 genuinely distinct
+  answers merged into one "concept" and reported as a contradiction;
+- and there is **no operating point**. The whole published policy space was searched — 684
+  policies over two profiles, two scales and two repetition depths — and the best precision
+  reached by any policy that reports anything at all on that shape is **0.0235**.
+
+So a `DISAGREE` is a prompt to look, never a defect report about the matcher. The check to
+run first is `distinctAnswers` against the number of members that answered: when the two are
+close, the group is a collision of distinct concepts that happen to share a column name.
+
+Captured from the live pack at `consistency_qualifier_segments: 0`, which is what it takes
+to make these three fields group at all:
+
+```json
+{
+  "grouping": {"qualifierSegments": 0, "includeDataType": true, "orderSensitive": false, "minGroupSize": 2},
+  "groupsFound": 1,
+  "fieldsGrouped": 2,
+  "groupsDisagreeing": 1,
+  "promotionApplied": false,
+  "groups": [
+    {
+      "concept": "|name|name|string",
+      "fields": ["published.terminal.name", "booking.passenger.name"],
+      "answers": {"published.terminal.name": "GBF-0027", "booking.passenger.name": "GBF-0001"},
+      "distinctAnswers": 2,
+      "agreement": "DISAGREE",
+      "majorityGovernanceId": null,
+      "majorityCount": 0
+    }
+  ]
+}
+```
+
+That finding is a **false positive, and it is shown here rather than a tidy `AGREE` on
+purpose**: a ferry terminal's name and a passenger's name are not one business concept, they
+share four letters. Two members answered and gave two different answers — `distinctAnswers`
+equals the number that answered, which is the collision signature. At the shipped default of
+1 the same three fields produce `"groupsFound": 0`.
+
+| Key | Meaning |
+|---|---|
+| `grouping` | The policy these groups were built under — `qualifierSegments`, `includeDataType`, `orderSensitive`, `minGroupSize` — published because a finding cannot be judged without the rule that produced it. |
+| `groupsFound` | How many groups of two or more columns were found. Zero is the expected answer at the default. |
+| `fieldsGrouped` | How many of this request's fields fell into a group of two or more. A column that shares its concept with nothing is not reported: it cannot disagree with anyone. |
+| `groupsDisagreeing` | How many groups have an `agreement` of `DISAGREE`. A count of groups, not a count of problems. |
+| `promotionApplied` | Always `false`. Promoting a group's majority can move a correct answer to an incorrect one, which surfacing a disagreement cannot, and the measurement that would justify it does not exist. |
+| `groups` | Ordered by where each group's first member appeared in the request, so two identical requests produce the same list. |
+
+Inside one group:
+
+| Key | Meaning |
+|---|---|
+| `concept` | The concept key as a printable label: the qualifier segments, the leaf's normalised tokens, its class word and the data type, separated by `\|`. A grouping **artifact**, stable for a given request and policy — quotable in a ticket, and not a name anyone chose. Do not key a downstream system on it. |
+| `fields` | The group's members, in the order they were sent. |
+| `answers` | Each member's rank-1 governance id, or `null` where the field had no answer to give — no candidates, or a `fieldDecisions` verdict of `NO_MATCH`, which inherits nothing. **A null is silence, not a dissenting answer.** |
+| `distinctAnswers` | How many different non-null answers the group got. |
+| `agreement` | `AGREE` when two or more answered and all agree, `DISAGREE` when two or more answered and they do not, `UNDECIDED` when fewer than two answered at all. `UNDECIDED` is deliberately not `AGREE`: one answer and five blanks is not five columns confirming each other. An open string, not a closed enum. |
+| `majorityGovernanceId` | The modal answer, or `null` when no single answer holds a plurality. **Evidence, never an instruction.** |
+| `majorityCount` | How many members gave it; `0` when there is none. |
+
+The concept key is built from the **response key** — your own `path` — and not from `name`.
+Segments are boundaries you declared: dots, or the `__` array boundary. Single underscores
+are tokens inside a segment, so `a_b__c_d_e` has two segments and `a.b.c` has three.
+
+### The feedback request body
+
+`POST /api/v1/feedback` records one reviewer's verdict. **Recorded only** — it is not read
+back into ranking.
+
+| Key | Required | Meaning |
+|---|---|---|
+| `field` | yes | The path the match response was keyed by. |
+| `doc` | no | The column comment the reviewer had in front of them. |
+| `chosenGovernanceId` | yes | The glossary id the reviewer chose. |
+| `suggestedGovernanceId` | no | The id the matcher had suggested, when it differed. |
+| `wasCorrect` | yes | Whether the matcher's suggestion was right. |
+| `reviewer` | yes | Who decided. |
+| `ts` | yes | The client's timestamp. Stored verbatim and **not** trusted for ordering — the server stamps its own `receivedAt` beside it, and that is the field to sort by. |
+| `verdict` | no | What the reviewer *did*: `APPROVED`, `REJECTED` or `MANUAL_OVERRIDE`. |
+
+`verdict` exists because `wasCorrect` has two states and the vocabulary has three. The one a
+boolean cannot express is the reviewer who chose a term **the matcher never proposed** — not
+rank 2, not rank 20: absent from the candidate list entirely. Collapsed into `false`, that
+record is byte-identical to "the top match was wrong and I took the third one", and those are
+opposite diagnoses. The second says the answer was retrieved and mis-ranked, which weights or
+a reranker can fix; the first says it was never retrieved, which no amount of re-ranking a
+list that never contained it will fix. `MANUAL_OVERRIDE` is that state.
+
+The two must agree, and the server **refuses the disagreement rather than picking a winner**:
+`APPROVED` requires `wasCorrect: true`, `REJECTED` and `MANUAL_OVERRIDE` both require
+`false`, and any other pairing is a **422**. A trail is evidence, and evidence that
+contradicts itself is worse than a refusal.
+
+The three values are published **inline on the property** and deliberately *not* as a named
+schema component, so a generated client gets them as documentation rather than as a closed
+type that stops decoding the day a fourth value is added.
+
+> **`verdict` is additive, and something did change for an unchanged request.** A body that
+> predates the member is still **201** and still stores the same eight values — but the
+> echoed record and the appended trail line now carry a ninth key, `"verdict": null`. A
+> tolerant reader is unaffected; a trail-consuming script asserting an exact key set is not.
+> See [CHANGELOG.md](../CHANGELOG.md).
 
 ### The status response
 

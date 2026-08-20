@@ -52,7 +52,13 @@ from nexus_matcher.domain.ports import (
     VectorStore,
 )
 from nexus_matcher.domain.ports.dictionary_loader import ColumnMapping, LoadStatistics
+from nexus_matcher.domain.ports.entry_lookup import MappingEntryLookup
 from nexus_matcher.domain.ports.retrieval import RerankCandidate, SparseDocument
+from nexus_matcher.domain.ports.review_feedback import (
+    APPROVED_PAIR_STAGE,
+    ApprovedPair,
+    FeedbackConsumer,
+)
 from nexus_matcher.domain.ports.vector_store import SearchResult, VectorDocument, VectorStoreConfig
 from nexus_matcher.domain.services.abbreviation import (
     AbbreviationDictionary,
@@ -64,6 +70,10 @@ from nexus_matcher.domain.services.context_enricher import (
     ContextEnricher,
 )
 from nexus_matcher.domain.services.domain_hierarchy import DomainMatcher
+
+# The ONE definition of a field's identity. Re-exported below as `field_result_key`; see
+# the comment there for why the domain copy is the one that survives.
+from nexus_matcher.domain.services.review_evidence import result_key as _result_key
 from nexus_matcher.shared.types.base import (
     EntityId,
     MatchDecision,
@@ -615,22 +625,39 @@ def field_result_key(field: SchemaField) -> str:
     """
     The name a caller uses to look this field up in a match result.
 
-    Results come back as a dict, so every field needs a handle -- and the handle has to
-    be the string the CALLER supplied, not one we derived. The flattened parser
-    deliberately rewrites `cust_addr__city` into the dotted path `cust.addr.city`,
-    because recovering the parent path is worth +19.3 P@1; keyed by that path, a caller
-    asking for their own column name got a KeyError from a result set that did contain
-    their field, and a caller iterating the keys saw names their schema never used.
+    ## ONE DEFINITION OF THE RULE, AND THIS IS NOT IT
 
-    `flattened_name` is that original string, and both flattened entry points set it.
-    Every other parser -- raw Avro, JSON Schema, SQL DDL -- has no such name and keeps
-    its dotted `full_path`, which is what those callers have always addressed.
+    The rule had TWO implementations -- this function and
+    `domain.services.review_evidence.result_key` -- written independently and agreeing only
+    by coincidence, with nothing gating them equal. They are not interchangeable trivia:
+    this string keys the result map, the audit trail, and therefore the approved-pair
+    bypass, while the other keys the consistency grouping. A divergence raises nothing; it
+    just means a bypass and a consistency finding are discussing different columns,
+    silently, which is the exact hazard the bypass key decision is about.
+
+    So this function now RESTATES NOTHING. It forwards, and the whole rule lives in the
+    domain. WHICH copy survives is forced rather than chosen: `domain/services` may not
+    import an application module (`tests/packaging/test_architecture.py`, contract 1), so
+    the application layer has to be the importer.
+
+    IT IS STILL A FUNCTION rather than `field_result_key = result_key`, and the reason is a
+    gate. `tests/museum/NM-0006/replay.py` reintroduces the original defect by anchoring on
+    this signature in this file, and a bare alias deleted the anchor -- the museum replayed
+    it as a HOLE, meaning NM-0006 could ship again with nothing to catch it. The forwarder
+    keeps the gate armed. What keeps the rule singular is
+    `tests/unit/application/test_match_result_identity.py`, which refuses a body that
+    restates it and searches the whole input space for a disagreement.
+
+    ## Why the rule is what it is
+
+    Results come back as a dict, so every field needs a handle -- and the handle has to be
+    the string the CALLER supplied, not one we derived. The flattened parser deliberately
+    rewrites `cust_addr__city` into the dotted path `cust.addr.city`, because recovering
+    the parent path is worth +19.3 P@1; keyed by that path, a caller asking for their own
+    column name got a KeyError from a result set that did contain their field, and a caller
+    iterating the keys saw names their schema never used.
     """
-    flattened = field.source_metadata.get("flattened_name")
-    if isinstance(flattened, str) and flattened:
-        return flattened
-    # __post_init__ guarantees full_path falls back to the bare field name.
-    return field.full_path
+    return _result_key(field)
 
 
 # =============================================================================
@@ -913,6 +940,7 @@ class NexusMatcher:
         domain_matcher: DomainMatcher | None = None,
         config: MatchingConfig | None = None,
         governance: GovernanceVocabulary | str | Path | None = None,
+        feedback_consumer: FeedbackConsumer | None = None,
     ) -> None:
         """
         Initialize the matcher.
@@ -934,6 +962,18 @@ class NexusMatcher:
                 `GovernanceVocabulary.empty()`, which defines nothing -- so indexing
                 entries that carry codes without wiring one is refused rather than
                 silently producing matches with no class. This library ships no taxonomy.
+            feedback_consumer: AR-7. A consumer of the reviewer-verdict trail that is
+                allowed to answer for a field BEFORE retrieval runs -- see
+                `domain.ports.review_feedback.FeedbackConsumer` and the reference
+                implementation in `application.feedback_loop`.
+
+                NONE IS THE SHIPPED DEFAULT AND IT CONSUMES NOTHING. Nothing in this
+                package constructs one: `from_config()` does not take it and
+                `create_app()` does not build it, so a deployment opts in by passing an
+                object here and by no other route. With None every field is matched by
+                retrieval exactly as before -- proven paired over the full committed
+                corpus at zero discordant pairs, id and confidence, against the build
+                before this parameter existed.
         """
         self._embedding_provider = embedding_provider
         self._vector_store = vector_store
@@ -953,6 +993,10 @@ class NexusMatcher:
         # "every code in this glossary is one nobody defined, say so" -- and
         # `load_dictionary` has to tell them apart to give the right refusal.
         self._governance_configured = governance is not None
+        # AR-7's seam. Held as a plain attribute and consulted only through the `is None`
+        # test in `_match_fields`, so the shipped default costs one identity comparison per
+        # batch rather than a call per field into an object that always says None.
+        self._feedback_consumer = feedback_consumer
 
         # State
         self._dictionary_entries: dict[str, DictionaryEntry] = {}
@@ -1373,6 +1417,27 @@ class NexusMatcher:
                 raise RuntimeError(f"Sparse indexing failed: {sparse_result.error}")
 
         self._is_initialized = True
+        self._rebind_feedback_consumer()
+
+    def _rebind_feedback_consumer(self) -> None:
+        """
+        Hand the attached consumer the glossary that is now in force. AR-7's invalidation.
+
+        Called from `_index_dictionary` and from nowhere else, which is what makes the
+        guarantee hold: EVERY path that replaces `_dictionary_entries` -- the public
+        `load_dictionary`, the incremental sync, and the direct `_index_dictionary` the
+        benchmarks use -- goes through that one line. A hook placed on `load_dictionary`
+        instead would leave the other two applying verdicts about a dictionary that is no
+        longer loaded.
+
+        The consumer is handed an `EntryLookup` rather than this matcher's private entry
+        map. It needs exact resolution and nothing else, that is precisely what AR-5's port
+        offers, and passing the dict would hand a caller-supplied object a mutable
+        reference to the matcher's own state.
+        """
+        if self._feedback_consumer is None:
+            return
+        self._feedback_consumer.bind(MappingEntryLookup(self._dictionary_entries, self._governance))
 
     def _reject_unresolvable_governance(self, entries: Sequence[DictionaryEntry]) -> None:
         """Fail loudly, once, naming the codes and the fix."""
@@ -1526,39 +1591,180 @@ class NexusMatcher:
         than once per field, and so nothing on `self` is touched: the matcher is shared
         across concurrent requests, and a per-request mutation would let one caller's
         catalog decide another caller's query text.
+
+        AR-7 enters here and nowhere else on the match path. A field an attached consumer
+        has a standing human answer for is REMOVED FROM THE BATCH before the encoder is
+        called, so a bypassed field costs no embedding, no dense search and no scoring --
+        it is the speed half of the feature, and skipping the work is also what makes the
+        precision half true by construction rather than by a threshold. `_bypassed_fields`
+        returns an empty map when no consumer is attached, and then every list below is
+        the list this method has always built, in the same order, for the same fields.
+
+        REMOVING A FIELD FROM A BATCH CAN MOVE THE ANSWERS FOR THE FIELDS THAT REMAIN, and
+        a deployment enabling a consumer has to know that before it does. The cause is not
+        this seam and not the retrieval code: it is the ENCODER. Measured on the bundled
+        int8 ONNX provider over the committed 688-field corpus, the same text encoded in a
+        batch of 688 and in a batch of 344 comes back as two different vectors every time
+        -- cosine against itself median 0.9932, 5th percentile 0.9839, minimum 0.9398, and
+        0 of 344 identical. Downstream of that, matching a 344-field subset instead of the
+        whole 688 changes rank 1 on 17 of the 344 and the rank-1 confidence on 35.
+        A fixed batch re-encoded is bit-identical, so this is composition, not chance.
+
+        THAT IS PRE-EXISTING AND UNCHANGED BY THIS SEAM: the 17/35 figures reproduce
+        EXACTLY on the build before this parameter existed, and the shipped default with no
+        consumer is paired-identical to it on all 688 (rank-1 id, confidence and absolute
+        score, zero discordant). What the bypass does is make batch composition depend on
+        the reviewer history, so an operator comparing two runs of the same schema across a
+        week of review will see a handful of untouched columns move. `benchmarks` is where
+        that should be sized against a caller's own corpus; the vector store's batched
+        search is not the culprit (subset versus full: 0 of 344 differ, max |delta| 0.0).
         """
         if not fields:
             return {}
 
+        bypassed = self._bypassed_fields(fields)
+        retrieved = [i for i in range(len(fields)) if i not in bypassed]
+
         request_signals = QuerySignals.coerce(signals)
         expander, expand = self._request_expander(request_signals)
-        per_field = [self._field_signals(f, request_signals) for f in fields]
+        per_field = [self._field_signals(fields[i], request_signals) for i in retrieved]
 
         query_texts = [
-            self._build_query_text(f, expander=expander, expand=expand, entity=s.entity)
-            for f, s in zip(fields, per_field, strict=True)
+            self._build_query_text(fields[i], expander=expander, expand=expand, entity=s.entity)
+            for i, s in zip(retrieved, per_field, strict=True)
         ]
 
         embeddings: list[np.ndarray] | None = None
-        embed_result = self._embedding_provider.embed(query_texts)
-        if embed_result.is_success:
-            batch = embed_result.unwrap()
-            embeddings = [batch.embeddings[i] for i in range(len(query_texts))]
+        if query_texts:
+            embed_result = self._embedding_provider.embed(query_texts)
+            if embed_result.is_success:
+                batch = embed_result.unwrap()
+                embeddings = [batch.embeddings[i] for i in range(len(query_texts))]
 
         dense_per_field = self._search_dense_batch(embeddings)
 
+        # Keyed by the field's INDEX, not by its result key: the result key is assigned
+        # below and may be suffixed for a duplicate column, so keying here would collide
+        # exactly where `_unique_result_key` exists to stop a collision.
+        matched: dict[int, list[MatchResult]] = {}
+        for slot, i in enumerate(retrieved):
+            matched[i] = self._match_field(
+                fields[i],
+                query_text=query_texts[slot],
+                query_embedding=embeddings[slot] if embeddings is not None else None,
+                dense_candidates=dense_per_field[slot] if dense_per_field is not None else None,
+                signals=per_field[slot],
+            )
+
         results: dict[str, tuple[MatchResult, ...]] = {}
         for i, field in enumerate(fields):
-            field_results = self._match_field(
-                field,
-                query_text=query_texts[i],
-                query_embedding=embeddings[i] if embeddings is not None else None,
-                dense_candidates=dense_per_field[i] if dense_per_field is not None else None,
-                signals=per_field[i],
+            pair = bypassed.get(i)
+            field_results = (
+                self._approved_pair_results(field, pair) if pair is not None else matched[i]
             )
             results[self._unique_result_key(field, results)] = tuple(field_results)
 
         return results
+
+    def _bypassed_fields(self, fields: Sequence[SchemaField]) -> dict[int, ApprovedPair]:
+        """
+        Which fields in this batch a human has already decided, by index. AR-7.
+
+        Empty -- and allocated once, not per field -- when no consumer is attached, which
+        is the shipped default. The `is None` test is deliberately here rather than inside
+        a null-object consumer: a default that costs one comparison per BATCH is a
+        different thing from one that costs a method call per FIELD, and this runs on the
+        path a 1,776-column bulk goes through.
+
+        A consumer that raises is a consumer that has taken matching down, so it is not
+        caught here. That is the same posture as every other injected port in this class:
+        an adapter that cannot answer says so through its return value, and one that
+        throws has a defect a caller needs to see rather than have swallowed into "no
+        opinion" -- which would silently turn a broken bypass into a slow, ordinary run.
+        """
+        consumer = self._feedback_consumer
+        if consumer is None:
+            return {}
+        found: dict[int, ApprovedPair] = {}
+        for i, field in enumerate(fields):
+            pair = consumer.approved_pair(field)
+            if pair is not None:
+                found[i] = pair
+        return found
+
+    def _approved_pair_results(self, field: SchemaField, pair: ApprovedPair) -> list[MatchResult]:
+        """
+        The single result for a field a reviewer has already decided.
+
+        ## What this result claims, number by number
+
+        ONE candidate, not `results_per_field`. Ranks 2..N would have to come from
+        retrieval, and retrieval did not run; inventing runner-ups for a human's answer
+        would be presenting a shortlist nobody produced.
+
+        `final_confidence` is **1.0**, and IT IS NOT A SENTINEL. That has to be said in the
+        negative because this docstring used to say the opposite: that 1.0 was "chosen
+        because the scorer cannot reach it ... a value outside the range the model can
+        produce". **That was false.** A retrieved confidence is a weighted sum of five
+        signals clamped to [0, 1]; the five shipped weights sum to exactly 1.0 and every
+        signal is attainable at 1.0, so the scorer's range INCLUDES 1.0 and ordinary
+        retrieval reaches it whenever all five are maximal. The two tests behind the claim
+        each matched ONE fixture and reported the highest confidence it happened to
+        produce -- an observation, published as a structural property, which is what
+        NM-0029 exists to prevent.
+
+        So 1.0 here means what it says and nothing more: a human decided this pair, and no
+        measurement was taken that could argue with them. Anything that needs to know where
+        the answer CAME FROM reads the provenance, below -- never this number.
+
+        `score_breakdown` reports every component at 0.0 with `absolute_cosine` at None,
+        and those are two different statements. The components are 0.0 because nothing was
+        measured -- no lexical overlap was computed, no edit distance, no type
+        compatibility. `absolute_cosine` is None because the dense retriever never returned
+        this candidate, which is the meaning that field already carries everywhere else in
+        this library, and it is the number that reaches the wire as `absoluteScore: null`.
+        That null is NOT a provenance signal either: it means the same thing for a retrieved
+        candidate that reached the shortlist through the lexical arm alone.
+
+        `decision` is AUTO_APPROVE. It is the one honest verdict available: a human
+        approved this pair, and `AUTO_APPROVE` is this library's word for "no review
+        needed". The pair (`decision` AUTO_APPROVE, `final_confidence` 1.0) is REACHABLE by
+        retrieval and identifies nothing.
+
+        `performance.latency_ms` is 0.0 because no retrieval was performed, not because it
+        was fast: the cost of a bypass is the dict lookup in `_bypassed_fields`, and
+        attributing that to a candidate that was never retrieved would report a retrieval
+        latency for a retrieval that did not happen.
+
+        `performance.retrieval_stage` is `APPROVED_PAIR_STAGE` and `candidates_evaluated`
+        is 0. **THIS IS THE PROVENANCE, AND IT IS THE ONLY ONE.** A library caller reads it
+        through `domain.ports.review_feedback.provenance_of`, which is the single reader
+        that turns it into the published `MatchProvenance` vocabulary; the HTTP layer
+        projects that same value onto the candidate as `provenance`, so the two surfaces
+        cannot disagree. `explain` is not attached to a candidate that carries it: the
+        explain block promises `sum(scores * weights) == confidence`, and a candidate whose
+        components are honestly zero and whose confidence is honestly 1.0 describes an
+        arithmetic nobody performed.
+        """
+        governance = self._governance.get(pair.entry.governance_code)
+        return [
+            MatchResult(
+                schema_field=field,
+                dictionary_entry=pair.entry,
+                rank=1,
+                final_confidence=1.0,
+                score_breakdown=ScoreBreakdown(absolute_cosine=None),
+                decision=MatchDecision.AUTO_APPROVE,
+                performance=PerformanceMetrics(
+                    latency_ms=0.0,
+                    cache_hit=False,
+                    retrieval_stage=APPROVED_PAIR_STAGE,
+                    candidates_evaluated=0,
+                    reranking_applied=False,
+                ),
+                governance=governance,
+            )
+        ]
 
     def _search_dense_batch(
         self, embeddings: list[np.ndarray] | None
@@ -2114,6 +2320,25 @@ class NexusMatcher:
         The 0.9 dense weight is the sweep optimum for P@1. If you tune for recall
         instead (e.g. to feed a reranker), balanced combsum scored higher R@10 (0.923
         vs 0.911) -- re-run the sweep rather than assuming.
+
+        KNOWN HAZARD, MEASURED, NOT FIXED: MIN-MAX IS SCALE-FREE, SO IT CANNOT TELL A
+        SIGNAL FROM DUST. `_minmax_normalize` rescales each arm by its own min and max,
+        which discards magnitude entirely. An arm whose scores are all around 1e-17 --
+        numerically zero, but not equal to each other -- is therefore stretched across the
+        whole [0, 1] range, and its best candidate is handed a lexical component of 1.0
+        rather than the 0.0 an ABSENT arm would give. At `lexical_weight` = 0.10 and
+        `semantic_weight` = 0.70 that is 0.07 of published confidence conjured out of
+        nothing.
+
+        That is not hypothetical: it is the amplifier that turned NM-0034 from a 2.2e-16
+        difference in a corpus statistic into a 0.07 move in a rank-1 confidence. NM-0034
+        repaired the CAUSE -- the sparse arm's membership no longer depends on glossary row
+        order -- and deliberately left this alone, because min-max was chosen by
+        measurement (linear 0.702 P@1 against rrf 0.610 and max-only) and re-tuning it on
+        the strength of one pathological corpus would be trading a measured gain for an
+        unmeasured one. What is missing is a notion of "this arm retrieved nothing worth
+        normalising", and any threshold that supplied it would need its own sweep. See
+        tests/museum/NM-0034/ and tests/properties/test_metamorphic.py.
         """
         dense_results = [(r.id, r.score) for r in dense]
         sparse_results = sorted(sparse.items(), key=_second, reverse=True)

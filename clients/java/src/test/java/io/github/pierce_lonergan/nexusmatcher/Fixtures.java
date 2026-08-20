@@ -20,10 +20,20 @@ import java.nio.charset.StandardCharsets;
  * to make a test pass tests the author's belief about the contract, which is the exact belief the
  * fixture was there to check. Run the script, then read the diff: it is the service having changed.
  *
- * <p>{@code match-response-no-match.json} is the one capture that does not come from the default
- * fixture. It is taken from the server started with {@code fixture-absolute-floor.json}, because a
- * {@link io.github.pierce_lonergan.nexusmatcher.model.FieldDecision#NO_MATCH} verdict needs a
- * configured absolute-score floor and the library ships none.
+ * <p>Two captures do not come from the default fixture, and both for the same reason: they hold a
+ * behaviour that is REACHABLE but that no correctly-configured stock server produces, so on the
+ * default fixture they could only ever have been bodies somebody typed.
+ *
+ * <ul>
+ *   <li>{@code match-response-no-match.json} comes from the server started with
+ *       {@code fixture-absolute-floor.json}, because a
+ *       {@link io.github.pierce_lonergan.nexusmatcher.model.FieldDecision#NO_MATCH} verdict needs a
+ *       configured absolute-score floor and the library ships none.
+ *   <li>{@code match-response-approved-pair.json} comes from the server started by
+ *       {@code clients/java/fixture_approved_pair_app.py}, because a
+ *       {@link io.github.pierce_lonergan.nexusmatcher.model.MatchProvenance#APPROVED_PAIR}
+ *       candidate needs an attached feedback consumer and the library attaches none.
+ * </ul>
  *
  * <p>The behaviour tests against a live service live in the {@code *IT} classes and are not
  * replaced by these.

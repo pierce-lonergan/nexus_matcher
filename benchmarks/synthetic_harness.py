@@ -25,6 +25,7 @@ threshold changes.
 
 from __future__ import annotations
 
+import re
 import sys
 import time
 from dataclasses import dataclass, field
@@ -151,6 +152,72 @@ def run_schema(
         index_seconds=index_seconds,
         match_seconds=time.perf_counter() - t0,
     )
+
+
+# =============================================================================
+# RECONSTRUCTION, AND WHY EVERY EXPANSION NUMBER NEEDS IT
+# =============================================================================
+
+
+def normalise_words(text: str) -> str:
+    """A name reduced to lowercase words separated by single spaces."""
+    return " ".join(t for t in re.split(r"[^0-9A-Za-z]+", text.lower()) if t)
+
+
+_MIRROR_NOTE = "mirrors "
+
+
+def mirror_pairs(mirror_of: Any, mirrored: Any) -> list[tuple[str, str]]:
+    """
+    `(original name, mirrored name)` for every column that survived into both schemas.
+
+    Paired on the note the generator writes, NOT positionally. Contraction is many-to-one,
+    so two readable names can land on one contracted spelling; `build_schemas` drops the
+    duplicate, and the two profiles then have different lengths. Zipping them would pair
+    columns with their neighbours' answers and every number downstream would be wrong
+    without anything raising.
+    """
+    prefix = f"{_MIRROR_NOTE}{mirror_of.name}:"
+    out: list[tuple[str, str]] = []
+    for row in mirrored.truth:
+        if row.note.startswith(prefix):
+            out.append((row.note[len(prefix) :], row.flattened_name))
+    return out
+
+
+def reconstructed_keys(
+    pairs: list[tuple[str, str]],
+    expander: Any,
+) -> set[str]:
+    """
+    The contracted columns this expander puts back EXACTLY as they were.
+
+    Returns the flattened names of the contracted rows whose expansion is caselessly
+    identical, word for word, to the English name of the row they mirror.
+
+    ## Why this is not optional
+
+    An abbreviation catalog generated from a set of names can be that contraction's exact
+    inverse. Expanding a name contracted by it then reproduces the original STRING, and a
+    P@1 measured on the result is measuring string identity: `f_inverse(f(x)) == x`. This
+    repository has already published such a figure -- a "99.4% recovery" whose caseless
+    reconstruction rate was 0.9927 -- and the giveaway was that it did not move when the
+    corpus got harder.
+
+    So every recovery figure in this package is reported beside this number, and the
+    interesting half of every one of them is the arm restricted to the rows NOT in this
+    set: on those, the catalog demonstrably cannot rebuild the original name, and any
+    P@1 the expansion buys there is retrieval.
+
+    `pairs` comes from `mirror_pairs`, which links the two profiles by the generator's own
+    record of which column each mirrors rather than by position.
+    """
+    keys: set[str] = set()
+    for original, contracted in pairs:
+        rebuilt = expander.expand(contracted.replace("_", " ")).expanded
+        if normalise_words(rebuilt) == normalise_words(original):
+            keys.add(contracted)
+    return keys
 
 
 # =============================================================================

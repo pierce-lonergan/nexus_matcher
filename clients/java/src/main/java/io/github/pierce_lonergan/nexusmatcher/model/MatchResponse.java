@@ -58,6 +58,26 @@ public record MatchResponse(
          */
         ScoringContract scoring,
 
+        /**
+         * Rank 1 against rank 2 for every field, or null when this response carries no contrast.
+         *
+         * <p>Null both on a request that did not ask for it -- {@link MatchRequest#withContrast(boolean)}
+         * -- and on a server predating the block; the two are indistinguishable here and the
+         * difference does not matter to a reader, because in both cases there is no contrast to
+         * read. {@link #contrastValue()} folds the null.
+         */
+        ContrastReport contrast,
+
+        /**
+         * Which columns the server grouped as one concept and whether they agree, or null when this
+         * response carries no consistency report.
+         *
+         * <p>Reporting only: nothing in {@link #results()} or {@link #fieldDecisions()} was changed
+         * by it, and {@link ConsistencyReport#promotionApplied()} states that machine-readably.
+         * <strong>Read {@link ConsistencyReport}'s measured limits before acting on a finding.</strong>
+         */
+        ConsistencyReport consistency,
+
         /** The {@code X-Request-ID} this exchange was answered under. Null only if the server
          *  omitted the header, which it does not. */
         String requestId,
@@ -75,8 +95,11 @@ public record MatchResponse(
             @JsonProperty("results") Map<String, List<MatchCandidate>> results,
             @JsonProperty("vocabulary") Vocabulary vocabulary,
             @JsonProperty("fieldDecisions") Map<String, FieldVerdict> fieldDecisions,
-            @JsonProperty("scoring") ScoringContract scoring) {
-        return new MatchResponse(results, vocabulary, fieldDecisions, scoring, null, null);
+            @JsonProperty("scoring") ScoringContract scoring,
+            @JsonProperty("contrast") ContrastReport contrast,
+            @JsonProperty("consistency") ConsistencyReport consistency) {
+        return new MatchResponse(
+                results, vocabulary, fieldDecisions, scoring, contrast, consistency, null, null);
     }
 
     public MatchResponse {
@@ -94,7 +117,8 @@ public record MatchResponse(
     /** This response with the correlation headers from the exchange that carried it. */
     public MatchResponse withTransport(String newRequestId, Double newResponseTimeMs) {
         return new MatchResponse(
-                results, vocabulary, fieldDecisions, scoring, newRequestId, newResponseTimeMs);
+                results, vocabulary, fieldDecisions, scoring, contrast, consistency,
+                newRequestId, newResponseTimeMs);
     }
 
     /** The paths that came back, in the order they were sent. */
@@ -201,5 +225,30 @@ public record MatchResponse(
     /** {@link #scoring()} as an {@link Optional}; empty on a server predating the block. */
     public Optional<ScoringContract> scoringValue() {
         return Optional.ofNullable(scoring);
+    }
+
+    /** {@link #contrast()} as an {@link Optional}; empty when this response carries no contrast. */
+    public Optional<ContrastReport> contrastValue() {
+        return Optional.ofNullable(contrast);
+    }
+
+    /**
+     * {@link #consistency()} as an {@link Optional}; empty when this response carries no report.
+     *
+     * <p>Empty is not "everything is consistent". It means nothing was checked.
+     */
+    public Optional<ConsistencyReport> consistencyValue() {
+        return Optional.ofNullable(consistency);
+    }
+
+    /**
+     * The contrast for one field, empty when there is no contrast block or no runner-up.
+     *
+     * <p>A convenience over {@code contrastValue().flatMap(r -> r.contrastFor(path))}, and the same
+     * three meanings collapse into empty: no block was asked for, the field had one candidate, or
+     * the path was never sent. Use {@link #contrastValue()} when you need to tell them apart.
+     */
+    public Optional<Contrast> contrastFor(String path) {
+        return contrastValue().flatMap(report -> report.contrastFor(path));
     }
 }

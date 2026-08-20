@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  * response members while this client was being written -- exactly the drift a mock cannot see. So a
  * missing service is a FAILURE that names the script which starts one.
  *
- * <p>Four fixtures, because four of the behaviours worth pinning are properties of a server's
+ * <p>Five fixtures, because five of the behaviours worth pinning are properties of a server's
  * configuration rather than of a request:
  *
  * <ul>
@@ -31,9 +31,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  *       {@link io.github.pierce_lonergan.nexusmatcher.model.FieldDecision#NO_MATCH}. The library
  *       ships no floor, so on any other fixture that verdict is unreachable and could only be
  *       tested against a body somebody typed.
+ *   <li>{@code nexus.matcher.approvedPairBaseUrl} -- the pack with one reviewer verdict standing,
+ *       so a candidate carries a real
+ *       {@link io.github.pierce_lonergan.nexusmatcher.model.MatchProvenance#APPROVED_PAIR}. The
+ *       library attaches no feedback consumer on any server it starts, so on every other fixture
+ *       every candidate is RETRIEVAL and the other half of that vocabulary is unreachable.
  * </ul>
  *
- * <p>{@code clients/java/serve-fixtures.ps1} (and {@code .sh}) starts all four.
+ * <p>{@code clients/java/serve-fixtures.ps1} (and {@code .sh}) starts all five.
  */
 final class LiveService {
 
@@ -75,6 +80,22 @@ final class LiveService {
         return base;
     }
 
+    /**
+     * The service with one reviewer verdict standing, on which APPROVED_PAIR is reachable.
+     *
+     * <p>Same pack, same encoder, one attached consumer -- so a candidate that comes back here as
+     * APPROVED_PAIR and comes back from {@link #matching()} as RETRIEVAL differs by the server's
+     * configuration alone. That is the comparison worth making, and
+     * {@code ApprovedPairIT} makes it by sending the SAME field spec to both.
+     */
+    static String approvedPair() {
+        String base = required(
+                "nexus.matcher.approvedPairBaseUrl", "NEXUS_MATCHER_APPROVED_PAIR_BASE_URL");
+        requireReachable(base);
+        requireMatcherReady(base);
+        return base;
+    }
+
     /** The service whose deadline is short enough that every match times out. */
     static String deadline() {
         String base = required("nexus.matcher.deadlineBaseUrl", "NEXUS_MATCHER_DEADLINE_BASE_URL");
@@ -91,7 +112,7 @@ final class LiveService {
         if (value == null || value.isBlank()) {
             return fail(
                     "neither -D" + property + " nor " + environmentVariable + " is set. These "
-                            + "tests run against a REAL service; start the three fixtures with "
+                            + "tests run against a REAL service; start the five fixtures with "
                             + "clients/java/serve-fixtures.ps1 (or .sh) from the repository root.");
         }
         return value.strip();

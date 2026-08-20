@@ -81,6 +81,31 @@ as evidence.
 
 A public `match_fields` on `NexusMatcher`, and a public accessor for its vocabulary, would
 remove all three couplings; that file belongs to another lane.
+
+## The two evidence blocks, and why neither is on by default
+
+`contrast` and `consistency` are opt-in and STRICTLY ADDITIVE. A request that asks for
+neither gets the four keys this response has always carried, byte for byte -- asserted on
+the bytes in `test_review_evidence_wire.TestAdditive`, not on parsed JSON, because a
+re-ordering survives a parse and this body is diffed by hand.
+
+`contrast` answers the question `explain` cannot. `explain` reports why the WINNER scored
+what it did; a reviewer looking at a surprising match wants to know why not the other one,
+which is a subtraction between two candidates rather than a description of one. It names
+the signals that separated rank 1 from rank 2, by how much, and whether any single one of
+them accounts for the margin -- and it refuses to name a cause below the resolution of the
+numbers the response publishes, because a reason the reviewer cannot see in the artifact
+they are holding is an invented one. Its arithmetic is checked before it is sent, exactly
+as `explain`'s is.
+
+`consistency` REPORTS AND DOES NOT OVERRIDE. Fields are matched one at a time and
+independently, which throws away a constraint that costs nothing to check: two columns
+that are the same concept should get the same answer. Nothing enforces it and nothing
+notices when it fails. Detecting the disagreement needs no ground truth, which is what
+makes it deployable; ACTING on it -- promoting a group's majority -- is a decision that
+can be wrong in a new way, so nothing here does it, and `promotionApplied` says so on the
+wire. Both passes live in `domain/services/review_evidence`, which is where the reasoning
+belongs; this module only projects them.
 """
 
 from __future__ import annotations
@@ -102,7 +127,31 @@ from fastapi.responses import JSONResponse
 # stack, which is the reason `MatchingConfig` below is deferred.
 from nexus_matcher.application.ingest import METADATA_RESERVED_KEYS
 from nexus_matcher.domain.governance import OPEN_CLASSIFICATION
-from nexus_matcher.domain.models.entities import SchemaField, derive_field_decision
+from nexus_matcher.domain.models.entities import (
+    FieldDecision,
+    SchemaField,
+    derive_field_decision,
+)
+
+# The two evidence passes, imported from the DOMAIN rather than written here. Both are
+# arithmetic over match results with no HTTP in them, so a copy in this layer would put
+# domain reasoning behind a transport and make it reachable only over a socket. Imported
+# by module path rather than through `domain.services.__init__` on purpose: that file is
+# the package's export list and belongs to whoever curates it, and this module does not
+# need it to be edited in order to work.
+# The candidate provenance vocabulary and its single reader, from the port that defines
+# the bypass. Import-time rather than deferred: `domain.ports.review_feedback` is domain
+# plus stdlib and pulls no part of the matching stack, which is the same test
+# `application.ingest` above passes and `MatchingConfig` below fails.
+from nexus_matcher.domain.ports.review_feedback import MatchProvenance, provenance_of
+from nexus_matcher.domain.services.review_evidence import (
+    Agreement,
+    GroupingPolicy,
+    SignalSpec,
+    assess_consistency,
+    contrast_top_two,
+    group_by_concept,
+)
 from nexus_matcher.presentation.api.errors import (
     ConservationViolationError,
     MalformedRequestError,
@@ -700,6 +749,15 @@ def _verify_reproducible(confidence: float, explain: dict[str, Any]) -> None:
 
     Clamped exactly as `_weighted_confidence` clamps, so a weight set summing above 1.0 is
     not reported as an arithmetic failure that never happened.
+
+    ONLY SCORED CANDIDATES REACH HERE, and the exclusion is made at the caller by
+    PROVENANCE rather than by loosening anything in this function -- see
+    `_candidate_payload`. A candidate a human decided never went through scoring, so it
+    cannot satisfy an identity describing an arithmetic nobody performed, and refusing the
+    whole response over it reported a scoring drift that had not happened while taking
+    matching down for every other field in the batch. That is a narrowing of WHAT is
+    checked, not of HOW: everything the scorer produced is still checked exactly as
+    before, which is what `TestTheGuardKeepsItsTeeth` holds this to.
     """
     scores = explain["scores"]
     weights = explain["weights"]
@@ -739,11 +797,42 @@ def _candidate_payload(
     a deployment could send its glossary through this service and get back none of what its
     own pipeline needed. Unconditional: it does not wait for `explain`, because a column a
     deployment declared is not diagnostic output.
+
+    ## `provenance`, and why it is a member rather than a number
+
+    Appended after `sourceMetadata` and still before `explain`, by the same rule again.
+    Unconditional and never null: a member that appears only when something unusual
+    happened is a member a client learns about in production.
+
+    It exists because the alternative was tried and was WRONG. A bypassed candidate carried
+    `confidence` 1.0 and `decision` AUTO_APPROVE, and the library asserted that pair was
+    outside the scorer's range. It is not -- the five default weights sum to exactly 1.0,
+    so ordinary retrieval reaches 1.0 whenever all five signals are maximal, and a client
+    reading those two members then cannot tell a human's answer from a very good match. A
+    VALUE cannot collide with a score, and this repository's posture is that a number's
+    meaning must never have to be inferred. See `MatchProvenance`.
+
+    ## `explain` IS NOT ATTACHED TO A CANDIDATE THAT WAS NEVER SCORED
+
+    The block promises `sum(scores * weights) == confidence`, and a candidate a human
+    decided has honest 0.0 components against an honest 1.0 confidence. Three options, and
+    only one is honest: emit the block and let it contradict itself; emit components of 1.0
+    so the arithmetic closes, publishing five measurements nobody took into fields the
+    scoring contract declares comparable ACROSS fields; or leave it out. It is left out --
+    `ExplainView` is already `| None` and the key is already conditional on the request, so
+    absence is a shape every generated client can read.
+
+    THE PREVIOUS BEHAVIOUR WAS A 500 FOR THE WHOLE REQUEST. `_verify_reproducible` refused,
+    correctly in principle, and took every other field in the batch down with it while
+    telling the operator the library had drifted. The check is unchanged for everything the
+    scorer produced; what changed is that a candidate which did not come from scoring is no
+    longer offered to it as evidence of a scoring drift.
     """
     entry = match.dictionary_entry
     confidence = round(float(match.final_confidence), _PRECISION)
     decision = match.decision
     absolute_score = _absolute_score(match)
+    provenance = provenance_of(match)
     payload: dict[str, Any] = {
         "rank": int(match.rank),
         "governanceId": _governance_id(match),
@@ -755,8 +844,9 @@ def _candidate_payload(
         "decision": getattr(decision, "value", str(decision)),
         "absoluteScore": absolute_score,
         "sourceMetadata": _source_metadata_payload(entry),
+        "provenance": provenance.value,
     }
-    if weights is not None:
+    if weights is not None and provenance is MatchProvenance.RETRIEVAL:
         explain = _explain_payload(match, weights, absolute_score)
         _verify_reproducible(confidence, explain)
         payload["explain"] = explain
@@ -830,6 +920,254 @@ def _scoring_payload(
         ],
         "comparabilityScopesNarrowestFirst": list(_COMPARABILITY_SCOPES),
         "comparability": dict(_COMPARABILITY),
+    }
+
+
+# =============================================================================
+# CONTRAST -- WHY THE RUNNER-UP LOST
+# =============================================================================
+
+
+def _contrast_signals(weights: dict[str, float]) -> tuple[SignalSpec, ...]:
+    """
+    The signal table the domain pass works from, built from the ONE pairing table.
+
+    `_SCORE_COMPONENTS` is the single visible place a component is paired with its
+    weight, and the contrast has to use the same pairing or it will attribute a margin to
+    the wrong signal -- a response that is self-consistently wrong, which is the worst
+    failure an audit surface has.
+    """
+    return tuple(
+        SignalSpec(name=key, score_attr=score_attr, weight=weights[key])
+        for key, score_attr, _weight_attr in _SCORE_COMPONENTS
+    )
+
+
+def _contrast_comparability() -> dict[str, Any]:
+    """
+    The scale contract for the contrast's own numbers, DERIVED from `_COMPARABILITY`.
+
+    A difference is exactly as comparable as its operands: the gap between two
+    confidences carries `confidence`'s scope, and a signal's delta carries that signal's.
+    Derived rather than typed a second time, so a number whose declared scope changes
+    cannot leave a stale entry here saying a client may still compare it across fields.
+    """
+    return {
+        "confidenceGap": _COMPARABILITY["confidence"],
+        "signals": {
+            key: _COMPARABILITY[f"explain.scores.{key}"] for key, _a, _w in _SCORE_COMPONENTS
+        },
+    }
+
+
+def _verify_contrast_reproducible(contrast: Any) -> None:
+    """
+    Do the reviewer's subtraction before handing them the contrast.
+
+    The promise is that the per-signal weighted differences sum to the gap between the two
+    published confidences. Checked on the EMITTED numbers, exactly as `_verify_reproducible`
+    checks a single candidate, and for the same reason: an explanation whose arithmetic
+    does not close is worse than none, because it is the one that gets used as evidence.
+    It closes the same class of drift -- a sixth weighted signal this file knows nothing
+    about, or weights that do not explain these confidences -- on a request that asked for
+    the contrast without asking for `explain`, where nothing else would check.
+
+    THE CLAMP IS THE ONE CARVE-OUT. `_weighted_confidence` clamps to [0, 1], so a
+    deployment whose weights sum above 1.0 can produce two candidates that both clamp to
+    1.0: the gap is then legitimately 0 while the weighted differences are not, and
+    refusing would turn a tuned-but-working configuration into a 500. A confidence sitting
+    exactly on a bound is the only case where the two routes are allowed to disagree.
+    """
+    if contrast.top_confidence in (0.0, 1.0) or contrast.runner_up_confidence in (0.0, 1.0):
+        return
+    if abs(contrast.signal_gap - contrast.confidence_gap) > _REPRODUCTION_TOLERANCE:
+        raise drift(
+            "the matcher's scoring",
+            "a reproducible contrast",
+            f"the emitted per-signal differences sum to {contrast.signal_gap!r} while the "
+            f"emitted confidences differ by {contrast.confidence_gap!r}.",
+        )
+
+
+def _contrast_payload(contrast: Any) -> dict[str, Any]:
+    """One contrast, with its keys in the contract's order -- the dict literal IS the wire
+    order, since `DeterministicJSONResponse` does not sort."""
+    return {
+        "topGovernanceId": contrast.top_governance_id,
+        "runnerUpGovernanceId": contrast.runner_up_governance_id,
+        "topConfidence": contrast.top_confidence,
+        "runnerUpConfidence": contrast.runner_up_confidence,
+        "confidenceGap": contrast.confidence_gap,
+        "signalGap": contrast.signal_gap,
+        "separation": contrast.separation.value,
+        "largestDifference": contrast.largest_difference,
+        "decidingSignals": list(contrast.deciding_signals),
+        "governanceDiffers": contrast.governance_differs,
+        "domainDiffers": contrast.domain_differs,
+        "signals": [
+            {
+                "signal": difference.signal,
+                "topScore": difference.top_score,
+                "runnerUpScore": difference.runner_up_score,
+                "delta": difference.delta,
+                "weight": difference.weight,
+                "weightedDelta": difference.weighted_delta,
+                "separating": difference.separating,
+                "deciding": difference.deciding,
+            }
+            for difference in contrast.differences
+        ],
+    }
+
+
+def _contrast_block(
+    specs: list[FieldSpec],
+    matched: dict[str, tuple[MatchResult, ...]],
+    weights: dict[str, float],
+) -> dict[str, Any]:
+    """
+    The contrast for every field, keyed like `results` and with an explicit null where
+    there is no runner-up.
+
+    EVERY INPUT PATH IS PRESENT. A field with one candidate has nothing it lost to, and
+    that must not look like a field this pass skipped -- the same argument the response
+    makes for `governance` being an explicit null and for a matchless field getting `[]`.
+
+    Read from the FULL match list rather than from the `top_k` slice, which is the reading
+    `fieldDecisions` already takes: the runner-up is a property of what the matcher found,
+    not of how many candidates the caller asked to see. A caller who asks for one
+    candidate and a contrast is told what the one they cannot see was.
+    """
+    signals = _contrast_signals(weights)
+    contrasts: dict[str, Any] = {}
+    for spec in specs:
+        matches = matched.get(spec.path, ())
+        try:
+            contrast = contrast_top_two(matches, signals, _PRECISION)
+        except ValueError as exc:
+            raise drift(
+                "ScoreBreakdown",
+                "a readable component",
+                f"a contrast could not be computed for {spec.path!r}: {exc}",
+            ) from exc
+        if contrast is None:
+            contrasts[spec.path] = None
+            continue
+        _verify_contrast_reproducible(contrast)
+        contrasts[spec.path] = _contrast_payload(contrast)
+
+    return {
+        "resolution": 10.0**-_PRECISION,
+        "comparability": _contrast_comparability(),
+        "fields": contrasts,
+    }
+
+
+# =============================================================================
+# CONSISTENCY -- THE SAME CONCEPT, ANSWERED TWICE
+# =============================================================================
+
+
+def _consistency_answers(
+    projected: dict[str, list[dict[str, Any]]],
+    decisions: dict[str, str],
+) -> dict[str, str | None]:
+    """
+    What each column ANSWERED, which is not the same as what it matched.
+
+    A field whose verdict is NO_MATCH inherits nothing -- its candidates are evidence for
+    a reviewer, not a classification -- so it has no answer to contribute. Feeding its
+    rank-1 id in anyway would manufacture a disagreement between a column that answered
+    and one that declined to, which is exactly the noise a report like this dies of.
+    `fieldDecisions` is the field-level authority and this reads it rather than
+    re-deriving a second opinion beside it.
+    """
+    answers: dict[str, str | None] = {}
+    for path, candidates in projected.items():
+        if not candidates or decisions.get(path) == FieldDecision.NO_MATCH.value:
+            answers[path] = None
+        else:
+            answers[path] = str(candidates[0]["governanceId"])
+    return answers
+
+
+def _consistency_block(
+    fields: list[SchemaField],
+    projected: dict[str, list[dict[str, Any]]],
+    decisions: dict[str, str],
+    policy: GroupingPolicy,
+) -> dict[str, Any]:
+    """
+    Which columns look like one concept, and whether they were given one answer.
+
+    REPORTS, NEVER OVERRIDES. Nothing here touches `projected` or `decisions`; both are
+    read. Promoting a group's majority is a decision that can be wrong in a new way --
+    it can move a correct answer to an incorrect one -- while surfacing a disagreement
+    cannot, and the measurement that would justify the former does not exist yet. What
+    does exist is a measurement of the GROUPING, which is its prerequisite -- and it came
+    back negative. See `tests/unit/domain/test_review_evidence_grouping.py`: on a
+    repeated-leaf schema the loose key scores pair-precision 0.0233 and every group it
+    emits is a collision, and no policy in the published space does better while reporting
+    anything at all. The default `qualifier_segments` is 1 for that reason: on the
+    generated corpus it emits nothing, which is the honest output for a grouping nobody has
+    shown to work on that shape.
+
+    The policy is published beside its findings because a finding cannot be judged without
+    the rule that produced it: a group of six that disagree means one thing under a leaf-
+    only key and another under a key that also matched their parent.
+    """
+    groups = group_by_concept(fields, policy)
+    answers = _consistency_answers(projected, decisions)
+
+    # Cheap insurance of the same shape as the conservation law: a group naming a column
+    # this response does not carry would be a report about a field the caller cannot look
+    # up. It cannot happen today -- both sides are built from the same field list -- and
+    # that is exactly the kind of claim this repository has shipped as coverage twice, so
+    # it is checked rather than asserted in a comment.
+    for group in groups:
+        for path in group.paths:
+            if path not in projected:
+                raise ConservationViolationError(
+                    message=(
+                        f"the consistency pass grouped {path!r}, which is not a field of "
+                        f"this response, so the report would name a column the caller "
+                        f"cannot look up."
+                    ),
+                    details={"path": path},
+                )
+
+    findings = assess_consistency(groups, answers)
+    return {
+        "grouping": {
+            "qualifierSegments": policy.qualifier_segments,
+            "includeDataType": policy.include_data_type,
+            "orderSensitive": policy.order_sensitive,
+            "minGroupSize": policy.min_group_size,
+        },
+        "groupsFound": len(findings),
+        "fieldsGrouped": sum(len(finding.paths) for finding in findings),
+        # Compared against the enum member, not against the string it renders as. The
+        # spelling is now a CLOSED published component (`Agreement`), so a rename would be
+        # a wire change caught by the schema gates -- but a literal here would keep
+        # counting zero disagreements in silence while the wire said something else.
+        "groupsDisagreeing": sum(
+            1 for finding in findings if finding.agreement is Agreement.DISAGREE
+        ),
+        # A constant, and published rather than left implicit: a consumer reading this
+        # block is entitled to a machine-readable statement that it changed nothing.
+        "promotionApplied": False,
+        "groups": [
+            {
+                "concept": finding.concept,
+                "fields": list(finding.paths),
+                "answers": dict(finding.answers),
+                "distinctAnswers": finding.distinct_answers,
+                "agreement": finding.agreement.value,
+                "majorityGovernanceId": finding.majority_answer,
+                "majorityCount": finding.majority_count,
+            }
+            for finding in findings
+        ],
     }
 
 
@@ -1001,10 +1339,23 @@ class MatchService:
             self._limits.deadline_seconds,
         )
 
-        weights = _scoring_weights(matcher) if request.explain else None
+        # Read ONCE when either surface needs them, and held in two separately-typed
+        # names. The two uses are genuinely different -- `explain` publishes the weights
+        # on every candidate, while the contrast only needs them to subtract with, so a
+        # caller can have the comparison without the breakdown -- and separate names mean
+        # each block's emission condition is "was this asked for" rather than "did the
+        # weights happen to be readable". A block that silently vanished because a shared
+        # variable was None is a request answered short with nothing saying so.
+        explain_weights: dict[str, float] | None = None
+        contrast_weights: dict[str, float] | None = None
+        if request.explain or request.contrast:
+            read = _scoring_weights(matcher)
+            explain_weights = read if request.explain else None
+            contrast_weights = read if request.contrast else None
+
         floor = _absolute_score_floor(matcher)
         projected, decisions = _project_results(
-            specs, fields, matched, request.top_k, weights, floor
+            specs, fields, matched, request.top_k, explain_weights, floor
         )
         # `results` first: it was the whole body, and the key order IS the wire contract.
         # `vocabulary` is what makes a `governance` of null readable without the caller
@@ -1012,12 +1363,25 @@ class MatchService:
         # the same reason: `fieldDecisions` is the one verdict per column a consumer
         # writes down, and `scoring` is what stops that verdict and the numbers beside it
         # from needing this library's source to interpret.
-        return {
+        body: dict[str, Any] = {
             "results": projected,
             "vocabulary": _vocabulary_payload(matcher),
             "fieldDecisions": decisions,
             "scoring": _scoring_payload(matcher, floor, projected),
         }
+        # APPENDED LAST, and only when asked for. A request that sets neither flag gets
+        # the four keys above and nothing else, byte for byte -- which is asserted on the
+        # bytes rather than on parsed JSON, because a re-ordering survives a parse.
+        if contrast_weights is not None:
+            body["contrast"] = _contrast_block(specs, matched, contrast_weights)
+        if request.consistency:
+            body["consistency"] = _consistency_block(
+                fields,
+                projected,
+                decisions,
+                GroupingPolicy(qualifier_segments=request.consistency_qualifier_segments),
+            )
+        return body
 
 
 def _invoke_matcher(

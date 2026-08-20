@@ -586,7 +586,8 @@ table, enumerated from a live app:
 | GET | `/docs`, `/redoc`, `/openapi.json` | Generated OpenAPI documentation |
 
 **A match response has four top-level keys, in this order: `results`, `vocabulary`,
-`fieldDecisions`, `scoring`.** `results` was once the whole body and everything since has
+`fieldDecisions`, `scoring`** — plus `contrast` and `consistency`, appended only when the
+request asks for them. `results` was once the whole body and everything since has
 been appended to it, never placed in front, so a client generated against an earlier shape
 still reads every key it knew at the key it knew. The one a consumer writes down is
 `fieldDecisions[path]` — **one verdict per column**, and the only place the value

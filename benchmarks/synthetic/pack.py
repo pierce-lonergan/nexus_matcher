@@ -64,6 +64,19 @@ class PackSpec:
     feedback_events: int = 5_000
     paraphrase_strength: float = 0.6
     repeats_per_domain: int = 2
+    # How many of the naming standard's short forms are genuinely contested, as a share
+    # of the vocabulary. This is the dial that decides how far the catalog is from being
+    # the EXACT INVERSE of the contraction, and it exists because an expansion experiment
+    # whose catalog is that inverse measures string reconstruction and nothing else.
+    #
+    # A contested short has several defensible long forms; the standard picks one, so
+    # every OTHER word that contracts to it expands back to a different word. Raise this
+    # and a smaller share of contracted names can be rebuilt letter for letter -- which is
+    # exactly the sweep that tells a reader whether a recovery figure is retrieval or
+    # arithmetic. The default is the value `build_catalog` already used, so a pack
+    # generated without touching this dial is byte-identical to one generated before it
+    # existed.
+    ambiguity: float = 0.08
 
     @property
     def subjects(self) -> int:
@@ -88,7 +101,7 @@ class SyntheticPack:
         pools = build_pools(spec.seed, n_subjects=spec.subjects)
         profile = GlossaryProfile(rows=spec.rows).scaled(spec.difficulty)
         glossary = build_glossary(pools, profile, spec.seed)
-        catalog = build_catalog(pools, spec.seed)
+        catalog = build_catalog(pools, spec.seed, ambiguous_share=spec.ambiguity)
         delta = build_delta(catalog, spec.seed)
         schemas = build_schemas(
             pools,
@@ -197,6 +210,13 @@ class SyntheticPack:
                 "not_contracted": len(self.catalog.identity),
                 "delta_entries": len(self.delta.changed),
                 "delta_version": self.delta.version,
+                # The number that says whether an expansion experiment on this pack can
+                # mean anything: the share of the naming standard's words that the
+                # catalog puts back exactly as they were. At 1.0 the catalog IS the
+                # inverse of the contraction, expansion reconstructs the original string,
+                # and every recovery figure measured on it is arithmetic. Reported here
+                # so no experiment has to be trusted to disclose it.
+                "token_level_invertible_share": _invertible_share(self.catalog),
             },
             "schemas": {
                 s.name: {
@@ -216,6 +236,41 @@ class SyntheticPack:
         if out_dir is not None:
             manifest["checksums"] = _checksums(out_dir)
         return manifest
+
+
+def _invertible_share(catalog: AbbreviationCatalog) -> float:
+    """
+    Of every word the per-word contraction map covers, the share it inverts exactly.
+
+    One word, one round trip: contract it, expand the result, and ask whether the original
+    word came back. Two ways it does -- the short form is uniquely its own and the catalog
+    expands it back, or the standard leaves the word alone and the passthrough expander
+    returns it unchanged. One way it does not: the word LOST a contested short form, so it
+    contracts to a short the catalog resolves to somebody else's word and comes back as a
+    different, equally legitimate-looking word. That last case is what `ambiguity` dials.
+
+    Deliberately scoped to the PER-WORD map. The multi-word rules are a different
+    mechanism -- they apply to an adjacent pair or triple and only when that phrase is
+    present -- so folding them in would make this number depend on the phrase's context
+    rather than on the map, and `multi_word_rules` above already counts them.
+
+    This is a property of the CATALOG, not of any experiment, which is why it is in the
+    manifest: an expansion measurement taken on a pack whose value here is 1.0 is
+    measuring `f_inverse(f(x)) == x` and nothing else, and no experiment should have to be
+    trusted to disclose that about its own fixture.
+    """
+    total = len(catalog.contraction)
+    if not total:
+        return 0.0
+
+    def survives(long: str, short: str) -> bool:
+        expansion = catalog.expansions.get(short)
+        if expansion is None:
+            return short == long
+        return expansion.lower() == long.lower()
+
+    kept = sum(1 for long, short in catalog.contraction.items() if survives(long, short))
+    return round(kept / total, 4)
 
 
 def _max_repetition(schema: SyntheticSchema) -> int:

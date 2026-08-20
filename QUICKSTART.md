@@ -349,6 +349,15 @@ and byte-identical between two identical requests — all three checked on the c
 `scoring`.** `results` was once the whole body, so everything since has been appended
 rather than placed in front of it.
 
+Two further keys are appended **only if you ask**: `"contrast": true` adds a per-field
+comparison of rank 1 against rank 2 — which signals separated them and which, if any,
+decided it — and `"consistency": true` adds a report of which columns look like one
+business concept and whether they were given one answer. Both default off, both are
+reporting-only, and with neither set the body is byte-identical to the one this service
+sent before they existed. Read the
+[consistency limits](docs/API_REFERENCE.md#consistency-and-why-it-is-off) before acting on
+what it finds: its grouping was measured and it is off by default for that reason.
+
 `vocabulary` echoes back the two things a caller cannot otherwise infer from a response:
 which tier an uncoded field sits at, and the order the caller's own file declares its
 tiers in. Without it a `"governance": null` is uninterpretable without a second copy of

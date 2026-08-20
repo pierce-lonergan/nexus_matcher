@@ -120,6 +120,15 @@ _SCHEMA_TO_JAVA = {
     "RetrievalChannelView": "model/RetrievalChannel.java",
     "RetrievalCandidateView": "model/RetrievalCandidate.java",
     "ExpectedPlacementView": "model/ExpectedPlacement.java",
+    # The two review-evidence blocks, both appended to `MatchResponseView` and both opt-in.
+    # Bound here whatever the server's default for asking is: a client that cannot read a member
+    # the server MAY send is the drift this file exists to catch, and "the flag is off today" is
+    # a deployment's decision rather than a property of the contract.
+    "ContrastReportView": "model/ContrastReport.java",
+    "ContrastView": "model/Contrast.java",
+    "SignalDifferenceView": "model/SignalDifference.java",
+    "ConsistencyReportView": "model/ConsistencyReport.java",
+    "ConceptGroupView": "model/ConceptGroup.java",
 }
 
 # The error envelope is NOT a record on the Java side -- it is decoded straight into the
@@ -140,6 +149,12 @@ _NOT_RESTATED_AS_A_RECORD = {
     "ErrorResponse": "carried by the NexusMatcherException hierarchy, not a record",
     "MatchDecision": "an enum; see test_every_match_decision_value_exists_in_the_java_enum",
     "FieldDecision": "an enum; see test_every_match_decision_value_exists_in_the_java_enum",
+    "Separation": "an enum; see test_every_match_decision_value_exists_in_the_java_enum",
+    "Agreement": "an enum; see test_every_match_decision_value_exists_in_the_java_enum",
+    "MatchProvenanceView": (
+        "an enum; see test_every_match_decision_value_exists_in_the_java_enum. It is the TYPE of "
+        "MatchCandidateView.provenance, which the record binds by name like any other member."
+    ),
 }
 
 
@@ -212,6 +227,21 @@ _NOT_ON_THE_JAVA_SIDE_YET: dict[str, str] = {
 _SCHEMA_TO_JAVA_ENUM = {
     "MatchDecision": ("model/MatchDecision.java", "MatchDecision"),
     "FieldDecision": ("model/FieldDecision.java", "FieldDecision"),
+    # The review-evidence vocabularies. Published as closed components, bound OPEN on the Java
+    # side with a sentinel -- the same call `FieldDecision` makes, for the reason its javadoc
+    # gives second: blast radius. A `decision` is one candidate of one field. A `separation` and
+    # an `agreement` sit inside blocks that carry one entry per field in the request, up to 250
+    # on the batch route, so refusing the whole body over one unrecognised word describing WHY a
+    # runner-up lost would discard every answer in the batch to protect a reader from commentary.
+    "Separation": ("model/Separation.java", "Separation"),
+    "Agreement": ("model/Agreement.java", "Agreement"),
+    # Where a candidate's answer came from. Published closed -- it is the library's own
+    # vocabulary, like `MatchDecision` -- and bound OPEN here, on the same blast-radius argument
+    # `FieldDecision` makes and with more of it at stake than any of the three above: a
+    # `decision` sits inside one candidate, but `provenance` rides on EVERY candidate of EVERY
+    # field, up to 250 fields on the batch route. A closed binding would let one unrecognised
+    # word on one runner-up cost every verdict, class and candidate in the response.
+    "MatchProvenanceView": ("model/MatchProvenance.java", "MatchProvenance"),
 }
 
 # Constants the Java enum declares that the service does NOT publish, with the reason.
@@ -233,6 +263,72 @@ _CLIENT_SIDE_ENUM_SENTINELS = {
         "UNKNOWN": (
             "the client-side sentinel for a verdict this build does not know. Never on the "
             "wire; FieldVerdict.wireValue() carries what the server actually sent."
+        )
+    },
+    "Separation": {
+        "UNKNOWN": (
+            "the client-side sentinel for a separation this build does not know. Never on the "
+            "wire; Contrast.separation() keeps the server's own string, and isTied() and "
+            "isSeparated() both answer false rather than guessing."
+        )
+    },
+    "Agreement": {
+        "UNKNOWN": (
+            "the client-side sentinel for an agreement this build does not know. Never on the "
+            "wire; ConceptGroup.agreement() keeps the server's own string, and agrees() and "
+            "disagrees() both answer false -- an unread value must not become a quiet AGREE."
+        )
+    },
+    "MatchProvenanceView": {
+        "UNKNOWN": (
+            "the client-side sentinel for a provenance this build does not know, and also what "
+            "an older server's SILENCE reads as -- neither may be defaulted to RETRIEVAL, "
+            "because the bypass existed before the member did. Never on the wire; "
+            "MatchCandidate.provenance() keeps the server's own string, and "
+            "decidedByAReviewer() and wasScored() both answer false: an unread value must not "
+            "become a quiet 'a human approved this', nor a quiet 'these numbers are a "
+            "measurement'."
+        )
+    },
+}
+
+
+# =============================================================================
+# THE ENUMS THAT ARE NOT COMPONENTS
+# =============================================================================
+#
+# An enum can reach the wire two ways, and the tables above see only one of them. A
+# `MatchDecision` is its own named component, so a generated client gets a TYPE for it and the
+# check above notices when the values move. A `Literal[...]` on a property renders INLINE --
+# `properties.verdict.anyOf[0].enum` -- with no component and no type name anywhere.
+#
+# That inline rendering is a deliberate server-side decision and it is the whole reason
+# `FeedbackRequest.verdict` is spelled as a Literal: a component would hand every generated
+# client a closed type that stops decoding the day a fourth value is added. Which means an
+# inline enum is EXACTLY the case where a hand-written client must not bind a closed Java
+# `enum` -- and it is also the case nothing was watching, because
+# `test_every_match_decision_value_exists_in_the_java_enum` walks named components only and an
+# inline enum is invisible to it.
+#
+# So these two tables, and `test_every_inline_enum_is_bound_and_stays_open` below, which SEARCHES
+# the published document for inline enums rather than sampling the ones somebody remembered.
+
+# (published schema, property name) -> (Java file, Java enum name).
+_INLINE_ENUM_TO_JAVA = {
+    ("FeedbackRequest", "verdict"): ("model/ReviewDecision.java", "ReviewDecision"),
+}
+
+# The constants the Java enum adds to an inline vocabulary, with what each is for.
+#
+# At least one is REQUIRED per inline enum -- see the test -- which is the rule that keeps the
+# server's decision intact on this side of the wire. An enum with no sentinel has nowhere to put
+# a value it does not recognise, so its only remaining option is to refuse the response.
+_INLINE_ENUM_SENTINELS = {
+    ("FeedbackRequest", "verdict"): {
+        "UNKNOWN": (
+            "the client-side sentinel for a verdict this build does not know. Never on the "
+            "wire; ReviewVerdict.wireValue() carries what the server actually sent, and "
+            "Feedback refuses to SEND one, because the string 'UNKNOWN' would be a 422."
         )
     },
 }
@@ -303,6 +399,72 @@ def _enum_constants(source: str, enum_name: str) -> set[str]:
     return set(re.findall(r"\b([A-Z][A-Z0-9_]{2,})\b", match.group(1)))
 
 
+def _enum_values_within(node: object) -> set[str]:
+    """
+    Every enum value anywhere inside a JSON fragment, however it is nested.
+
+    Deliberately a SEARCH and not a lookup at a known path. `verdict` renders today as
+    `anyOf[0].enum` because it is `Literal[...] | None`; a required one would be `.enum`, one
+    inside a list would be `items.enum`, and one inside a map `additionalProperties.enum`.
+    Reading only the shape that exists right now is how a gate goes quietly green when the
+    shape moves, which is the failure mode this whole file is written against.
+    """
+    found: set[str] = set()
+    if isinstance(node, dict):
+        values = node.get("enum")
+        if isinstance(values, list):
+            found |= {str(value) for value in values}
+        for value in node.values():
+            found |= _enum_values_within(value)
+    elif isinstance(node, list):
+        for value in node:
+            found |= _enum_values_within(value)
+    return found
+
+
+def _inline_enums(spec: dict) -> dict[tuple[str, str], set[str]]:
+    """
+    Every published enum that is NOT a component of its own, keyed by (schema, property).
+
+    A schema that IS an enum is skipped: that is a named component and
+    `test_every_match_decision_value_exists_in_the_java_enum` owns it. What is left is the
+    vocabulary a generated client gets as bare strings, and this repository's hand-written
+    client must therefore bind as an OPEN type.
+    """
+    schemas = spec["components"]["schemas"]
+    found: dict[tuple[str, str], set[str]] = {}
+    for schema_name, schema in schemas.items():
+        if "enum" in schema:
+            continue
+        for member, node in (schema.get("properties") or {}).items():
+            # `$ref`s are followed by the component walk, not here: an enum reached through a
+            # reference IS a named component and is covered by the other gate.
+            values = _enum_values_within(node)
+            if values:
+                found[(schema_name, member)] = values
+    return found
+
+
+_SWITCH_ARM = re.compile(
+    r"case\s+([A-Z][A-Z0-9_,\s]*?)\s*->\s*Optional\.of\(Boolean\.(TRUE|FALSE)\)"
+)
+
+
+def _java_verdict_pairing(source: str) -> dict[str, bool]:
+    """
+    `ReviewDecision.requiredWasCorrect()`, read as a mapping.
+
+    The Java client refuses a `Feedback` whose verdict contradicts its `wasCorrect` before it
+    is sent, which is a COPY of a server rule with no compiler between the two. Reading the
+    switch back out is what lets the copy be compared against the original.
+    """
+    pairing: dict[str, bool] = {}
+    for constants, boolean in _SWITCH_ARM.findall(source):
+        for constant in re.findall(r"[A-Z][A-Z0-9_]+", constants):
+            pairing[constant] = boolean == "TRUE"
+    return pairing
+
+
 def _mapped_statuses(source: str) -> set[int]:
     """
     Every status the `of(...)` switch maps to a SPECIFIC exception.
@@ -368,6 +530,165 @@ def _published_failure_statuses(spec: dict) -> set[int]:
                 if str(code).isdigit() and int(code) >= 400:
                     statuses.add(int(code))
     return statuses
+
+
+# =============================================================================
+# THE ENUM COMPARISONS
+# =============================================================================
+#
+# Split out of `test_every_match_decision_value_exists_in_the_java_enum` rather than written
+# inside it, because that function's NAME is load-bearing -- `tests/packaging/conftest.py`
+# declares its opt-in skip by nodeid -- so the gate cannot be split by renaming it or by
+# adding a second test function. Each helper returns FINDINGS rather than asserting, so one
+# run reports every disagreement instead of stopping at the first.
+
+
+def _component_enum_findings(published_enums: dict[str, set[str]]) -> list[str]:
+    """Every published enum COMPONENT against the Java enum that binds it."""
+    findings: list[str] = []
+    for schema_name, published in sorted(published_enums.items()):
+        java_file, enum_name = _SCHEMA_TO_JAVA_ENUM[schema_name]
+        declared = _enum_constants(_java(java_file), enum_name)
+
+        missing = published - declared
+        if missing:
+            findings.append(
+                f"{schema_name} -> {java_file}: the service publishes {sorted(missing)} and "
+                f"the Java enum does not declare them (it declares {sorted(declared)}). A "
+                f"response carrying one fails to decode."
+            )
+
+        # Extra constants are allowed only where this file has written down what they are
+        # for. An undeclared extra is a client-side value somebody added without saying what
+        # it means, which is how a sentinel quietly becomes a guess.
+        sentinels = _CLIENT_SIDE_ENUM_SENTINELS.get(schema_name, {})
+        undeclared_extras = declared - published - set(sentinels)
+        if undeclared_extras:
+            findings.append(
+                f"{schema_name} -> {java_file}: the Java enum declares "
+                f"{sorted(undeclared_extras)}, which the service does not publish and "
+                f"_CLIENT_SIDE_ENUM_SENTINELS does not explain."
+            )
+
+        # And the sharp one: a sentinel the server has started publishing is no longer a
+        # sentinel, it is a real verdict wearing the client's "I could not read that" hat.
+        collided = set(sentinels) & published
+        if collided:
+            findings.append(
+                f"{schema_name}: {sorted(collided)} is declared as a CLIENT-SIDE sentinel in "
+                f"{java_file} and the service now publishes it as a real value. The Java "
+                f"client would read a genuine server verdict as 'this build did not "
+                f"understand you'. Rename the sentinel."
+            )
+    return findings
+
+
+def _inline_enum_findings(inline: dict[tuple[str, str], set[str]]) -> list[str]:
+    """
+    Every enum published INLINE on a property, under the OPPOSITE rule.
+
+    A component enum must be bound closed and complete. An inline one must be bound OPEN:
+    rendering inline is how this service declines to hand generated clients a type that
+    breaks on a new value, and a hand-written client binding it closed takes that decision
+    back. So a sentinel is REQUIRED here, where on a component it is merely permitted.
+    """
+    findings: list[str] = []
+    for key, published in sorted(inline.items()):
+        schema_name, member = key
+        java_file, enum_name = _INLINE_ENUM_TO_JAVA[key]
+        declared = _enum_constants(_java(java_file), enum_name)
+        sentinels = _INLINE_ENUM_SENTINELS.get(key, {})
+        where = f"{schema_name}.{member} -> {java_file}"
+
+        missing = published - declared
+        if missing:
+            findings.append(
+                f"{where}: the service publishes {sorted(missing)} and the Java enum does "
+                f"not declare them (it declares {sorted(declared)})."
+            )
+
+        if not sentinels:
+            findings.append(
+                f"{where}: this vocabulary is published INLINE, which is the service "
+                f"declining to hand clients a closed type for it. The Java enum must "
+                f"therefore carry a sentinel for an unrecognised value, and "
+                f"_INLINE_ENUM_SENTINELS declares none. Binding it closed re-creates the "
+                f"deserialisation break the inline rendering was chosen to avoid."
+            )
+        elif not set(sentinels) <= declared:
+            findings.append(
+                f"{where}: _INLINE_ENUM_SENTINELS declares "
+                f"{sorted(set(sentinels) - declared)} which the Java enum does not, so the "
+                f"open binding this table claims is not there."
+            )
+
+        undeclared_extras = declared - published - set(sentinels)
+        if undeclared_extras:
+            findings.append(
+                f"{where}: the Java enum declares {sorted(undeclared_extras)}, which the "
+                f"service does not publish and _INLINE_ENUM_SENTINELS does not explain."
+            )
+
+        collided = set(sentinels) & published
+        if collided:
+            findings.append(
+                f"{where}: {sorted(collided)} is declared as a CLIENT-SIDE sentinel and the "
+                f"service now publishes it as a real value. Rename the sentinel."
+            )
+    return findings
+
+
+def _the_copied_verdict_pairing_still_matches_the_server(
+    inline: dict[tuple[str, str], set[str]],
+) -> None:
+    """
+    The one rule the Java client COPIES rather than reads off the wire.
+
+    `Feedback` refuses a verdict that contradicts its own `wasCorrect` before sending, so a
+    reviewer's verdict is not lost to a 422 discovered over the network. That refusal is a
+    second description of a server rule with no compiler between them -- the same hazard
+    `test_the_unconfigured_vocabulary_sentinel_matches_the_server` guards -- so the copy is
+    compared against the original by asking the real server model which pairs it accepts,
+    in BOTH directions. A client that refuses a pair the server ACCEPTS is rejecting a
+    record a reviewer is entitled to file, which is the quieter of the two failures.
+    """
+    from pydantic import ValidationError
+
+    from nexus_matcher.presentation.api.feedback import FeedbackRequest
+
+    def accepted_by_the_server(verdict: str, was_correct: bool) -> bool:
+        try:
+            FeedbackRequest(
+                field="t.a",
+                chosenGovernanceId="GBF-0001",
+                wasCorrect=was_correct,
+                reviewer="gate",
+                ts="2026-08-20T00:00:00Z",
+                verdict=verdict,
+            )
+        except ValidationError:
+            return False
+        return True
+
+    java_pairing = _java_verdict_pairing(_java("model/ReviewDecision.java"))
+    published = inline.get(("FeedbackRequest", "verdict"), set())
+    assert set(java_pairing) == published, (
+        f"ReviewDecision.requiredWasCorrect() answers for {sorted(java_pairing)} while the "
+        f"service publishes {sorted(published)}. Either the switch was reshaped out from "
+        f"under this parser or a verdict has no client-side pairing, and Feedback would then "
+        f"throw on a verdict the server accepts."
+    )
+
+    for verdict, requires in sorted(java_pairing.items()):
+        assert accepted_by_the_server(verdict, requires), (
+            f"the Java client pairs {verdict} with wasCorrect={requires} and the server "
+            f"REFUSES that pair, so Feedback would build a request that is always a 422."
+        )
+        assert not accepted_by_the_server(verdict, not requires), (
+            f"the Java client refuses {verdict} with wasCorrect={not requires} and the "
+            f"server now ACCEPTS it, so this client rejects a record a reviewer is entitled "
+            f"to file. Relax Feedback's constructor and ReviewDecision.requiredWasCorrect()."
+        )
 
 
 # =============================================================================
@@ -593,11 +914,24 @@ def test_every_match_decision_value_exists_in_the_java_enum():
     NODEID, so renaming the function here would silently un-declare its skip in a checkout
     without `clients/java/` -- a rename that switches a gate off is exactly the vacuity this
     file is written against. Renaming it is a two-file change and belongs with whoever owns
-    the conftest.
+    the conftest. The INLINE half below is here for the same reason: a second function would
+    need a second conftest entry to be allowed to skip, so it is one gate with two halves
+    rather than a gate and an undeclared one.
+
+    ## The inline half, and why the rule for it is the opposite rule
+
+    A component enum must be bound CLOSED and complete. An enum published inline on a
+    property must be bound OPEN, and that is not a stylistic difference: rendering inline is
+    how this service declines to give generated clients a type that breaks on a fourth value,
+    and a hand-written client binding it closed takes that decision back. So an inline enum
+    is required to have a sentinel -- somewhere for an unrecognised value to land -- and the
+    inline enums are SEARCHED for rather than looked up at a remembered path.
     """
-    schemas = _openapi()["components"]["schemas"]
+    spec = _openapi()
     published_enums = {
-        name: set(schema["enum"]) for name, schema in schemas.items() if "enum" in schema
+        name: set(schema["enum"])
+        for name, schema in spec["components"]["schemas"].items()
+        if "enum" in schema
     }
     assert published_enums, "no enums are published; this comparison proves nothing"
 
@@ -607,42 +941,28 @@ def test_every_match_decision_value_exists_in_the_java_enum():
         f"checks whether the Java client can decode their values: {sorted(unwatched)}"
     )
 
-    findings: list[str] = []
-    for schema_name, published in sorted(published_enums.items()):
-        java_file, enum_name = _SCHEMA_TO_JAVA_ENUM[schema_name]
-        declared = _enum_constants(_java(java_file), enum_name)
+    inline = _inline_enums(spec)
 
-        missing = published - declared
-        if missing:
-            findings.append(
-                f"{schema_name} -> {java_file}: the service publishes {sorted(missing)} and "
-                f"the Java enum does not declare them (it declares {sorted(declared)}). A "
-                f"response carrying one fails to decode."
-            )
+    unwatched_inline = sorted(set(inline) - set(_INLINE_ENUM_TO_JAVA))
+    assert not unwatched_inline, (
+        f"these enums are published INLINE on a property and are bound by no entry in "
+        f"_INLINE_ENUM_TO_JAVA, so nothing checks whether the Java client can read their "
+        f"values: {unwatched_inline}. An inline enum gets no component and no type name, so "
+        f"the check that walks components cannot see it."
+    )
 
-        # Extra constants are allowed only where this file has written down what they are
-        # for. An undeclared extra is a client-side value somebody added without saying what
-        # it means, which is how a sentinel quietly becomes a guess.
-        sentinels = _CLIENT_SIDE_ENUM_SENTINELS.get(schema_name, {})
-        undeclared_extras = declared - published - set(sentinels)
-        if undeclared_extras:
-            findings.append(
-                f"{schema_name} -> {java_file}: the Java enum declares "
-                f"{sorted(undeclared_extras)}, which the service does not publish and "
-                f"_CLIENT_SIDE_ENUM_SENTINELS does not explain."
-            )
+    stale_inline = sorted(set(_INLINE_ENUM_TO_JAVA) - set(inline))
+    assert not stale_inline, (
+        f"these entries name an inline enum the service no longer publishes there: "
+        f"{stale_inline}. Either the member was dropped, or it was PROMOTED to a named "
+        f"schema component -- which is a contract change, because a generated client then "
+        f"gets a closed type for it. If it was promoted, move the entry to "
+        f"_SCHEMA_TO_JAVA_ENUM and decide whether the Java binding stays open."
+    )
 
-        # And the sharp one: a sentinel that the server has started publishing is no longer
-        # a sentinel, it is a real verdict wearing the client's "I could not read that" hat.
-        collided = set(sentinels) & published
-        if collided:
-            findings.append(
-                f"{schema_name}: {sorted(collided)} is declared as a CLIENT-SIDE sentinel in "
-                f"{java_file} and the service now publishes it as a real value. The Java "
-                f"client would read a genuine server verdict as 'this build did not "
-                f"understand you'. Rename the sentinel."
-            )
+    _the_copied_verdict_pairing_still_matches_the_server(inline)
 
+    findings = _component_enum_findings(published_enums) + _inline_enum_findings(inline)
     assert not findings, "the published enums and the Java enums disagree:\n  " + "\n  ".join(
         findings
     )
@@ -737,9 +1057,56 @@ def test_the_java_source_parsers_are_not_vacuous():
         f"the enum scan no longer reads FieldDecision.java; it found {sorted(field_decisions)}"
     )
 
+    # The candidate's provenance, on both sides of the seam it spans. Asserted here as well as in
+    # the gates above because BOTH of those gates are difference tests: a @JsonProperty scan that
+    # stopped reading MatchCandidate.java would report no member missing, and an enum scan that
+    # stopped reading MatchProvenance.java would report no value undeclared -- while a Java caller
+    # had lost the only member that says whether an answer came from a human or from the model.
+    candidate = _wire_names(_java("model/MatchCandidate.java"))
+    assert {"confidence", "decision", "absoluteScore", "provenance"} <= candidate, (
+        f"the @JsonProperty scan no longer reads MatchCandidate.java; it found {sorted(candidate)}"
+    )
+
+    provenances = _enum_constants(_java("model/MatchProvenance.java"), "MatchProvenance")
+    assert {"RETRIEVAL", "APPROVED_PAIR", "UNKNOWN"} <= provenances, (
+        f"the enum scan no longer reads MatchProvenance.java; it found {sorted(provenances)}"
+    )
+
     statuses = _mapped_statuses(_java("error/NexusMatcherException.java"))
     assert {413, 422, 500, 503, 504} <= statuses, (
         f"the switch scan no longer reads NexusMatcherException.java; it found {sorted(statuses)}"
+    )
+
+    # The inline-enum search, against the live document. Its failure mode is the file's worst
+    # one -- a walk that stops matching finds nothing and reports nothing unwatched -- so it is
+    # asserted to still find the one inline enum this service publishes, and the Java enum that
+    # binds it is asserted to still carry both the vocabulary and its sentinel.
+    inline = _inline_enums(_openapi())
+    assert inline, (
+        "the inline-enum search found nothing. Either the service stopped publishing every "
+        "inline enum -- in which case _INLINE_ENUM_TO_JAVA is stale and the gate above says "
+        "so -- or the walk is broken and is now reporting every inline enum as watched."
+    )
+    assert inline.get(("FeedbackRequest", "verdict")) == {
+        "APPROVED",
+        "REJECTED",
+        "MANUAL_OVERRIDE",
+    }, (
+        f"the inline-enum search no longer reads FeedbackRequest.verdict, which renders as "
+        f"anyOf[0].enum because the member is optional; it found {inline}"
+    )
+
+    review = _enum_constants(_java("model/ReviewDecision.java"), "ReviewDecision")
+    assert {"APPROVED", "REJECTED", "MANUAL_OVERRIDE", "UNKNOWN"} <= review, (
+        f"the enum scan no longer reads ReviewDecision.java; it found {sorted(review)}"
+    )
+
+    pairing = _java_verdict_pairing(_java("model/ReviewDecision.java"))
+    assert pairing == {"APPROVED": True, "REJECTED": False, "MANUAL_OVERRIDE": False}, (
+        f"the switch scan no longer reads ReviewDecision.requiredWasCorrect(); it found "
+        f"{pairing}. The gate that compares that mapping against the server's own refusal "
+        f"is a difference against this dict, so an under-read passes it over every arm it "
+        f"failed to see."
     )
 
     # And it can see an omission. These are the shapes the checks above would have to
@@ -764,4 +1131,37 @@ def test_the_java_source_parsers_are_not_vacuous():
     assert _mapped_statuses("default -> c;") == set(), (
         "the default arm must not count as a mapped status, or this gate passes for a "
         "client that maps nothing at all"
+    )
+
+    # The inline walk, against every nesting the schema generator can produce. A lookup that
+    # only knew `anyOf[0].enum` would pass today and stop seeing the member the moment it
+    # became required, which is a one-word change on the server.
+    assert _enum_values_within({"enum": ["A"]}) == {"A"}, "a bare required enum"
+    assert _enum_values_within({"anyOf": [{"enum": ["A"]}, {"type": "null"}]}) == {"A"}
+    assert _enum_values_within({"items": {"enum": ["A", "B"]}}) == {"A", "B"}
+    assert _enum_values_within({"additionalProperties": {"enum": ["A"]}}) == {"A"}
+    assert _enum_values_within({"$ref": "#/components/schemas/MatchDecision"}) == set(), (
+        "a reference is a NAMED component and belongs to the other half of this gate; "
+        "counting it inline would demand an open binding for a deliberately closed enum"
+    )
+    assert _inline_enums(
+        {
+            "components": {
+                "schemas": {"E": {"enum": ["A"]}, "S": {"properties": {"m": {"enum": ["A"]}}}}
+            }
+        }
+    ) == {("S", "m"): {"A"}}, (
+        "a schema that IS an enum is a component and must not be reported as inline, or "
+        "every component enum would be required to carry a sentinel"
+    )
+
+    # And the switch parser, which must be able to see an arm that is NOT there.
+    assert _java_verdict_pairing("case A_B -> Optional.of(Boolean.TRUE);") == {"A_B": True}
+    assert _java_verdict_pairing("case C_D, E_F -> Optional.of(Boolean.FALSE);") == {
+        "C_D": False,
+        "E_F": False,
+    }, "a multi-constant arm must yield every constant, not only the first"
+    assert _java_verdict_pairing("case G_H -> Optional.empty();") == {}, (
+        "an arm that answers no pairing must not be read as one, or UNKNOWN would look "
+        "like a verdict this client is prepared to send"
     )

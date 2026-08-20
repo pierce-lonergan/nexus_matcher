@@ -24,10 +24,10 @@ this library ships no taxonomy at all.
 
 Nothing in your controlled vocabulary is typed as a Java enum. `code`, `name`, `classification`,
 `enhancement`, `tier`, `absoluteScoreMetric`, a status warning's `code` and every key and value of
-`sourceMetadata` are open and will stay open. The only Java enums here are `MatchDecision` and
-`FieldDecision`, which are the library's own vocabularies and are published as closed sets in
-`/openapi.json` — and they behave differently on an unknown value. See
-[Two enums, two answers](#two-enums-two-answers-about-an-unknown-value).
+`sourceMetadata` are open and will stay open. Every Java enum here — `MatchDecision`,
+`FieldDecision`, `ReviewDecision`, `Separation`, `Agreement`, `MatchProvenance` — is one of the
+library's *own* vocabularies, and they do not all behave the same way on an unknown value. See
+[Six enums, two answers](#six-enums-two-answers-about-an-unknown-value).
 
 ## Using it
 
@@ -109,6 +109,9 @@ nothing, it only says which kind of nothing.
 governs scores higher than several that matched correctly. `REVIEW` means "a human must decide",
 never "probably fine". Do not diff against `confidence` either; it moves with any retrieval change.
 
+And do not read **1.0** as anything but a number. It is not a sentinel, it is reachable by ordinary
+retrieval, and `provenance` below is what says where an answer came from.
+
 ### One verdict per column: `fieldDecisions`
 
 `decision` on a candidate is about **that candidate**. The value that goes into a metadata sheet is
@@ -145,8 +148,10 @@ with no normalisation and no floor, and `scoring.thresholdableAcrossFields` name
 you may legitimately compare against a constant across different columns — which `confidence`
 is not.
 
-**`null` is not zero.** Null means the dense retriever never returned that candidate at all; it
-reached the shortlist through the lexical arm alone. Zero would mean "measured, and as far from the
+**`null` is not zero, and it has two causes.** Either the dense retriever never returned that
+candidate — it reached the shortlist through the lexical arm alone — or nothing scored it at all,
+because a reviewer decided the field and matching was skipped. `wasScored()` tells the two apart.
+Zero would mean "measured, and as far from the
 query as this metric goes", which is a very different claim, and on a cosine metric a very bad
 score. The component is therefore a boxed `Double`, deliberately: a primitive would let Jackson
 bind the absent number to `0.0` in silence and a caller filtering `>= floor` would drop the
@@ -179,15 +184,65 @@ Check `isComplete()` before treating the map as a record of the glossary row. Wh
 absent key may have been *dropped to fit the cap* rather than *not populated*, and those are
 different conclusions about your glossary.
 
-### Two enums, two answers about an unknown value
+### `provenance`: who decided this candidate
 
-Both closed sets in this client are the library's own vocabulary. They behave differently when a
-newer server sends a value this build has never heard of, and the difference is deliberate:
+`RETRIEVAL` means the pipeline scored the candidate. `APPROVED_PAIR` means a reviewer had already
+decided the pair and matching was skipped for that field. Present on every candidate.
+
+```java
+candidate.provenanceValue();      // RETRIEVAL | APPROVED_PAIR | UNKNOWN
+candidate.decidedByAReviewer();   // true only for APPROVED_PAIR
+candidate.wasScored();            // true only for RETRIEVAL
+candidate.provenance();           // the server's own string, verbatim
+```
+
+**Read this, never `confidence`.** The obvious test — a confidence of exactly 1.0 with
+`AUTO_APPROVE` — does not work, and the service's own source used to assert that it did, on the
+grounds that the scorer could not reach 1.0. It can: the five default weights sum to exactly 1.0
+and every signal is attainable at 1.0. `captured/match-response-approved-pair.json` is a live
+capture of both cases in one body, agreeing on confidence, on decision, and on the entry id.
+
+A candidate a reviewer decided says so in three more ways, and each is an *absence with a reason*
+rather than a zero:
+
+* it is **alone** in its field, however large `top_k` was. Ranks 2 and beyond would have to come
+  from retrieval, and retrieval did not run;
+* `absoluteScore()` is `null` — nothing measured it;
+* `explain()` is absent even when the request asked for one. That block promises
+  `sum(scores × weights) == confidence`, and a candidate with no components cannot keep it.
+
+**`decidedByAReviewer()` is not a licence to inherit.** Whether the *field* may take rank 1's
+protection class is the server's rule, published as `fieldDecisions` and applied by
+`inheritableGovernanceFor(path)`; this client holds no second opinion about it. What `provenance`
+answers is *who decided*, which is the fact no other member carries — and the fact an audit trail,
+a coverage count or a re-review queue actually needs.
+
+### Six enums, two answers about an unknown value
+
+Every closed set in this client is the library's own vocabulary. They behave differently when a
+newer server sends a value this build has never heard of, and the difference is deliberate — it
+turns entirely on **what one unreadable value costs**:
 
 | | unknown value | why |
 |---|---|---|
 | `MatchDecision` (per candidate) | **throws**, naming the value | the service has committed to freezing it. Putting `NO_MATCH` on a *new* enum instead of widening this one **is** that commitment |
 | `FieldDecision` (per field) | becomes `UNKNOWN`, keeps the raw string, grants nothing | this is the vocabulary that grows — it was born by growing |
+| `ReviewDecision` (`Feedback.verdict`) | becomes `UNKNOWN`, keeps the raw string, refuses to be *sent* | the service publishes this one **inline on the property**, with no schema component, precisely so no generated client gets a closed type for it. Binding it closed here would take that decision back |
+| `Separation` (per contrast) | becomes `UNKNOWN`; `isTied()` and `isSeparated()` both answer false | a word describing *why a runner-up lost*, inside a block with one entry per field |
+| `Agreement` (per concept group) | becomes `UNKNOWN`; `agrees()` and `disagrees()` both answer false | likewise — and an unread value must never become a quiet `AGREE` |
+| `MatchProvenance` (per candidate) | becomes `UNKNOWN`; `decidedByAReviewer()` and `wasScored()` both answer false | it rides on *every* candidate of *every* field, so a closed binding puts the largest blast radius in this table behind the newest vocabulary |
+
+The last three are published as **closed** components and are still bound open here. A closed
+vocabulary is a promise about what the server will send; an open binding is a decision about what
+happens if that promise is ever revised, and the two are different questions. What settles each row
+is the **blast radius**: refusing a whole response — up to 250 fields of verdicts, candidates and
+governance — to protect a reader from one unrecognised word on one candidate is not a trade worth
+making, and `provenance` has the widest radius of the six because it rides on every candidate of
+every field.
+
+That is not the same as saying an unread value is harmless. It is not usable as an answer either,
+which is the other half of every row above: `MatchProvenance.UNKNOWN` grants nothing, claims
+nothing, and is never mapped onto whichever known value looks closest.
 
 Binding `FieldDecision` closed would re-create, on the new field, the exact deserialisation break
 the new field was invented to avoid. The blast radius also differs by the batch size: a `decision`
@@ -204,6 +259,13 @@ Degrading here is not a guess, because `UNKNOWN` is not usable as an answer:
 * the client never maps it onto the nearest value it does know. That silent reinterpretation — a
   new `APPROVE_WITH_CONDITIONS` quietly becoming an auto-approval — is the failure this seam exists
   to prevent, and it is a different thing from degrading loudly.
+
+`MatchProvenance.UNKNOWN` carries one extra meaning the others do not: it is also what a response
+from a server **predating the member** reads as, because that server sends no value at all. That
+null must not be defaulted to `RETRIEVAL` — the bypass existed before the member did, and was
+identifiable only by the magic confidence this member replaced — so an older server's silence is
+genuinely uninformative. `provenance()` is `null` there and a real string for an unrecognised
+value, which is how the two are told apart.
 
 `tests/packaging/test_java_client_contract.py` asserts that `UNKNOWN` is **not** a value the
 service publishes. The day it becomes one, that gate goes red — because at that moment the client's
@@ -307,6 +369,68 @@ The server's deadline exists so a slow match ends in a 504 rather than a hang; i
 timeout is the shorter one, the client always gives up first and never sees the 504 — which is the
 hang the whole arrangement was built to avoid, reintroduced by an off-by-one in seconds.
 
+### The two review-evidence blocks
+
+Both are opt-in, both are appended to the response, and both are reporting-only — nothing in
+`results` or `fieldDecisions` changes because you asked.
+
+```java
+MatchResponse response = client.match(
+        MatchRequest.of(fields, 3).withContrast(true).withConsistency(true));
+
+response.contrastFor("booking.passenger.name").ifPresent(contrast -> {
+    contrast.largestDifferenceValue().ifPresent(signal ->
+            log.info("rank 1 won on {}", signal));
+    if (!contrast.hasDecidingSignal()) {
+        log.info("no single signal carried the margin");   // a real answer, and the common one
+    }
+});
+```
+
+`contrast` answers *why not the other one*, which `explain` cannot: `explain` describes one
+candidate, and a reviewer's question is a subtraction. `ContrastReport.fields()` carries **every**
+input path, with an explicit `null` where a field had no runner-up — "one candidate" and "skipped"
+must not look alike, so `contrastFor(path)` folds that null and `paths()` tells the two apart.
+
+`consistency` is the one to read the javadoc for before you use it. It reports which columns look
+like one business concept and whether they agree — and **the service ships it off by default
+because the grouping behind it was measured and the measurement came back negative.** At the
+default `consistency_qualifier_segments` it emits no group at all on the corpus it was measured
+against; at the loose setting it scored 0.0233 pair-precision on a repeated-leaf schema, where all
+four groups it produced merged distinct concepts and none was a concept. A `DISAGREE` is a prompt
+to look, never a defect report about the matcher, and the check to run first is on the type:
+
+```java
+if (group.distinctAnswers() == group.answeredCount()) {
+    // every column that answered gave a different one: a collision in the grouping,
+    // not a contradiction in the answers
+}
+```
+
+`ConsistencyReport.promotionApplied()` is always false, and it is published rather than implied so
+a consumer can assert it rather than trust it.
+
+### Recording what the reviewer actually did
+
+`Feedback.withVerdict(...)` carries the third state `wasCorrect` cannot hold:
+
+```java
+client.submitFeedback(
+        Feedback.of(path, chosenId, /* wasCorrect */ true, reviewer, Instant.now())
+                .withVerdict(ReviewVerdict.MANUAL_OVERRIDE));   // sets wasCorrect=false for you
+```
+
+`MANUAL_OVERRIDE` means the reviewer chose a term **the matcher never proposed** — retrieval
+missed rather than mis-ranked, which is the one failure re-ranking cannot fix. The verdict must
+agree with `wasCorrect`, and this record **refuses the contradiction locally** rather than letting
+you find out as a 422 that costs the reviewer their verdict. That is a copy of a server rule, so
+`tests/packaging/test_java_client_contract.py` pins it against the real server model in both
+directions; configurable caps, by contrast, are deliberately not mirrored.
+
+Omitting the verdict is still valid and always will be. Note that the server then stores
+`"verdict": null` rather than omitting the key — `FeedbackReceipt.storedVerdict()` reads it, and
+empty means "the reviewer gave none", not "this server predates the member".
+
 ### Additive server changes
 
 Unknown response keys are ignored, on every DTO, with `@JsonIgnoreProperties(ignoreUnknown = true)`
@@ -320,11 +444,11 @@ Unknown *values* in a closed set are handled per set, not by one rule — see
 ## Building and testing
 
 ```
-mvn test        # 73 unit tests. No service, no network
-mvn verify      # + 57 integration tests against a REAL service
+mvn test        # 109 unit tests. No service, no network
+mvn verify      # + 67 integration tests against a REAL service
 ```
 
-`mvn verify` needs four running fixtures, because four of the behaviours worth pinning are
+`mvn verify` needs five running fixtures, because five of the behaviours worth pinning are
 properties of a server's configuration rather than of a request:
 
 | | | |
@@ -333,6 +457,7 @@ properties of a server's configuration rather than of a request:
 | `http://127.0.0.1:8001` | no dictionary at all | every match is a real 503 |
 | `http://127.0.0.1:8002` | the pack, `NEXUS_API_DEADLINE_SECONDS=0.001` | every match is a real 504 |
 | `http://127.0.0.1:8003` | the pack, `NEXUS_API_MATCHING_CONFIG=clients/java/fixture-absolute-floor.json` | `NO_MATCH` is reachable |
+| `http://127.0.0.1:8004` | the pack, `clients/java/fixture_approved_pair_app.py` | `provenance: APPROVED_PAIR` is reachable |
 
 From the repository root:
 
@@ -341,7 +466,8 @@ From the repository root:
 ```
 
 Override the URLs with `-Dnexus.matcher.baseUrl=`, `-Dnexus.matcher.unavailableBaseUrl=`,
-`-Dnexus.matcher.deadlineBaseUrl=`, `-Dnexus.matcher.floorBaseUrl=`.
+`-Dnexus.matcher.deadlineBaseUrl=`, `-Dnexus.matcher.floorBaseUrl=`,
+`-Dnexus.matcher.approvedPairBaseUrl=`.
 
 **8003 exists because `NO_MATCH` is otherwise untestable against a live server.** The verdict is
 earned two ways: a field that came back with no candidates at all, or a configured
@@ -369,6 +495,30 @@ belongs to a glossary, an encoder and a metric. Calibrate against your own corpu
 a floor measured anywhere else — the same number under `dot` or `euclidean`, or over an index that
 pools aliases, is not the same number.
 
+**8004 exists because `APPROVED_PAIR` is otherwise unreachable, and because the obvious
+work-around is wrong.** `provenance` says where a candidate's answer came from: `RETRIEVAL` when
+the pipeline scored it, `APPROVED_PAIR` when a reviewer decided the pair and matching was skipped.
+The second needs a feedback consumer attached, and the service ships none — `create_app()` builds
+none and `NexusMatcher()` takes `feedback_consumer=None`, both documented as measured decisions
+rather than unfinished wire-ups. So on 8000–8003 every candidate is `RETRIEVAL`.
+
+`fixture_approved_pair_app.py` opts a throwaway server into that documented seam using the
+library's own reference consumer, reading one standing verdict from
+`clients/java/fixture-approved-pairs.jsonl`. It refuses to start if the verdict does not resolve
+against the loaded glossary, because a fixture that came up quietly answering by retrieval would
+make every capture taken from it say the opposite of what it says.
+
+**The reason it is worth a whole server:** the obvious way to spot a reviewer's answer —
+`confidence == 1.0` with `AUTO_APPROVE` — does not work, and the library's own source used to
+claim it did, on the grounds that the scorer could not produce 1.0. It can. The five default
+weights sum to exactly 1.0 and every signal is attainable at 1.0.
+`captured/match-response-approved-pair.json` is a live capture holding both cases in one body:
+`booking.passenger.legal_name` at confidence 1.0 because a human decided it, and
+`published.terminal_nm` at confidence 1.0 because all five signals are maximal — that column name
+*is* the glossary's own `logical_name` for `GBF-0027`. Same confidence, same decision, same
+entry id on the reviewed field as retrieval would have found. `provenance` is the only member
+that separates them, and `MatchCandidate.decidedByAReviewer()` is the reading of it.
+
 **The integration tests do not mock the service and do not skip when it is missing.** A skipped
 integration test is a green build that proved nothing, and this contract moved twice while the
 client was being written — exactly the drift a mock cannot see. A missing fixture fails the build
@@ -392,7 +542,26 @@ the test" can only ever be resolved the honest way. A body somebody typed to mak
 the author's belief about the contract — the exact belief the fixture was there to check. A diff
 after running it is the service having changed; read it before you accept it.
 
-`match-response-no-match.json` is the one capture taken from 8003 rather than 8000.
+Two captures come from somewhere other than 8000: `match-response-no-match.json` from 8003, and
+`match-response-approved-pair.json` from 8004.
+
+Four captures exist to hold a *documented hazard* rather than a happy path, and they are worth
+knowing about before somebody tidies them away:
+
+* `match-response-evidence.json` asks for both review-evidence blocks at the server's **default**
+  grouping, where the consistency report finds nothing. An empty report is the shipped behaviour;
+  a fixture that only ever showed a populated one would be testing a setting nobody runs.
+* `match-response-evidence-leaf-key.json` asks for the **loose** grouping, where two columns both
+  named `name` — a ferry terminal and a passenger — become one "concept" and their different
+  answers are reported as a contradiction. That finding is a false positive. It is captured
+  deliberately: `ConsistencyReport`'s javadoc warns about exactly this, and a warning with no
+  fixture behind it is one nobody can check.
+* `feedback-receipt.json` sends a body that predates `verdict` and comes back with a ninth stored
+  key, `"verdict": null`. Additive, and not nothing — see the CHANGELOG entry.
+* `match-response-approved-pair.json` holds a scored candidate and a reviewer-decided one that
+  agree on `(confidence 1.0, decision AUTO_APPROVE)`. That pair was once documented as identifying
+  a bypass; this file is a running service producing it with nothing bypassed, which is why it must
+  be regenerated rather than trimmed to whichever half a test happens to need.
 
 ### One case the shipped configuration cannot reach — and how to reach it anyway
 
@@ -404,8 +573,8 @@ caller who raises `review_threshold` past that floor.
 
 That does **not** mean it takes somebody else's deployment to see. `review_threshold` is settable
 on a local fixture through `NEXUS_API_MATCHING_CONFIG`, and the case has been provoked and the
-client's mapping confirmed end to end against a real server. Port **8004** below, because 8003 is
-now the shipped `NO_MATCH` fixture:
+client's mapping confirmed end to end against a real server. Port **8005** below, because 8000–8004
+are the shipped fixtures:
 
 ```bash
 cat > /tmp/reject.json <<'JSON'
@@ -417,7 +586,7 @@ NEXUS_API_DICTIONARY=examples/governance/glossary.csv \
 NEXUS_API_GOVERNANCE=examples/governance/protection_classes.json \
 NEXUS_API_MATCHING_CONFIG=/tmp/reject.json \
   .venv/Scripts/python -m uvicorn nexus_matcher.presentation.api.app:create_app \
-  --factory --host 127.0.0.1 --port 8004
+  --factory --host 127.0.0.1 --port 8005
 ```
 
 Matching `terminal_name` at `top_k=3` against that server returns, and the client reads it as:
@@ -431,7 +600,7 @@ Matching `terminal_name` at `top_k=3` against that server returns, and the clien
 That is the whole rule in one response: a rejected **rank 1** confers nothing, a rejected
 **runner-up** keeps its class, and the two nulls stay distinguishable.
 
-The shipped suite does not start that fifth fixture. `GovernanceNullsIT` instead asserts against
+The shipped suite does not start that sixth fixture. `GovernanceNullsIT` instead asserts against
 the live pack that no rank-1 candidate is `REJECT`, and fails with an explanation if that ever
 stops being true; `MatchResponseDecodingTest` pins the client's decoding from a body labelled in
 place as hand-built. If you are changing anything in this area, run the fixture above rather than
@@ -493,9 +662,11 @@ workaround needs.
   implements no API-key or OAuth check, and reads no credential. This client sends none —
   deliberately, because an earlier revision of the service's own description offered an
   `X-API-Key` header that no code ever checked. Put it behind your gateway.
-- **No `threshold` request parameter.** `/openapi.json` publishes `fields`, `top_k` and `explain`
-  and nothing else. The server now ignores unrecognised top-level request keys rather than
-  refusing them, so sending one would be silently discarded.
+- **No `threshold` request parameter.** `/openapi.json` publishes `fields`, `top_k`, `explain`,
+  `signals`, `contrast`, `consistency` and `consistency_qualifier_segments` — and no threshold, by
+  design. Confidence is rank-relative; thresholding on it client-side is the mistake the server's
+  own documentation warns against. The server ignores unrecognised top-level request keys rather
+  than refusing them, so sending one would be silently discarded rather than reported.
 - **No client-side field caps.** `max_fields`, `max_batch_fields`, the lookup id-length bound and
   the string-length bounds are per-deployment settings; a copy of them compiled in here would
   refuse requests a tuned server accepts and go stale silently the first time an operator raised

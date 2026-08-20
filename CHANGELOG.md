@@ -15,7 +15,126 @@ library matches.
 
 ## [Unreleased]
 
-Nothing yet. 2.1.0 has not been published, so work lands under it until it is.
+Nothing yet. 2.2.0 is staged below; work lands under it until it is published.
+
+---
+
+## [2.2.0] - 2026-08-20
+
+Worked against an adoption specification for an enterprise deployment. Those documents are
+an enterprise's internal material and are **not** in this repository — scanned with this
+repo's own gate they carry 54 hits on 16 blocked terms. Every capability below is
+implemented generically and caller-configured, and the library still ships no taxonomy.
+The specification agrees: it says the requirement is the NEED, not the spelling.
+
+### Fixed
+
+- **Governance did nothing on the documented Python path.** `from_config(governance=...)`
+  accepted a vocabulary and `load_dictionary()` never applied it — 0 of 30 entries coded,
+  every candidate `governance: null`, indistinguishable from a glossary with no classes.
+  This shipped in 2.1.0. It is the same "accepted and then never read" shape as the
+  `config_path` defect this project already retracted once, and the example pack had been
+  printing a wiring-defect banner about it the whole time. Now 27 of 30 coded (three rows
+  declare none), verified library, HTTP and pack, with a control proving the check is not
+  passing for free, and the derivation invariant firing on this path with a refusal string
+  asserted byte-equal to `load_entries`'. **NM-0033.**
+
+- **A published confidence depended on where a glossary row was listed.** BM25's epsilon
+  IDF floor came from `ndarray.sum()` — a *pairwise* reduction — over an array laid out in
+  glossary row order. On a corpus whose raw IDFs cancel, the float64 total came back as
+  ±2.22e-16 depending on order, so the floor **changed sign**; `search` keeps documents
+  scoring above zero, so the sparse arm returned three documents in one order and none in
+  the other; and scale-free min-max fusion stretched that dust across the full range,
+  moving rank 1 from lexical 0.0 to lexical 1.0. Measured effect: **confidence 0.88625 to
+  0.95625, exactly 0.07**, on nothing but row order.
+
+  Fixed with `math.fsum`, which is correctly rounded and therefore identical for every
+  permutation of its input. Cost 0.011 ms to 1.006 ms inside a 0.465 s index build at 100k
+  documents (0.2%); the search path is untouched. **Zero discordant pairs** on 688 combined
+  plus 1556 FHIR queries, worst absolute confidence delta exactly 0.000e+00 — so
+  calibration cannot have moved either.
+
+  This is NM-0020's shape reached by a different route: a quantity that is a property of
+  the corpus **as a set** was computed by reading the corpus **as a sequence**. There it was
+  a hash-ordered container; here a float64 reduction. **NM-0034.**
+
+  The property that caught it also falsified a claim in its own source: that file stated a
+  "measured maximum" movement of 3.9e-08 across 42,320 comparisons. The observed movement
+  was **1.8 million times larger**. A search that found nothing had been written up as a
+  measurement that nothing exists. The tolerance is a documented ratchet and was NOT
+  loosened; two 20,000-example soaks after the fix put the true float32 band at 6.4e-08 and
+  8.2e-08, so 1e-6 keeps the same margin it was chosen with.
+
+### Added — the semantic contract
+
+- **An absolute, floor-free score on every candidate, without `explain`.** `confidence` is
+  min-max normalised per field and has a structural floor of `semantic_weight` times
+  `fusion_alpha` = 0.63, above `review_threshold` 0.50 — so rank 1 could never be rejected
+  on score alone and "no match" had no representation. `absoluteScore` bottoms out at
+  0.5264 on a 135-candidate run, below that floor, and rank 1 separates cleanly: right
+  answers at or above 0.71, wrong ones at or below 0.59.
+
+- **A `NO_MATCH` verdict**, emitted only when a caller configures an absolute floor.
+  **Default off** — a floor is a calibration decision and this library must not invent one
+  for a corpus it has never seen. It went on a new `FieldDecision` vocabulary rather than
+  widening `MatchDecision`, because a generated Java enum turns an unknown value into a
+  deserialisation failure on a build nobody redeployed.
+
+- **A field-level verdict** (`fieldDecisions`), with a fourth conservation check refusing
+  the response if its keys disagree with `results`.
+
+- **A self-describing `scoring` block** stating, per numeric field, whether it is comparable
+  within a field, across fields, or across runs. The published `confidenceFloor`
+  **self-verifies**: on a one-entry glossary the min-max precondition breaks, real
+  confidences land near 0.196, and it emits null rather than the config's 0.63.
+
+- **`provenance` on every candidate** — `RETRIEVAL` or `APPROVED_PAIR`. This exists because
+  `confidence` does **not** discriminate: the approved-pair path writes 1.0, and shipped
+  source asserted that value was unreachable by the scorer. It is not — the default weights
+  sum to exactly 1.0 and every signal caps at 1.0, so ordinary retrieval reaches 1.0 when
+  all five are maximal. Two independent constructions did it. Both guard tests had asserted
+  `highest < 1.0` over one fixture: an observation promoted to a structural claim.
+
+### Added — capability
+
+- **A pass-through metadata plane** the core never reads, carried loader to index to
+  response byte-for-byte and proven with a non-breaking space, an em-dash, accents and
+  curly quotes through an ASCII-only body. Bounded and declared, with the drop count on the
+  wire. Rule 1 measured rather than asserted: two dictionaries whose planes share no key —
+  one containing the literal strings `AUTO_APPROVE` and `REJECT` — produce responses equal
+  once the plane is stripped.
+- **A lookup plane** (exact or absent, no scoring) with its own domain port.
+- **An introspection surface** answering "is retrieval degraded", including whether a
+  fallback encoder is in force, plus a retrieval diagnostic.
+- **A per-request query-signal channel**: abbreviation overlay, parent entity, domain prior.
+  `extra="forbid"` was **not** relaxed on `FieldSpec` — a typo and an extension are
+  different events, so the extension point is a named field whose value is open. Pinned by
+  a test asserting the same unknown key is 422 beside `doc` and 200 inside `signals`.
+  Absence proven against a `git archive HEAD` build: zero discordant pairs, byte-identical
+  bodies.
+- **A consumable feedback trail** with an approved-pair bypass, default off. Keyed with
+  parent context, because the same leaf name under a different parent is a different
+  question. Invalidated by a fingerprint over content **and** governance code — a
+  reclassified term has a byte-identical content hash, and a stale approval on it is
+  exactly the silent-wrong-class failure.
+- **A feedback verdict vocabulary** that can express "the reviewer chose something the
+  matcher never proposed" — `wasCorrect: bool` collapsed that into the same value as "the
+  top match was wrong", and those imply opposite fixes.
+- **Explanation by contrast** and **cross-schema consistency reporting**, both additive.
+- **Calibration profiles** loadable per deployment, with the active profile and the corpus
+  the shipped defaults were fitted on both machine-readable.
+- **A synthetic corpus generator** so accuracy features are testable without any real
+  glossary leaving its owner. Verified genuinely synthesised: every content word comes from
+  a seeded syllable grammar, the package imports nothing from `nexus_matcher`, and a scan
+  of 11.4M generated characters returns zero blocked terms.
+
+### Changed
+
+- `POST /api/v1/feedback` returns and records one additional key for an unchanged request
+  body. Additive, but a trail-consuming script asserting an exact key set will see it.
+- The Java client binds every new member. `provenance` and the feedback verdict follow the
+  existing UNKNOWN-sentinel precedent, so a value a newer server sends cannot break an
+  older client. **NM-0032.**
 
 ---
 
@@ -329,6 +448,107 @@ build artifact, not a release; everything in this section is unreleased work.
   alongside it.
 
 ### Added
+
+- **`POST /api/v1/feedback` accepts a `verdict`, and — read this part — a body that does
+  not send one now stores a ninth key.** `wasCorrect: bool` has two states and the
+  vocabulary has three. The one it cannot express is the reviewer who chose a term **the
+  matcher never proposed** — not rank 2, not rank 20: absent from the candidate list
+  entirely. Collapsed into `false`, that record is byte-identical to "the top match was
+  wrong and I took the third one", and those are opposite diagnoses: the second says the
+  answer was retrieved and mis-ranked, which weights or a reranker can fix, and the first
+  says it was never retrieved, which no amount of re-ranking a list that never contained it
+  will fix. `MANUAL_OVERRIDE` is that state; `APPROVED` and `REJECTED` are the other two.
+  The member is optional, and it must agree with `wasCorrect` — `APPROVED` requires `true`,
+  the other two require `false`, and any other pairing is a **422** rather than a record in
+  an audit trail that argues with itself.
+
+  **The disclosure.** This was reported as additive, and it is — every pre-widening body is
+  still **201** and still stores the same eight values. But it is *not* "nothing changed for
+  an unchanged request", and something did: **the echoed record and the appended trail line
+  both gained `"verdict": null`.** Measured by re-capturing this repository's own Java
+  fixture from a live service and diffing it against the byte-for-byte copy at `HEAD`: the
+  same request body, **285 bytes before and 300 after**, eight stored keys and now nine,
+  and the appended trail line gains the same 15 bytes. The key is written rather than
+  omitted, so a record predating the member and a reviewer who gave none read identically —
+  but a trail-consuming script asserting an exact key set breaks, and that is the only
+  thing here that can break. The Java client's captured fixture
+  `clients/java/src/test/resources/captured/feedback-receipt.json` carries the diff, and
+  `FeedbackIT.anUnchangedBodyStoresAnExplicitNullVerdict` asserts the ninth key against a
+  live service so the fact cannot quietly become untrue in either direction.
+
+  The three values are published **inline on the property** and deliberately not as a named
+  schema component, so a client generated from the spec gets them as documentation rather
+  than as a closed type that stops decoding the day a fourth value is added. The domain
+  vocabulary's fourth value, `UNSPECIFIED`, is deliberately not offered on the wire: it is
+  what a record written before this member reads as, not something a reviewer can decide,
+  and offering it would let a client assert an absence of information as an observation.
+
+- **Two opt-in review-evidence blocks on both match routes: `contrast` and `consistency`.**
+  Both default off, both are appended after `scoring`, and with neither asked for the
+  response is byte-identical to the one this service sent before they existed.
+
+  `contrast` answers the question `explain` cannot. An explain block says why the winner
+  scored what it did, using weights that are the same for every candidate and are already
+  published; a reviewer looking at a surprising match wants to know **why not the other
+  one**, and that is a subtraction between two candidates rather than a description of one.
+  It reports the per-signal differences between rank 1 and rank 2, which of them separated
+  the pair, and which — if any — actually decided it. Two things are deliberately not
+  claimed: a difference at or below the published `resolution` is never named as a cause,
+  and when the whole margin is at or below it nothing is named at all, because the order
+  then came from the matcher's own sort. `decidingSignals` can be empty and empty is a real
+  answer. The service re-runs the arithmetic before answering and **refuses the response**
+  rather than send a contrast that does not close.
+
+  `consistency` reports which columns look like one business concept and whether their
+  rank-1 answers agree. Reporting only: `promotionApplied` is always `false` and says so
+  machine-readably. **It is off by default because its grouping was measured and the
+  measurement came back negative**, and that is recorded here rather than left in a
+  docstring: at the default `consistency_qualifier_segments` of 1 it emits no group at all
+  on any profile in the generated corpus, and at 0 it scores 0.0233 pair-precision on a
+  repeated-leaf schema, where all four groups it emitted merged distinct concepts and none
+  was a concept. `tests/unit/domain/test_review_evidence_grouping.py` searches the whole
+  published policy space — 684 policies — and the best precision reached by any policy that
+  reports anything at all on that shape is 0.0235. There is no operating point. A
+  `DISAGREE` is a prompt to look, and the check to run first is `distinctAnswers` against
+  the number of members that answered.
+
+- **The Java client reads all of it, and one gate now watches the enums that are not
+  components.** `clients/java/` gains `ReviewVerdict`/`ReviewDecision`, `ContrastReport`,
+  `Contrast`, `SignalDifference`, `ConsistencyReport`, `ConceptGroup`, `Separation` and
+  `Agreement`; `MatchRequest` gains `contrast`, `consistency` and
+  `consistency_qualifier_segments`; `MatchResponse` gains the two blocks; `Feedback` gains
+  `verdict` and `FeedbackReceipt` gains `storedVerdict()`. `ConsistencyReport`'s javadoc
+  carries the measurement above rather than only the shape, because a client that surfaces
+  a finding without it lends the finding a confidence nobody has.
+
+  Three decisions worth naming. **`verdict`, `separation` and `agreement` are all bound
+  OPEN**, with an `UNKNOWN` sentinel and the server's own string preserved — the call
+  `FieldDecision` already made, for its second reason: these sit inside blocks carrying one
+  entry per field, up to 250 on the batch route, so refusing a whole response over one
+  unrecognised word would discard every answer in the batch. **`Feedback` refuses a verdict
+  that contradicts its `wasCorrect` locally**, because no deployment can record that pair
+  and a 422 on this route costs the reviewer their verdict;
+  `tests/packaging/test_java_client_contract.py` pins that copied rule against the real
+  server model in both directions, so it cannot drift. And that file now **searches** the
+  published document for enums rendered inline on a property rather than as components —
+  the case the previous check could not see at all — and requires each to be bound with a
+  sentinel, which is the rule that keeps the server's inline decision intact on the client
+  side. Five negative probes confirm the new half fires.
+
+  Two smaller fixes found while doing it. `MatchRequest.withTopK`, `withExplain` and
+  `withFields` **silently dropped `signals`**, rebuilding the record with `null` for a knob
+  they did not own — worst on `withFields`, which is what the retry loop calls to re-chunk
+  a 413, so half a batch could be answered under different knobs from the other half. And
+  the captured `status.json` fixture was **stale**: re-derived from a live service it gains
+  `thresholds.absoluteScoreFloor`, `thresholds.absoluteScoreMetric` and the whole
+  `calibration` block, and `limits.bodyByteCap` moves 9,873,024 → 10,897,024. The Java side
+  still does not bind those three; they remain recorded in `_UNBOUND_ON_THE_JAVA_SIDE` with
+  the components that close them.
+
+  **Source-breaking for anyone compiling against the unpublished 2.1.0 client**, not for the
+  wire: `Feedback`, `MatchRequest` and `MatchResponse` are records, so their canonical
+  constructors gained parameters. `Feedback.of(...)`, `MatchRequest.of(...)` and
+  `MatchResponse.fromBody(...)` are unchanged.
 
 - **`governance.enhancement` now crosses the wire**, appended as the sixth key of the
   governance object so existing key order is unchanged. It is the caller's own instruction

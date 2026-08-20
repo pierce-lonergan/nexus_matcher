@@ -1,7 +1,7 @@
 id: NM-0033
 symptom: "from_config(governance=...) accepted a controlled vocabulary and load_dictionary never applied it, so every indexed entry carried no protection code and every match came back with governance=null -- indistinguishable from a glossary that declares no classes"
 severity: HIGH
-fixed_in: 2.1.0
+fixed_in: 2.2.0
 gate_that_should_have_caught_it: "none -- every governance test on the matcher called the private _index_dictionary with entries a fixture had already coded by hand, so nothing in the suite ever loaded a glossary through the documented load_dictionary() path and asked what class came back"
 gate_that_catches_it_now: "tests/museum/NM-0033/test_nm_0033.py, plus tests/unit/application/test_governance_through_load_dictionary.py"
 touches:

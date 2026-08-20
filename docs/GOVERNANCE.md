@@ -272,8 +272,11 @@ not recognise are still invisible to it.
 
 ### The request contract, which is not the example pack's field names
 
-A request is `{"fields": [...], "top_k": 5, "explain": false}`, and each field is exactly
-these four keys:
+A request is `{"fields": [...], "top_k": 5, "explain": false}`, optionally carrying
+`signals`, `contrast`, `consistency` and `consistency_qualifier_segments` — all defaulted
+server-side and all documented in
+[API_REFERENCE.md](API_REFERENCE.md#the-matching-request-body). Each field is these four
+keys, plus an optional `signals` map of its own:
 
 | Key | Required | Meaning |
 |---|---|---|

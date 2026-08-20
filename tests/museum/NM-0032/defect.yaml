@@ -1,7 +1,7 @@
 id: NM-0032
 symptom: "load_entries forwarded any unrecognised keyword to the reader, which discarded it in silence, so a misspelled option loaded a different glossary than the one asked for -- sheet_name= instead of sheet= indexed the workbook's first sheet with no warning"
 severity: HIGH
-fixed_in: 2.1.0
+fixed_in: 2.2.0
 gate_that_should_have_caught_it: "none -- every ingest test passed the options it meant, so no test ever asked what happens to one that is misspelled, and the reader's own signature is **kwargs"
 gate_that_catches_it_now: "tests/museum/NM-0032/test_nm_0032.py, plus tests/unit/application/test_ingest_admission_and_metadata.py"
 touches:
