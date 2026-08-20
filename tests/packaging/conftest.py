@@ -51,6 +51,7 @@ _OPT_IN_SKIPS = {
     "test_java_client_contract.py::test_every_match_decision_value_exists_in_the_java_enum": _JAVA_CLIENT_ABSENT,
     "test_java_client_contract.py::test_every_published_status_code_has_a_mapped_exception": _JAVA_CLIENT_ABSENT,
     "test_java_client_contract.py::test_the_unconfigured_vocabulary_sentinel_matches_the_server": _JAVA_CLIENT_ABSENT,
+    "test_java_client_contract.py::test_the_governance_id_is_an_opaque_string_on_both_sides_of_the_seam": _JAVA_CLIENT_ABSENT,
     "test_java_client_contract.py::test_the_java_source_parsers_are_not_vacuous": _JAVA_CLIENT_ABSENT,
 }
 

@@ -376,6 +376,27 @@ def _wire_names(source: str) -> set[str]:
     return set(_JSON_PROPERTY.findall(source))
 
 
+def _java_component_type(source: str, wire_name: str) -> str | None:
+    """
+    The Java type a record component binds one wire name to, or None if it binds none.
+
+    Matches `@JsonProperty("<name>") <Type> <field>`, which is the shape every DTO in this
+    client uses. Generics are captured whole (`Map<String, List<MatchCandidate>>`) so a
+    component whose type changed shape is visible rather than truncated to its head.
+
+    Returning None rather than raising is deliberate and is why
+    `test_the_java_source_parsers_are_not_vacuous` asserts this one sees a real type: the
+    caller compares against an expected type, so a parser that stopped matching would hand
+    back None and the comparison would fail loudly instead of passing over nothing.
+    """
+    match = re.search(
+        rf'@JsonProperty\(\s*"{re.escape(wire_name)}"\s*\)\s*'
+        rf"((?:[A-Za-z_$][\w$.]*)(?:\s*<[^>()]*>)?)\s+[A-Za-z_$][\w$]*",
+        source,
+    )
+    return None if match is None else " ".join(match.group(1).split())
+
+
 def _enum_constants(source: str, enum_name: str) -> set[str]:
     """
     The constants declared by `enum <enum_name>`, up to the first `;` or `}`.
@@ -993,6 +1014,69 @@ def test_every_published_status_code_has_a_mapped_exception():
 
 
 @pytest.mark.skipif(_CLIENT_ABSENT, reason=_ABSENT_REASON)
+def test_the_governance_id_is_an_opaque_string_on_both_sides_of_the_seam():
+    """
+    `governanceId` is `type: string` in the published schema and `String` in the Java record,
+    and the two are checked against each other rather than each against a belief.
+
+    A dictionary id is the caller's own key column. This library never parses it, and the
+    deployment that prompted the question describes its ids as "just a number from 1 to
+    10000000" -- which is exactly the shape that invites a `long` on this side. Two things
+    break the moment one appears, and neither raises anything:
+
+      * a zero-padded id (`0000123`) binds to 123 and stops being the key the glossary has;
+      * an id above 2^53 does not survive a `double`, and `format: int64` in the published
+        schema is what makes a code generator emit one.
+
+    So both halves are pinned. The published side must be a BARE string -- no `format`, no
+    `pattern`, no bounds -- because every one of those is this library constraining a column
+    it has never seen, and `format` in particular is what a generator reads as a number.
+    """
+    published = _openapi()["components"]["schemas"]
+    carriers = {
+        name: schema["properties"]["governanceId"]
+        for name, schema in published.items()
+        if "governanceId" in (schema.get("properties") or {})
+    }
+    assert {"MatchCandidateView", "LookupEntryView"} <= set(carriers), (
+        f"the two schemas whose ids a Java caller reads are no longer both published; found "
+        f"{sorted(carriers)}"
+    )
+
+    numeric_keywords = {
+        "format",
+        "pattern",
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "multipleOf",
+    }
+    for name, schema in sorted(carriers.items()):
+        assert schema.get("type") == "string", (
+            f"{name}.governanceId publishes type {schema.get('type')!r}. A generated client "
+            f"binds that type, and a numeric one loses a zero-padded id on the first parse."
+        )
+        constrained = numeric_keywords & set(schema)
+        assert not constrained, (
+            f"{name}.governanceId now publishes {sorted(constrained)}. The id is the caller's "
+            f"own key and this library does not get to describe its shape; `format` is what "
+            f"turns a String into a long in a generated client."
+        )
+
+    for java_file, record in (
+        ("model/MatchCandidate.java", "MatchCandidate"),
+        ("model/LookupEntry.java", "LookupEntry"),
+    ):
+        declared = _java_component_type(_java(java_file), "governanceId")
+        assert declared == "String", (
+            f"{record}.governanceId is declared as {declared!r}. The service publishes it as "
+            f"an opaque string; binding it as a number here loses zero padding and every id "
+            f"above 2^53, and does it silently on the deployment whose ids are numerals."
+        )
+
+
+@pytest.mark.skipif(_CLIENT_ABSENT, reason=_ABSENT_REASON)
 def test_the_unconfigured_vocabulary_sentinel_matches_the_server():
     """
     `Vocabulary.UNCONFIGURED_OPEN_CLASSIFICATION` is a COPY of a server constant.
@@ -1066,6 +1150,23 @@ def test_the_java_source_parsers_are_not_vacuous():
     assert {"confidence", "decision", "absoluteScore", "provenance"} <= candidate, (
         f"the @JsonProperty scan no longer reads MatchCandidate.java; it found {sorted(candidate)}"
     )
+
+    # The component-TYPE parser, which is a different scan from the name scan above and has the
+    # same failure mode. `test_the_governance_id_is_an_opaque_string_on_both_sides_of_the_seam`
+    # compares the type it returns against the literal "String", so a parser that stopped matching
+    # would return None and that gate would go red -- but only for `governanceId`. It is asserted
+    # here against a member with a DIFFERENT and more awkward type, so that a regex which happened
+    # to match only bare identifiers is caught rather than mistaken for a working one.
+    assert _java_component_type(_java("model/MatchCandidate.java"), "governanceId") == "String", (
+        "the component-type scan no longer reads MatchCandidate.governanceId"
+    )
+    assert _java_component_type(_java("model/MatchCandidate.java"), "absoluteScore") == "Double", (
+        "the component-type scan reads a bare identifier but no longer reads the boxed type on "
+        "MatchCandidate.absoluteScore"
+    )
+    assert (
+        _java_component_type(_java("model/SourceMetadata.java"), "renderedKeys") == "List<String>"
+    ), "the component-type scan no longer captures a generic type whole"
 
     provenances = _enum_constants(_java("model/MatchProvenance.java"), "MatchProvenance")
     assert {"RETRIEVAL", "APPROVED_PAIR", "UNKNOWN"} <= provenances, (

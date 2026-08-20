@@ -39,6 +39,52 @@ The specification agrees: it says the requirement is the NEED, not the spelling.
   passing for free, and the derivation invariant firing on this path with a refusal string
   asserted byte-equal to `load_entries`'. **NM-0033.**
 
+  **Reclassified, and this is the honest reading of it.** NM-0033 was recorded above as a
+  metadata defect: a field that should have carried a class carried none. The maintainer
+  has since stated what `governance.code` is — *a description of the level of protection on
+  data, of the kind an organisation writes in order to assign roles to columns and control
+  who or what can read them* — and under that definition the sentence "every candidate
+  came back `governance: null`" is not a missing label. It is a **classification result
+  that says no column in this schema carries a protection class**, produced against a
+  glossary in which 27 of 30 entries do. A consumer wiring those results into RBAC, and
+  reading `null` the fail-open way this documentation now argues against, would have
+  marked **every column unrestricted** — including the columns whose glossary entries
+  carry the direct-identifier classes. This is why
+  [docs/GOVERNANCE.md](docs/GOVERNANCE.md#the-fail-open-hazard-a-null-class-is-not-no-restriction)
+  now carries the hazard as its headline section.
+
+  **What made it severe** is not the rate — it was total — but that the wrong answer and a
+  correct answer are the **same bytes**. A response of all-`null` is exactly what a correct
+  match against a glossary carrying no classes looks like. There is no error, no warning,
+  no degraded flag and no shape difference. `fieldDecisions` does not catch it either: a
+  well-matched field still returns `AUTO_APPROVE`, and the consumer then inherits `null`
+  from a verdict that told it to inherit. The only thing that detects this from outside is
+  the check the guide now prescribes — assert that a glossary with a protection-code column
+  produces a non-zero count of coded entries. `tests/museum/NM-0033/test_nm_0033.py` pins
+  the same assertion from inside, and pins its own premise first, so it cannot pass
+  vacuously against a fixture that declares no codes.
+
+  **What it was not, stated so this is not read as more than it is.** The library grants
+  nothing and enforces nothing: it has no permission model, no ACL writer and no connection
+  to a catalog, so nothing was exposed by the library itself. For this to have become an
+  exposure a deployment had to do three things — map `governance.code` onto read
+  permissions; treat `governance: null` as "no restriction" rather than as the most
+  restrictive class; and be on the `from_config()` + `load_dictionary()` path, because the
+  library's own HTTP app called `ingest.load_entries` and applied the vocabulary correctly.
+  The example pack printed a wiring-defect banner about it throughout. And **2.1.0 was
+  prepared, never published** — PyPI has never served it — so the defective path reached no
+  released artifact, only a locally built wheel in `dist/` that one review opened. No
+  deployment is known to have been affected, and this entry does not claim one was.
+
+  Honouring `fieldDecisions` would not have helped, and that is the part worth keeping.
+  Two of the other four nulls this documentation describes are caught by reading the
+  verdict first. This one is not, because the verdict was correct: a well-matched field
+  returns AUTO_APPROVE, and a consumer that inherits on that verdict inherits a null.
+
+  The one thing not to take comfort from: it did not reach a user because the release was
+  not cut, not because anything stopped it. `release_preflight.py` declared the wheel built
+  from that tree fit to publish.
+
 - **A published confidence depended on where a glossary row was listed.** BM25's epsilon
   IDF floor came from `ndarray.sum()` — a *pairwise* reduction — over an array laid out in
   glossary row order. On a corpus whose raw IDFs cancel, the float64 total came back as
@@ -135,6 +181,62 @@ The specification agrees: it says the requirement is the NEED, not the spelling.
 - The Java client binds every new member. `provenance` and the feedback verdict follow the
   existing UNKNOWN-sentinel precedent, so a value a newer server sends cannot break an
   older client. **NM-0032.**
+
+### Documentation — the two definitions the adoption specification blocked on
+
+The specification listed two items as documentation **blockers**: a written, stable
+statement of what `governanceId` is, and what `governance.code` is. Both are now in
+[docs/GOVERNANCE.md](docs/GOVERNANCE.md#the-two-definitions-this-document-rests-on), and
+every payload quoted in support of them was captured from a live app on the day it was
+written.
+
+- **`governanceId` is the caller's own identifier for the matched glossary entry, carried
+  through unchanged** — the handle a consumer joins a match back to their own system with.
+  It is **opaque** and typed **`string`**: never parsed, never normalised beyond the loader
+  stripping whitespace around the cell, never compared numerically. Pinned with the case
+  that catches an int-parsing consumer: against a glossary whose ids are zero-padded
+  seven-digit numbers, an entry with id `0000123` comes back as the JSON string
+  `"0000123"`, and `POST /api/v1/lookup` with `{"ids":["0000123","123"]}` resolves the
+  padded one and puts `"123"` in `missing`. A second capture shows both forms coexisting as
+  two entries carrying two different protection classes, and one CSV through `load_entries`
+  shows `"  0000123  "`, `"123"` and `"0123"` becoming three distinct ids. There is no
+  silent numeric equivalence and there should not be: the alternative is a library that
+  decides two of your ids are one id.
+
+- **`governance.code` is an access-control class** — a deployment's own description of how
+  protected a data element is, of the kind an organisation writes in order to decide who or
+  what may read a column. The library still defines none of them, still ships no taxonomy
+  and still enforces nothing; what changes is the register. That value is
+  **security-relevant**, not descriptive metadata, and the documentation now says so
+  wherever it is published.
+
+- **The fail-open hazard is now the headline section of `docs/GOVERNANCE.md`.** A consumer
+  that maps `code` onto read permissions and treats `governance: null` as "no restriction"
+  makes that column **world-readable**; the safe reading of "I could not classify this" is
+  the most restrictive class, not the least. **Five** different situations produce a `null`
+  — the entry carries no code and sits at the open tier; the top candidate was rejected and
+  confers nothing; a reviewer decided the field; the field has nothing to inherit at all;
+  or the server was never given a vocabulary — and `vocabulary.openClassification`,
+  `fieldDecisions` and `provenance` are what tell them apart. All five are captured from
+  live servers, including the two that read worst: a rank-1 `REJECT` returning
+  `governance: null` beside a rank 2 carrying a full `CREW_ONLY` class out of the same
+  domain of the same glossary; and an unconfigured server returning the pack's
+  `SEALED_RESTRICTED` direct-identifier entry as `AUTO_APPROVE` with no class, byte-for-byte
+  indistinguishable at every per-candidate key from a correct open-tier answer. The only
+  discriminator for the second is the response-level `vocabulary` block, which is why the
+  recipe checks it once per response before looking at any field.
+
+- **[docs/guides/governance_as_access_control.md](docs/guides/governance_as_access_control.md)** —
+  new. The seven-step recipe, the two constants a deployment has to choose before writing any
+  of it (the library ranks no tiers and will not pick a most restrictive class), the five
+  nulls with their captures, and three checks to run on your own deployment — one of which
+  is the check that would have caught NM-0033 from outside.
+
+- **NM-0033's severity is restated** under the new definition, in its own entry above:
+  reclassified from a metadata defect to a fail-open classification result, with an equally
+  explicit statement of what a consumer would have had to do for it to become an exposure
+  and of the fact that 2.1.0 was never published.
+
 
 ---
 
@@ -667,6 +769,12 @@ build artifact, not a release; everything in this section is unreleased work.
   row with the same message `load_entries` gives for the same file, and refuses a
   protection-code column it has no vocabulary to interpret. `governance_strict=False` is the
   documented opt-out, and `tests/museum/NM-0033/test_nm_0033.py` pins the gate.
+
+  **Severity restated in 2.2.0.** This entry describes the defect as a metadata failure.
+  Once `governance.code` was defined as an access-control class, that reading became too
+  generous: an all-`null` response is a classification result saying no column here is
+  protected. The reclassification, and the equally explicit statement of what a consumer
+  would have had to do for it to become an exposure, are under 2.2.0 → Fixed.
 
 - **NM-0032 — `load_entries` forwarded any unrecognised keyword to the reader, which
   discarded it in silence, so a misspelled option loaded a different glossary than the one

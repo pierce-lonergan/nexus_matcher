@@ -179,7 +179,13 @@ public record MatchResponse(
      * nothing. This method returns empty there, and {@link #candidatesFor(String)} still hands back
      * every candidate for the human who now has to look.
      *
-     * <p><strong>Empty is overloaded, so branch on the verdict first and use this inside the
+     * <p><strong>{@link #governanceFor(String)} is the accessor to reach for.</strong> It answers
+     * this question and the two that have to be asked alongside it, in one call and without an
+     * overloaded empty. This method is kept because callers already read it, and because it is the
+     * narrower question: "may the field take rank 1's class", with no opinion about what to do when
+     * it may not.
+     *
+     * <p><strong>Empty is overloaded here, so branch on the verdict first and use this inside the
      * branch.</strong> It is what you get for every verdict that is not {@code AUTO_APPROVE}, AND
      * for an {@code AUTO_APPROVE} field whose rank-1 entry carries no protection code. Those need
      * different handling and this method cannot tell you which you have:
@@ -188,12 +194,21 @@ public record MatchResponse(
      * switch (response.verdictFor(path).map(FieldVerdict::decision).orElse(FieldDecision.UNKNOWN)) {
      *     case AUTO_APPROVE -> response.inheritableGovernanceFor(path).ifPresentOrElse(
      *             this::apply,
-     *             // empty HERE can only be the open tier: an AUTO_APPROVE field has a rank 1,
-     *             // and a rank 1 that confers nothing sits at the vocabulary's open tier.
-     *             () -> applyOpenTier(response.vocabulary().openClassification()));
+     *             // Empty HERE is the open tier -- but ONLY once the vocabulary block has been
+     *             // checked. A deployment that loaded no vocabulary returns this exact shape for
+     *             // every field, and applying its UNCLASSIFIED sentinel as a tier grants the most
+     *             // permissive reading on the strength of a configuration nobody completed.
+     *             () -> {
+     *                 if (!response.vocabulary().isConfigured()) {
+     *                     throw new IllegalStateException("server has no vocabulary loaded");
+     *                 }
+     *                 applyOpenTier(response.vocabulary().openClassification());
+     *             });
      *     case REVIEW, REJECT, NO_MATCH, UNKNOWN -> sendToAHuman(response.candidatesFor(path));
      * }
      * }</pre>
+     *
+     * <p>All of which is what {@link #governanceFor(String)} does for you.
      *
      * <p>Outside an {@code AUTO_APPROVE} branch, empty means "do not apply a class from this
      * response" and must never be read as "apply the open tier". See
@@ -206,6 +221,87 @@ public record MatchResponse(
             return Optional.empty();
         }
         return topCandidateFor(path).flatMap(MatchCandidate::governanceValue);
+    }
+
+    /**
+     * THE governance answer for one column: what may be applied to it, or which kind of nothing.
+     *
+     * <p>The reading a consumer mapping {@code governance.code} onto read permissions needs, made
+     * shorter than the wrong reading. Three published rules are applied here, in the order the
+     * server states them, and none of them is this client's own opinion:
+     *
+     * <ol>
+     *   <li>{@code fieldDecisions[path]} is the field-level authority. Anything but
+     *       {@code AUTO_APPROVE} confers nothing, and the constant says which "nothing" it is --
+     *       {@link FieldDecision#NO_MATCH} in particular still arrives with a full candidate list
+     *       whose rank 1 can carry a real class.
+     *   <li>On {@code AUTO_APPROVE}, rank 1's own {@code governance} is the class, when it has one.
+     *   <li>When it has none, that is the open tier -- <strong>but only if this deployment has a
+     *       vocabulary at all.</strong> {@link Vocabulary#isConfigured()} is what separates "the
+     *       matched entry carries no code" from "nothing on this server was ever classified", and
+     *       those two responses are otherwise identical, field for field and null for null.
+     * </ol>
+     *
+     * <p>Step 3 is the one that earns this method. It is a check every caller has to make, on a
+     * member on the far side of the response from the field they are reading, to avoid granting the
+     * most permissive classification to a server that classified nothing. Left to each caller, it
+     * is the check that gets skipped.
+     *
+     * <p><strong>The vocabulary is consulted after the verdict, not before.</strong> A
+     * {@code REVIEW} field on an unconfigured deployment reports
+     * {@link GovernanceOutcome#WITHHELD_PENDING_REVIEW} rather than
+     * {@link GovernanceOutcome#UNCLASSIFIABLE_NO_VOCABULARY}: the verdict is a fact about that
+     * column and is worth keeping, and the deployment-wide question has a deployment-wide answer in
+     * {@code vocabulary().isConfigured()}, which is one call per response rather than one per
+     * field. The unconfigured outcome is reported exactly where it changes what a caller would do
+     * -- where the answer would otherwise have been "apply the open tier".
+     *
+     * <p>A path that was never sent reports {@link GovernanceOutcome#UNREADABLE}, the same as a
+     * verdict this build cannot read: in both cases this response says nothing about that column.
+     */
+    public FieldGovernance governanceFor(String path) {
+        Optional<FieldVerdict> verdict = verdictFor(path);
+        if (verdict.isEmpty() || !verdict.get().isKnown()) {
+            return new FieldGovernance(GovernanceOutcome.UNREADABLE, null, null);
+        }
+
+        switch (verdict.get().decision()) {
+            case REVIEW:
+                return new FieldGovernance(GovernanceOutcome.WITHHELD_PENDING_REVIEW, null, null);
+            case REJECT:
+                return new FieldGovernance(
+                        GovernanceOutcome.WITHHELD_REJECTED_TOP_MATCH, null, null);
+            case NO_MATCH:
+                return new FieldGovernance(GovernanceOutcome.WITHHELD_NO_MATCH, null, null);
+            case AUTO_APPROVE:
+                break;
+            default:
+                // UNKNOWN is filtered by isKnown() above; anything else is a constant added to
+                // FieldDecision without a branch here, which must not fall through to "apply".
+                return new FieldGovernance(GovernanceOutcome.UNREADABLE, null, null);
+        }
+
+        Optional<MatchCandidate> top = topCandidateFor(path);
+        if (top.isEmpty()) {
+            // AUTO_APPROVE with nothing to approve. The server does not send this -- a field with
+            // no candidates is NO_MATCH -- so it is a response contradicting itself, and the safe
+            // reading of a self-contradicting response is that it cannot be read.
+            return new FieldGovernance(GovernanceOutcome.UNREADABLE, null, null);
+        }
+
+        Governance conferred = top.get().governance();
+        if (conferred != null) {
+            // A class that ARRIVED is a class, whatever the vocabulary block says: the server
+            // resolved it, and nothing here needs to know the tier ordering to pass it on.
+            return new FieldGovernance(GovernanceOutcome.CONFERRED, conferred, null);
+        }
+
+        if (vocabulary == null || !vocabulary.isConfigured()) {
+            return new FieldGovernance(
+                    GovernanceOutcome.UNCLASSIFIABLE_NO_VOCABULARY, null, null);
+        }
+        return new FieldGovernance(
+                GovernanceOutcome.OPEN_TIER, null, vocabulary.openClassification());
     }
 
     /**

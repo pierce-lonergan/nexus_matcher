@@ -487,11 +487,11 @@ candidate carries no `absoluteScore` and no `explain`, because nothing measured 
 | Key | Type | Meaning |
 |---|---|---|
 | `rank` | `int` | 1-based position within this field's candidate list. |
-| `governanceId` | `string` | The dictionary entry's id — the thing you join on. |
+| `governanceId` | `string` | The dictionary entry's id — the thing you join on, and **the caller's own string**. Never parsed, never normalised, never compared numerically: a zero-padded numeric id comes back with its padding. [Why that matters, with the capture](#governanceid-is-an-opaque-string-and-lookup-is-where-that-becomes-visible). |
 | `businessName` | `string` | The entry's business name. |
 | `definition` | `string` | The entry's definition. |
 | `domain` | `string` | The entry's subject area. |
-| `governance` | object or `null` | The protection class the entry confers. Six keys; see below. `null` is a documented value. |
+| `governance` | object or `null` | The protection class the entry confers. Six keys; see below. `null` is a documented value and **it is not "no restriction"** — see [the fail-open hazard](GOVERNANCE.md#the-fail-open-hazard-a-null-class-is-not-no-restriction) before mapping this onto read permissions. |
 | `confidence` | `float` | The scored confidence. **Comparable within this field only** — see `scoring.comparability`. |
 | `decision` | `string` | `AUTO_APPROVE`, `REVIEW` or `REJECT`. **Per candidate.** It cannot say `NO_MATCH`; the per-field verdict is in `fieldDecisions`. |
 | `absoluteScore` | `float` or `null` | The raw dense-retrieval score for this candidate. `null` means the dense arm never proposed it — which is not zero: zero is a similarity that was measured, `null` is one that was never taken. |
@@ -534,12 +534,23 @@ retriever did not return that candidate.
 Six keys, in this order: `code`, `name`, `classification`, `personalInformation`,
 `directIdentifier`, `enhancement`.
 
+**This block is security-relevant, not descriptive.** `governance.code` is [an
+access-control class](GOVERNANCE.md#governancecode--an-access-control-class-not-a-label): a
+deployment's own description of how protected a data element is, of the kind an
+organisation writes in order to decide who or what may read a column. The library defines
+none of them, resolves them only against the caller's own vocabulary, and enforces nothing
+— but a consumer wiring `code` into read permissions must read [the fail-open
+hazard](GOVERNANCE.md#the-fail-open-hazard-a-null-class-is-not-no-restriction) first,
+because the whole block is `null` in five different situations and none of them is a grant.
+The procedure that gets all five right is
+[Governance as access control](guides/governance_as_access_control.md).
+
 `enhancement` is the newest and was **appended**, so the order of the five before it is
 unchanged and a client reading them by name is unaffected.
 
 | Key | Type | Meaning |
 |---|---|---|
-| `code` | `string` | The protection code, resolved through the caller's vocabulary — aliases already followed. The example pack maps `GBF-LEGACY-NAME` to `MANIFEST_NAME`, which is why `GBF-0001` comes back as the latter. |
+| `code` | `string` | **The access-control class**: how protected this element is, in the caller's own vocabulary, resolved with aliases already followed. This is the value a consumer maps onto read permissions. The example pack maps `GBF-LEGACY-NAME` to `MANIFEST_NAME`, which is why `GBF-0001` comes back as the latter. |
 | `name` | `string` | The class's human-readable name. |
 | `classification` | `string` | The tier. Rankable only against `vocabulary.tiersMostOpenFirst`. |
 | `personalInformation` | `bool` | |
@@ -700,6 +711,13 @@ That candidate has a `confidence` of 0.82 — well above `review_threshold` — 
 `REVIEW`, and a fully populated `CREW_ONLY` protection class. Nothing in it says the field
 is unanswerable. Its `absoluteScore` of 0.5867 does, and `fieldDecisions` is where that
 reading is published. **Read `fieldDecisions[path]` first.**
+
+That instruction is load-bearing rather than tidy when `governance.code` drives read
+permissions. `NO_MATCH` beside a populated `CREW_ONLY` block is one half of the trap; the
+other half is a `governance: null` read as "no restriction", which grants the column to
+everyone. Both halves, the five situations that produce a `null`, and the seven-step recipe
+that gets them all right are in [the fail-open
+hazard](GOVERNANCE.md#the-fail-open-hazard-a-null-class-is-not-no-restriction).
 
 `absolute_score_floor` is off by default and this library ships no value for it: a floor is
 a statement about a score distribution, and the distribution belongs to your dictionary.
@@ -900,6 +918,142 @@ Inside one group:
 The concept key is built from the **response key** — your own `path` — and not from `name`.
 Segments are boundaries you declared: dots, or the `__` array boundary. Single underscores
 are tokens inside a segment, so `a_b__c_d_e` has two segments and `a.b.c` has three.
+
+### Resolving an id: POST /api/v1/lookup
+
+The match routes answer "which entry governs this column". This route answers "what is
+entry X", for an id you already hold — the `governanceId` off a stored match, a row in your
+own catalog, an id typed into a ticket. No scoring, no ranking, no decision: an entry is
+either there or it is not.
+
+```bash
+curl -s -X POST http://127.0.0.1:8000/api/v1/lookup \
+  -H 'Content-Type: application/json' \
+  -d '{"ids":["0000123","123"]}'
+```
+
+| Key | Meaning |
+|---|---|
+| `results` | Every id you sent, **once and in the order sent**, mapped to an entry or an explicit `null`. An id cannot vanish from the map. |
+| `missing` | Exactly the ids whose value is `null`, so a program does not have to scan for them. |
+| `vocabulary` | The same block the match routes carry: `openClassification` and `tiersMostOpenFirst`. A `LookupEntryView` can carry `"governance": null` for the same reason a candidate can, and the block is what makes that null readable. |
+
+Caps and refusals: id cap `NEXUS_API_MAX_BATCH_FIELDS`, **413** over it, **422** on a
+duplicate, blank or oversized id (duplicates come back in `error.details.duplicate_ids`,
+the same shape `duplicate_paths` uses on `/match`), **503** with no dictionary loaded.
+
+`GET /api/v1/lookup/{governance_id}` is the single-id form of the same body. A miss is a
+**200** carrying `null`, never a 404 — a 404 on this service means the route does not exist.
+The route is declared with the `:path` converter so an id containing `/` stays addressable.
+
+#### governanceId is an opaque string, and lookup is where that becomes visible
+
+The id is the caller's own, [carried through
+unchanged](GOVERNANCE.md#governanceid--your-own-identifier-for-the-entry-carried-through-unchanged):
+never parsed, never normalised beyond the loader stripping whitespace around the cell,
+never compared numerically. `governanceId` is `"type": "string"` on both
+`MatchCandidateView` and `LookupEntryView`, `ids` is `"items": {"type": "string"}`, the
+path parameter is a string, and the generated Java client binds it as `String`.
+
+Lookup is where a consumer who ignored that finds out. Two captures, both from live servers
+today, both against glossaries whose ids are zero-padded seven-digit numbers.
+
+**A padded id resolves; the unpadded form does not.** The glossary holds `0000123` and no
+`123`:
+
+```json
+{
+  "results": {
+    "0000123": {
+      "governanceId": "0000123",
+      "businessName": "Passenger Legal Name",
+      "definition": "The full legal name of a ticketed passenger as printed on the Gravel Bay sailing manifest.",
+      "domain": "Passenger",
+      "governance": {
+        "code": "MANIFEST_NAME",
+        "name": "Passenger manifest identity",
+        "classification": "SEALED_RESTRICTED",
+        "personalInformation": true,
+        "directIdentifier": true,
+        "enhancement": "MASK_IN_LOGS"
+      },
+      "sourceMetadata": {
+        "values": {"personal_information": "yes", "direct_identifier": "yes"},
+        "droppedKeyCount": 0,
+        "renderedKeys": []
+      }
+    },
+    "123": null
+  },
+  "missing": ["123"],
+  "vocabulary": {
+    "openClassification": "OPEN_DECK",
+    "tiersMostOpenFirst": ["OPEN_DECK", "CREW_ONLY", "BRIDGE_SENSITIVE", "SEALED_RESTRICTED"]
+  }
+}
+```
+
+`GET /api/v1/lookup/123` against the same server is a **200** with
+`{"results":{"123":null},"missing":["123"], ...}`. So an `int()` on the way out and a
+`str()` on the way back does not fail loudly; it returns a clean, well-formed answer that
+the entry does not exist.
+
+**And when both forms exist, they are two entries.** The same glossary plus one row whose
+id is the literal `123`, same request, `governance` and `businessName` shown:
+
+```json
+{
+  "results": {
+    "0000123": {
+      "governanceId": "0000123",
+      "businessName": "Passenger Legal Name",
+      "governance": {
+        "code": "MANIFEST_NAME",
+        "name": "Passenger manifest identity",
+        "classification": "SEALED_RESTRICTED",
+        "personalInformation": true,
+        "directIdentifier": true,
+        "enhancement": "MASK_IN_LOGS"
+      }
+    },
+    "123": {
+      "governanceId": "123",
+      "businessName": "Crew Watch Rota Identifier",
+      "governance": {
+        "code": "CREW_ROSTER",
+        "name": "Crew employment record",
+        "classification": "BRIDGE_SENSITIVE",
+        "personalInformation": true,
+        "directIdentifier": true,
+        "enhancement": null
+      }
+    }
+  },
+  "missing": []
+}
+```
+
+*(`definition`, `domain` and `sourceMetadata` elided from both entries; nothing else is
+edited.)*
+
+Two ids that are the same number, two different terms, two different protection classes. A
+consumer that had parsed either one as an integer would hold a single key for both and
+would inherit whichever class it happened to write last. Since `governance.code` is [an
+access-control class](GOVERNANCE.md#governancecode--an-access-control-class-not-a-label),
+that is not a display defect.
+
+The ingest side has the same property, measured on one CSV through `load_entries` today:
+
+```
+  id column        entry id
+  ---------        --------
+  "  0000123  " -> '0000123'            surrounding whitespace stripped, padding kept
+  "123"         -> '123'
+  "0123"        -> '0123'
+  ""            -> 'ad77dbe304e1d05a'   no id in the row, so a content digest
+```
+
+Store it as text, join on it as text, log it as text.
 
 ### The feedback request body
 
@@ -1275,7 +1429,14 @@ over HTTP, `vocabulary.openClassification` is what resolves the first.
 
 `governance_id` is the matched entry's id, which *is* the governance id. It is derived from
 `dictionary_entry` when not supplied and refused when supplied and different, because two
-answers to "whose class is this?" is worse than none.
+answers to "whose class is this?" is worse than none. It is a `str` and it is the caller's
+own: `str(dictionary_entry.id)` and nothing else, [never parsed, normalised or compared
+numerically](GOVERNANCE.md#governanceid--your-own-identifier-for-the-entry-carried-through-unchanged).
+
+`governance` is an [access-control
+class](GOVERNANCE.md#governancecode--an-access-control-class-not-a-label), so `None` here
+is a value a caller must handle deliberately rather than fall through: see [the fail-open
+hazard](GOVERNANCE.md#the-fail-open-hazard-a-null-class-is-not-no-restriction).
 
 `MatchDecision` is a `str`-backed enum, so `result.decision == "AUTO_APPROVE"`,
 `result.decision.value` and `result.decision.name` all work. Prefer comparing against

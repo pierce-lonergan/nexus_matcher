@@ -574,7 +574,7 @@ table, enumerated from a live app:
 | POST | `/api/v1/match` | Up to 100 schema fields; returns the ranked dictionary entries and the protection class each field would inherit, one **verdict per column** in `fieldDecisions`, and a `scoring` block saying what the numbers mean |
 | POST | `/api/v1/match/batch` | The same contract with a 250-field cap, for chunked clients |
 | POST | `/api/v1/feedback` | Appends a reviewer's verdict to an audit log. Recorded, never fed back into ranking |
-| POST | `/api/v1/lookup` | Resolve dictionary ids you already hold. No scoring, no ranking, no decision. Every id comes back once, in the order sent, carrying an entry or an explicit `null` |
+| POST | `/api/v1/lookup` | Resolve dictionary ids you already hold. No scoring, no ranking, no decision. Every id comes back once, in the order sent, carrying an entry or an explicit `null`. Ids are matched as **exact strings** — `123` does not resolve `0000123` |
 | GET | `/api/v1/lookup/{governance_id:path}` | The single-id form of the above, answering the identical body under one key. A miss is **200** with `null`, not a 404 |
 | GET | `/api/v1/status` | Entry count, dictionary provenance, the active encoder and whether a fallback one is in force, the live thresholds and caps. Always **200**; read `degraded` before a bulk run |
 | POST | `/api/v1/diag/retrieval` | Why a field retrieved what it did: the query text it became, each channel's candidates with that channel's own raw scores, and where an expected entry ranked. Retrieval only |
@@ -604,6 +604,39 @@ on a low score means configuring `absolute_score_floor`, which ships **off**: a 
 statement about a score distribution and the distribution belongs to your glossary, not to
 this library. Measuring one is
 [docs/guides/absolute_score_floor.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/absolute_score_floor.md).
+
+### The two members you build against, and the one way to get them wrong
+
+**`governanceId` is your own identifier for the matched glossary entry, carried through
+unchanged** — the handle you join a match back to your system with. It is **opaque** and
+typed **`string`**: the library never parses it, never normalises it beyond the loader
+stripping whitespace around the cell, and never compares it numerically. A deployment whose
+ids are zero-padded numbers gets those bytes back, so `0000123` does not resolve from
+`123` — `POST /api/v1/lookup` with `{"ids":["0000123","123"]}` puts the unpadded form in
+`missing`. Store it as text and join on it as text.
+
+**`governance.code` is an access-control class** — your own description of how protected a
+data element is, of the kind an organisation writes in order to decide who or what may read
+a column. This library still defines none of them; your vocabulary file is the only source.
+But the value is **security-relevant**, not descriptive metadata, and that has one
+consequence worth putting in a README:
+
+> **`governance: null` is not "no restriction".** A consumer that maps `code` onto read
+> permissions and treats a `null` as "no rule applies" has made that column
+> **world-readable**. The safe reading of "I could not classify this" is your **most
+> restrictive** class, not your least. `null` is produced by five different situations —
+> the entry carries no code and sits at your open tier; the top candidate was rejected and
+> confers nothing; a reviewer decided the field; the field has no answer at all; or the
+> server was never given a vocabulary — and the response publishes
+> `vocabulary.openClassification`, `fieldDecisions` and `provenance` precisely so a
+> consumer can tell them apart. Check `vocabulary.openClassification` is not
+> `UNCLASSIFIED` once per response, then read `fieldDecisions[path]` per field, before
+> anything else.
+
+The hazard is argued, with captures of all five, in
+[docs/GOVERNANCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/GOVERNANCE.md#the-fail-open-hazard-a-null-class-is-not-no-restriction);
+the seven-step recipe and the three checks to run on your own deployment are in
+[docs/guides/governance_as_access_control.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/governance_as_access_control.md).
 
 The two match routes answer **503** until a dictionary is loaded, and `/api/v1/feedback`
 answers **503** until a feedback file is configured; each 503 names the setting to change.
@@ -686,7 +719,8 @@ observed to fail intermittently under load.
 
 - [QUICKSTART.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/QUICKSTART.md) — the verified five-minute path
 - [docs/API_REFERENCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/API_REFERENCE.md) — the Python, CLI and REST surfaces
-- [docs/GOVERNANCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/GOVERNANCE.md) — governance inheritance, and the matching endpoint's wire contract
+- [docs/GOVERNANCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/GOVERNANCE.md) — governance inheritance, what `governanceId` and `governance.code` are, the fail-open hazard, and the matching endpoint's wire contract
+- [docs/guides/governance_as_access_control.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/governance_as_access_control.md) — turning a match into a read permission without failing open: the recipe, the five nulls, and the checks to run
 - [docs/guides/absolute_score_floor.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/absolute_score_floor.md) — how to measure a `NO_MATCH` floor for your own corpus, and why no default ships
 - [docs/guides/governed_abbreviations.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/governed_abbreviations.md) — using your own approved-abbreviation catalog
 - [docs/BENCHMARK_REGISTRY.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/BENCHMARK_REGISTRY.md) — every benchmark run, with its artifact or an explicit note that it has none
