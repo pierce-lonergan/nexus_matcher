@@ -25,6 +25,7 @@ import operator
 import re
 import sys
 import time
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,6 +138,38 @@ class MatchingConfig:
     auto_approve_threshold: float = 0.87
     review_threshold: float = 0.50
     min_confidence_gap: float = 0.10
+
+    # The absolute-score floor beneath which a field is reported NO_MATCH.
+    #
+    # OFF BY DEFAULT, AND THAT IS NOT A PLACEHOLDER. A threshold is a statement about a
+    # score distribution, and the distribution is a property of the caller's dictionary
+    # and the caller's field names -- neither of which this library has seen. Shipping a
+    # number here would be inventing a calibration for somebody else's corpus, which is
+    # the same mistake as shipping a taxonomy. `auto_approve_threshold` above at least
+    # names the corpus it was measured on; there is no corpus at all behind this one.
+    #
+    # WHY IT IS NEEDED. `review_threshold` cannot express "nothing matched". The rank-1
+    # confidence has a structural floor of `semantic_weight * fusion_alpha` = 0.63 (see
+    # `minimum_achievable_confidence`), which sits above `review_threshold` = 0.50, so a
+    # rank-1 candidate can never be REJECT on score alone -- every field comes back at
+    # least REVIEW, however irrelevant its best candidate is. No setting of
+    # `review_threshold` recovers the missing state, because the floor moves with the
+    # WEIGHTS and the thresholds do not move with it.
+    #
+    # WHAT IT IS COMPARED AGAINST. `ScoreBreakdown.absolute_cosine` on rank 1: the raw
+    # dense-retrieval score, which has no per-field normalisation and therefore no floor.
+    # Under the shipped wiring that is a cosine similarity in [-1, 1]; see
+    # `NexusMatcher.absolute_score_metric` for when it is not.
+    #
+    # HOW TO CHOOSE ONE. Match a labelled sample of YOUR fields against YOUR dictionary,
+    # look at the absolute score of the rank-1 candidate for the fields you know have no
+    # correct entry, and put the floor below the lowest absolute score among the fields
+    # that DO. There is no substitute for that measurement, and a value copied from
+    # another deployment is a guess wearing a number.
+    #
+    # `None` means off. `0.0` means ON with a floor at zero, which is a different thing
+    # and refuses only candidates the retriever scored at or below zero.
+    absolute_score_floor: float | None = None
 
     # Results
     results_per_field: int = 5
@@ -337,6 +370,119 @@ def _load_governance_vocabulary(
     if isinstance(source, GovernanceVocabulary):
         return source
     return GovernanceVocabulary.from_json(source)
+
+
+# The `ColumnMapping` fields that name a column `ingest.load_entries` also reads, as
+# {ColumnMapping attribute: load_entries field}. `parent_table`, `sample_values` and
+# `synonyms` are absent because `load_entries` does not map them -- and the second read is
+# only ever asked for a governance code, so mapping them would buy nothing and, for
+# `synonyms`, be refused outright (it is a frozenset, and embedding it unordered makes one
+# process's vectors differ from another's).
+_GOVERNANCE_READ_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("id_column", "id"),
+    ("business_name_column", "business_name"),
+    ("logical_name_column", "logical_name"),
+    ("definition_column", "definition"),
+    ("data_type_column", "data_type"),
+    ("domain_column", "domain"),
+    ("protection_level_column", "protection_level"),
+)
+
+
+def _governance_read_columns(column_mapping: ColumnMapping | None) -> dict[str, str] | None:
+    """
+    Translate a `ColumnMapping` into the `columns=` overrides `load_entries` takes.
+
+    None passes through as None, which is the common case and means "infer from the
+    header" -- the same alias table the loader's own `ColumnMapping.detect` uses, so the
+    two reads agree by construction.
+
+    When the caller DID name their columns, the second read must be told, or it infers a
+    different business-name column and the join below sees two glossaries that disagree
+    about which entries exist. It is a faithful translation, defaults included: the caller
+    gave those literals to the loader and the loader used them, so the second read using
+    them too is the only reading that keeps the two files describing the same rows.
+
+    The protection CODE column is deliberately not in the mapping and cannot be: the port
+    has no field for it, so it is always resolved from the header by alias.
+    """
+    if column_mapping is None:
+        return None
+    named = {
+        field_name: getattr(column_mapping, attribute)
+        for attribute, field_name in _GOVERNANCE_READ_COLUMNS
+    }
+    return {field_name: column for field_name, column in named.items() if column}
+
+
+def _merge_governance(
+    entries: Sequence[DictionaryEntry],
+    governed: Sequence[DictionaryEntry],
+    source: str | Path,
+) -> list[DictionaryEntry]:
+    """
+    Copy each governed entry's protection code onto the loader's entry for the same row.
+
+    The two lists come from two readers over one file, both in source order, so they are
+    joined on `business_name` through a queue per name: duplicates -- a real glossary has
+    them -- keep their order of appearance instead of collapsing onto one another.
+
+    They are NOT joined on `id`. The two readers derive an id differently when the source
+    has no id column (`auto_1`, versus a digest of the identifying content), so an id join
+    silently matches nothing on exactly the glossaries that are commonest.
+
+    A name with no counterpart REFUSES the load. It means the two readers disagree about
+    which rows became entries, and the alternative -- attaching no code to that entry --
+    is once again a class that reads as "this entry has no class". A wrong governance
+    answer must not be reachable by a code path that had every chance to know better.
+    """
+    pending: dict[str, deque[DictionaryEntry]] = defaultdict(deque)
+    for entry in governed:
+        pending[entry.business_name].append(entry)
+
+    merged: list[DictionaryEntry] = []
+    for entry in entries:
+        queue = pending.get(entry.business_name)
+        if not queue:
+            raise ValueError(_governance_join_failure(entry, source))
+        merged.append(_with_governance_of(entry, queue.popleft()))
+    return merged
+
+
+def _governance_join_failure(entry: DictionaryEntry, source: str | Path) -> str:
+    return (
+        f"Reading {source} for its protection codes produced no row for "
+        f"{entry.business_name!r}, which the dictionary loader did produce, so the two "
+        f"readings of this file disagree about which entries exist and no code can be "
+        f"attached to it.\n"
+        f"Pass an explicit column_mapping=ColumnMapping(...) naming the business-name "
+        f"column, or load the glossary with nexus_matcher.application.ingest.load_entries "
+        f"and index it directly."
+    )
+
+
+def _with_governance_of(entry: DictionaryEntry, governed: DictionaryEntry) -> DictionaryEntry:
+    """
+    One entry, plus the code the governed reading gave it, and nothing else changed.
+
+    `governance_code_raw` and `governance_problems` travel with it when they exist. They
+    only exist under `governance_strict=False`, which is the mode that loads a defective
+    glossary anyway -- and there an entry whose code was REFUSED would otherwise carry
+    `governance_code=None`, indistinguishable from a row that never declared one. The
+    reason a code is missing is the one thing that must survive that mode.
+    """
+    carried = {
+        key: governed.source_metadata[key]
+        for key in ("governance_code_raw", "governance_problems")
+        if key in governed.source_metadata
+    }
+    if governed.governance_code is None and not carried:
+        return entry
+    return dataclasses.replace(
+        entry,
+        governance_code=governed.governance_code,
+        source_metadata={**entry.source_metadata, **carried} if carried else entry.source_metadata,
+    )
 
 
 # =============================================================================
@@ -565,6 +711,13 @@ class NexusMatcher:
         self._domain_matcher = domain_matcher or DomainMatcher.default()
         self._config = config or MatchingConfig()
         self._governance = _load_governance_vocabulary(governance)
+        # Whether a vocabulary was CONFIGURED, which `self._governance` cannot express:
+        # `_load_governance_vocabulary` turns None into `empty()`, and `empty()` is also
+        # what a caller gets by handing over a vocabulary that declares nothing. The two
+        # mean opposite things to a load -- "read no codes and check nothing" against
+        # "every code in this glossary is one nobody defined, say so" -- and
+        # `load_dictionary` has to tell them apart to give the right refusal.
+        self._governance_configured = governance is not None
 
         # State
         self._dictionary_entries: dict[str, DictionaryEntry] = {}
@@ -662,20 +815,90 @@ class NexusMatcher:
         source: str | Path,
         column_mapping: ColumnMapping | None = None,
         source_type: str | None = None,
+        governance_strict: bool = True,
     ) -> LoadStatistics:
         """
-        Load a data dictionary into the matcher.
+        Load a data dictionary into the matcher, READ THROUGH its vocabulary.
 
         Args:
             source: Path to dictionary file
             column_mapping: Custom column mapping
             source_type: Force specific loader (auto-detect if None)
+            governance_strict: REFUSE the load when the source's governance is defective
+                -- with a vocabulary configured, any row carrying an undefined code or a
+                tier that contradicts its own code; with none configured, a source that
+                HAS a protection-code column, which nothing can then read. Set False to
+                load anyway: the catalog still wins, so no entry inherits a contradicted
+                tier, and each offending row carries `governance_problems` in its
+                `source_metadata`. It is also the switch that skips the extra read of the
+                source described below.
 
         Returns:
             Loading statistics
 
         Raises:
-            ValueError: If no suitable loader found
+            ValueError: If no suitable loader found; if the source's governance is
+                defective under `governance_strict`; if the two readings of the source
+                described below disagree about which entries exist; or if the source
+                carries a protection-code column and no vocabulary was configured to read
+                it.
+
+        ## The defect this method carried, recorded as NM-0033
+
+        `from_config(governance=...)` accepted a vocabulary and this method never applied
+        it. `DictionaryLoader` -- the port every loader implements -- hands back finished
+        `DictionaryEntry` objects, and the two loaders this package ships build them
+        without reading a protection-code column at all, so every indexed entry carried
+        `governance_code=None`, every match came back `governance=None`, and a field the
+        glossary marks as a direct identifier was auto-approved carrying no class. Nothing
+        errored, because a glossary loaded without a vocabulary is a documented mode: the
+        result is indistinguishable from a glossary that declares no classes. That is
+        NM-0005's failure -- a field silently losing the classification it should have
+        inherited -- on the documented Python happy path, in the commit that cut 2.1.0
+        (`git show 36ffc1d:` this file: `load_dictionary` says "governance" zero times).
+        CHANGELOG.md records that 2.1.0 was never published, so it reached no user;
+        `release_preflight.py` declared the wheel built from that tree fit to publish, so
+        nothing between there and a publish was going to stop it.
+
+        It is also the second time this class accepted a parameter and never read it; the
+        first is recorded on `from_config`'s `config_path`. A parameter that is read
+        nowhere is worse than one that does not exist, because the caller has evidence
+        they configured the thing.
+
+        ## Why the governance is attached AFTER the loader, not instead of it
+
+        `application.ingest.load_entries` is the reader in this layer that understands
+        governance: it resolves the code column, canonicalises the code through the
+        caller's vocabulary, and enforces the derivation invariant. The obvious fix is to
+        route this method through it and delete the loader call.
+
+        Measured against `examples/governance/glossary.csv`, that swap is not a subset of
+        this method's behaviour -- it also drops `parent_table`, `sample_values` and
+        `synonyms` (which `load_entries` deliberately never maps), turns `auto_N` ids into
+        content digests, and coerces types and tiers through a different table
+        (`double` -> `decimal`, `INTERNAL` -> `RESTRICTED` on the same 30 rows). Several
+        of those are improvements. All of them are changes, and shipping them inside a P0
+        governance fix would mean nobody can tell which change moved a match.
+
+        So the loader still builds the entries, unchanged, and the governance is attached
+        to them afterwards from the same file read through `load_entries`. The cost is one
+        extra read of the source; it is measured in `_attach_governance`.
+
+        ## Why there is no per-call `governance=` here, when `load_entries` has one
+
+        Because a matcher resolves `MatchResult.governance` through `self._governance` at
+        MATCH time. A per-call vocabulary that differs from it can only do one of two
+        things: attach codes this matcher cannot resolve, which `_index_dictionary`
+        refuses outright, or attach fewer than it could, which is the silent nothing this
+        fix exists to remove. The one spelling that would work -- letting the argument
+        also replace `self._governance` -- means a load silently reconfigures the matcher,
+        and leaves the next load with no argument holding an ambiguous vocabulary.
+
+        `load_entries` keeps its parameter because it has no matcher and no match-time
+        resolver; it is a function that returns entries. Here the vocabulary is a property
+        of the object, set once where it can be seen, in exactly one place. Two answers to
+        "which vocabulary is this matcher's" is worse than one, which is the argument
+        `MatchResult.governance_id` already makes about which entry a field inherits from.
         """
         path = Path(source)
 
@@ -700,10 +923,113 @@ class NexusMatcher:
 
         entries, stats = result.unwrap()
 
+        # The step whose absence is NM-0033. Everything above produces entries with
+        # no governance whatever the caller configured.
+        entries = self._attach_governance(path, entries, column_mapping, governance_strict)
+
         # Index entries
         self._index_dictionary(entries)
 
         return stats
+
+    def _attach_governance(
+        self,
+        source: Path,
+        entries: Sequence[DictionaryEntry],
+        column_mapping: ColumnMapping | None,
+        governance_strict: bool,
+    ) -> list[DictionaryEntry]:
+        """
+        Give the loader's entries the protection code the source declares.
+
+        Reads the source a SECOND time, through `ingest.load_entries`, and takes exactly
+        one thing from it: the canonical `governance_code` per entry (plus, under
+        `governance_strict=False`, the evidence for a code that was refused). Nothing else
+        about an entry is touched, so a reviewer can check the claim "this fix changes
+        governance and nothing else" by reading this method alone.
+
+        Delegating rather than resolving the code here is deliberate. The vocabulary
+        lookup, the alias table, the derivation invariant and the refusal messages all
+        live in `load_entries`; a second implementation of any of them is a second set of
+        rules, and the last time this repository had two readers with two notions of which
+        column was which, one of them rejected files the other read without complaint.
+
+        ## What the second read costs
+
+        Measured 2026-08-19 on a generated 30,000-row CSV (12 columns, 5.4 MB, a
+        protection-code column resolving against a 12-code vocabulary), median of five
+        runs on this machine:
+
+            loader.load() alone                  0.281 s
+            + load_entries() for the codes       1.154 s   (+0.873 s, +310% of the parse)
+            load_dictionary() end to end        70.64  s   (one run, bundled encoder)
+
+        So the second read triples the parse and costs **1.2%** of the call, because
+        embedding dominates by two orders of magnitude. Peak traced allocation rises
+        46.9 -> 79.4 MB while both entry lists are alive; `load_entries` returns a list,
+        so this cannot be streamed without changing its signature.
+
+        The guard-only path -- no vocabulary configured -- pays `read_source` alone at
+        0.137 s, because all it wants is the header.
+
+        `governance_strict=False` with no vocabulary configured skips the read entirely --
+        there is then nothing to attach and nothing to check.
+
+        The read disappears altogether the day `DictionaryLoader` can carry a protection
+        code, which is the honest fix and is not this method's to make: the port is in
+        `domain/ports/dictionary_loader.py` and its `ColumnMapping` has no field for a
+        code column, which is also why a caller whose code column is spelled outside
+        `CODE_COLUMN_ALIASES` cannot map it on this path.
+        """
+        from nexus_matcher.application import ingest
+
+        if not self._governance_configured:
+            if governance_strict:
+                self._refuse_an_unreadable_code_column(source)
+            return list(entries)
+
+        governed = ingest.load_entries(
+            source,
+            columns=_governance_read_columns(column_mapping),
+            governance=self._governance,
+            governance_strict=governance_strict,
+        )
+        return _merge_governance(entries, governed, source)
+
+    def _refuse_an_unreadable_code_column(self, source: Path) -> None:
+        """
+        Refuse a glossary that carries protection codes when no vocabulary was configured.
+
+        `load_entries` has had this guard since NM-0030 and this path bypassed it, which
+        is how a deployment reached "every entry carries no class" by the other door: not
+        by mis-wiring the vocabulary, but by never wiring one, against a glossary whose
+        header plainly says `protection_class`. The silence is circular -- with no
+        vocabulary there are no codes, so there is nothing for any later layer to refuse.
+
+        The refusal is `ingest`'s own, quoted rather than rewritten, so a caller who hits
+        it from `load_dictionary` and from `load_entries` reads one message and gets one
+        instruction. Only the header is wanted; the reader has no header-only mode, which
+        is the whole of the cost here.
+
+        A source `ingest` cannot read at all is left alone rather than refused. That is a
+        custom loader reading something this package's reader has never heard of, and
+        turning a load that works today into an error over a check we could not run would
+        be a regression dressed as a safeguard. Nothing is lost: with no vocabulary
+        configured there is no code to attach either way.
+        """
+        from nexus_matcher.application import ingest
+
+        try:
+            _rows, header = ingest.read_source(source)
+        except Exception:
+            # Deliberately broad, and deliberately silent: see the docstring. Whatever a
+            # reader this package does not own raises, it is not evidence about this
+            # source's governance, and it must not fail a load that works today.
+            return
+
+        code_column = ingest.map_columns(header).get("governance_code")
+        if code_column:
+            raise ingest._unread_code_column_error(source, code_column)
 
     def _index_dictionary(self, entries: Sequence[DictionaryEntry]) -> None:
         """
@@ -1003,6 +1329,12 @@ class NexusMatcher:
             # reading as "nothing to review". The session is a domain object and must
             # not import MatchingConfig, so it gets the derived number, not the config.
             minimum_achievable_confidence=self._session_confidence_floor(results),
+            # Carried so `MatchingSession.field_decisions()` applies the floor this
+            # matcher was configured with, rather than making every caller pass it back
+            # in. Unlike the confidence floor above it needs no verification against the
+            # data: it is not a derived bound that can quietly stop holding, it is the
+            # number the caller typed.
+            absolute_score_floor=self._config.absolute_score_floor,
         )
 
     def _session_confidence_floor(
@@ -1640,6 +1972,41 @@ class NexusMatcher:
         if self._reranker is not None:
             return None
         return self._config.minimum_achievable_confidence
+
+    @property
+    def absolute_score_floor(self) -> float | None:
+        """
+        The absolute-score floor beneath which a field is reported `NO_MATCH`, or None
+        when none is configured.
+
+        Public because the HTTP surface has to publish it: a consumer who cannot see the
+        floor cannot tell an emitted `NO_MATCH` from a field the matcher simply had
+        nothing for. See `MatchingConfig.absolute_score_floor` for why the default is off.
+        """
+        return self._config.absolute_score_floor
+
+    @property
+    def absolute_score_metric(self) -> str:
+        """
+        The distance metric the wired vector store declares, so nobody has to ASSUME the
+        absolute score is a cosine.
+
+        `ScoreBreakdown.absolute_cosine` is the raw number the store returned. Under the
+        shipped wiring the store's metric is `cosine` and the name is accurate. A caller
+        who supplies their own store configured for `dot` or `euclidean` gets a number
+        that is monotone in similarity but is NOT a cosine, is not bounded to [-1, 1], and
+        must not be compared against a floor chosen for one. Naming the metric is what
+        turns that from a trap into a fact the caller can read.
+
+        Returns `"unknown"` when the store declares no metric. That is not a synonym for
+        cosine: it means this matcher cannot state what the number is, and a caller
+        setting an absolute floor against an unknown metric is guessing.
+        """
+        store_config = getattr(self._vector_store, "_config", None)
+        metric = getattr(store_config, "distance_metric", None)
+        if isinstance(metric, str) and metric:
+            return metric
+        return "unknown"
 
     @property
     def dictionary_size(self) -> int:

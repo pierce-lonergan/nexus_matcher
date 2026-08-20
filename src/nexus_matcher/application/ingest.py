@@ -19,6 +19,16 @@ One entry point for getting a glossary out of anything and into the index.
 JSON dump or a database table, and every one of those needs a different reader with
 different quirks. `load_entries()` dispatches on the source so callers never care.
 
+Three of its options exist because the alternative FAILS SILENTLY, which is a different
+thing from being inconvenient. `admit=` keeps drafts and retired terms out of the index --
+they compete as real terms because they are real terms, and no threshold repairs that.
+`value_delimiters=` says which character separates values inside a column, because one
+file routinely uses ';' in one column and ',' in another and reading either the other way
+round yields one plausible-looking value instead of an error. `metadata_columns=` and
+`metadata_max_bytes=` declare and bound the pass-through plane, which is otherwise every
+unmapped column of every row, held for the life of the index. `LoadReport` is how a caller
+finds out what any of them did -- a filter is invisible from its result.
+
 **Re-indexing.** Glossaries are edited constantly and re-embedding all of them on every
 sync is the expensive part -- at ~600 texts/sec, a 100k-entry glossary costs about three
 minutes each time, almost all of it recomputing vectors that did not change.
@@ -42,7 +52,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from collections.abc import Iterable, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -119,6 +129,212 @@ COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
 
 def _norm_key(name: str) -> str:
     return "".join(ch for ch in str(name).lower() if ch.isalnum())
+
+
+# =============================================================================
+# MULTI-VALUE COLUMNS
+# =============================================================================
+
+# Fields whose source column holds SEVERAL values in one cell.
+#
+# Both are ordered tuples, and neither reaches `to_searchable_text()` -- so populating
+# them cannot move a content hash, cannot re-embed a row, and cannot make one process's
+# vectors differ from another's.
+#
+# `synonyms` is the obvious third member and is deliberately absent. It is a `frozenset`,
+# and `to_searchable_text()` extends the embedded text with it UNORDERED, so an entry with
+# two or more synonyms produces a different string in every interpreter (str hashing is
+# seeded per process). Measured: five processes, five different `content_hash` values for
+# one entry with four synonyms. Populating it from here would mean a restart re-embeds the
+# whole glossary and the vectors themselves stop being reproducible -- both properties this
+# package documents and one of them the reason `sync()` exists. `_refuse_unordered_field`
+# says so rather than letting a caller find out from a benchmark.
+MULTI_VALUE_FIELDS: tuple[str, ...] = ("sample_values", "enum_values")
+_UNORDERED_MULTI_VALUE_FIELDS: tuple[str, ...] = ("synonyms",)
+
+# The separator used when a multi-value column is mapped without declaring one. A default
+# is a guess, which is exactly the thing that fails silently here -- so the guess is the
+# commonest convention and `_wrong_delimiter` checks it against the data rather than
+# trusting it.
+_DEFAULT_VALUE_DELIMITER = ","
+
+# Separators a glossary export plausibly uses. Order is the tie-break order in
+# `_wrong_delimiter`, so it is deliberate rather than incidental.
+_DELIMITER_CANDIDATES: tuple[str, ...] = (";", ",", "|", "\t")
+
+# Below this many non-empty cells a column carries no evidence of a convention, and
+# refusing on it would fire on fixtures and pilots -- which is how a good check gets
+# switched off for good.
+_DELIMITER_MIN_CELLS = 3
+# The signature of a wrong separator: the declared one splits almost nothing, while
+# another one is present nearly everywhere.
+_DELIMITER_UNSPLIT_SHARE = 0.95
+_DELIMITER_CANDIDATE_SHARE = 0.60
+
+
+def _split_values(text: str, delimiter: str) -> tuple[str, ...]:
+    return tuple(part.strip() for part in text.split(delimiter) if part.strip())
+
+
+def _wrong_delimiter(cells: Sequence[str], delimiter: str) -> str | None:
+    """
+    The separator a column appears to actually use, when it is not the declared one.
+
+    Returns None when there is no case to answer -- too few cells to judge, or the
+    declared separator is doing work.
+
+    Only this shape is detected, and that is a deliberate narrowing. The other pathology
+    worth refusing -- a value list shredded into single characters -- cannot arise from
+    `str.split` with a non-empty separator at all, and IS refused, exactly, at
+    configuration time. A heuristic over the data cannot separate a shredded string from a
+    legitimate list of single-character codes: `0,1,2,3` and a shredded `0123` are the same
+    bytes. Refusing the empty separator catches the real cause; guessing at the symptom
+    would refuse real flag and grade columns.
+    """
+    if len(cells) < _DELIMITER_MIN_CELLS:
+        return None
+    unsplit = sum(1 for cell in cells if delimiter not in cell)
+    if unsplit / len(cells) < _DELIMITER_UNSPLIT_SHARE:
+        return None
+    best: str | None = None
+    best_share = _DELIMITER_CANDIDATE_SHARE
+    for candidate in _DELIMITER_CANDIDATES:
+        if candidate == delimiter:
+            continue
+        share = sum(1 for cell in cells if candidate in cell) / len(cells)
+        if share >= best_share:
+            best, best_share = candidate, share
+    return best
+
+
+# =============================================================================
+# THE PASS-THROUGH METADATA PLANE
+# =============================================================================
+
+# Keys the LOADER writes into `source_metadata`, as opposed to columns the caller's
+# glossary supplied. Published because whatever emits the plane has to be able to tell the
+# two apart, and a second hand-maintained list of them in the presentation layer is how
+# they drift.
+#
+# They are also the keys truncation may never drop: `governance_code_raw` is the ONLY place
+# a rejected code token survives, and `governance_problems` is the evidence for whoever
+# fixes the source file. Discarding either to make room for a spreadsheet column would
+# destroy the reason a row was refused.
+METADATA_RESERVED_KEYS: tuple[str, ...] = (
+    "governance_raw",
+    "governance_code_raw",
+    "governance_problems",
+    "metadata_truncated",
+)
+_RESERVED_KEY_SET = frozenset(METADATA_RESERVED_KEYS)
+
+# Per-entry cap on the pass-through plane, in bytes of key + value.
+#
+# Chosen by measuring, not by rounding. A realistic enterprise pass-through payload --
+# twelve short enrichment columns: two identifiers, a code, two flags, five sample values,
+# a steward, a review date, a lifecycle token -- costs 330 bytes. The example pack in
+# examples/governance/ has a 103-byte median. 1,024 is 3.1x the first and 10x the second.
+#
+# What the cap is FOR, measured at 100,000 entries with per-row distinct strings
+# (tracemalloc, current after construction):
+#
+#     no metadata          61.0 MB
+#     330-byte payload    140.4 MB
+#     1,627-byte payload  278.8 MB   <- a whole spreadsheet row, including a rationale
+#                                       column, raked in by an undeclared mapping
+#
+# So the plane is not free even when it is used well, and an undeclared mapping more than
+# quadruples what the index costs to hold. The cap refuses the third row and leaves the
+# second alone. Pass `metadata_max_bytes=None` to lift it, having measured your own rows.
+#
+# It is on by default, and that costs measurable time: sizing 30,000 five-key maps takes
+# 29.1 ms against 1.8 ms for the lifted cap (median of five, extremes dropped), roughly
+# +11% on a 30k-row CSV load. An ASCII fast path -- `len(text)` where `text.isascii()`,
+# which is exact -- was implemented and measured at 23.5 ms against 21.8 ms for encoding
+# unconditionally, so it is slower for short strings and is not here. The cost is the
+# price of the bound, not an oversight.
+METADATA_MAX_BYTES = 1024
+
+# Upper bound on what the `metadata_truncated` marker itself costs, reserved out of the
+# budget so a truncated entry still fits the cap it was truncated to meet.
+_TRUNCATION_MARKER_BYTES = len("metadata_truncated") + 4
+
+
+def _value_bytes(value: Any) -> int:
+    return len(str(value).encode("utf-8"))
+
+
+def metadata_bytes(metadata: Mapping[str, Any]) -> int:
+    """
+    Size of a pass-through map, as bytes of key plus rendered value.
+
+    A proxy, and deliberately a cheap and stable one rather than a true memory figure:
+    `sys.getsizeof` is interpreter-defined and shifts with string interning, so a cap
+    expressed in it would mean different things on different builds. This counts what the
+    row actually said, which is the thing a deployment can reason about.
+    """
+    return sum(_value_bytes(k) + _value_bytes(v) for k, v in metadata.items())
+
+
+def _bound_metadata(metadata: dict[str, Any], cap: int | None) -> tuple[dict[str, Any], int]:
+    """
+    Trim a pass-through map to `cap` bytes, largest key first.
+
+    Returns (map, keys_dropped). Dropping the largest first keeps the most keys, and the
+    tie-break on key name makes the survivors identical run to run -- the plane must not
+    be the thing that introduces non-deterministic output.
+
+    Surviving keys keep their original order, so a truncated map is a subsequence of the
+    untruncated one rather than a re-sorted version of it.
+    """
+    if cap is None:
+        return metadata, 0
+    sizes = {key: _value_bytes(key) + _value_bytes(value) for key, value in metadata.items()}
+    total = sum(sizes.values())
+    if total <= cap:
+        return metadata, 0
+
+    budget = cap - _TRUNCATION_MARKER_BYTES
+    dropped: set[str] = set()
+    for key in sorted(
+        (k for k in sizes if k not in _RESERVED_KEY_SET),
+        key=lambda k: (-sizes[k], k),
+    ):
+        if total <= budget:
+            break
+        total -= sizes[key]
+        dropped.add(key)
+
+    if not dropped:
+        # Everything over the cap was reserved evidence, which is never dropped. The
+        # entry keeps it and the cap is exceeded knowingly.
+        return metadata, 0
+
+    kept = {key: value for key, value in metadata.items() if key not in dropped}
+    kept["metadata_truncated"] = len(dropped)
+    return kept, len(dropped)
+
+
+# =============================================================================
+# ROW ADMISSION
+# =============================================================================
+
+
+def _admit_key(value: Any) -> str:
+    """
+    The form an admitted value is compared in: trimmed and case-folded.
+
+    A trailing space in an export is not a policy decision, and refusing an entire
+    glossary over one produces the same outcome as a broken file -- which is the failure
+    this whole filter exists to make distinguishable.
+    """
+    return str("" if value is None else value).strip().casefold()
+
+
+# How many distinct observed values a refusal quotes. Enough to recognise the vocabulary
+# actually in the column, few enough that the message stays readable next to a 105k-row
+# glossary's worth of statuses.
+_OBSERVED_SHOWN = 5
 
 
 def map_columns(columns: Sequence[str]) -> dict[str, str]:
@@ -536,6 +752,69 @@ def load_governance(
 _DEFECTS_SHOWN = 10
 
 
+@dataclass
+class LoadReport:
+    """
+    What a load admitted, refused and bounded.
+
+    Exists because a row filter is invisible from its result. A glossary that comes back
+    with 8,000 of 105,000 rows looks exactly like a glossary that IS 8,000 rows, and looks
+    exactly like a filter aimed at the wrong column -- there is nothing in the returned
+    list that distinguishes the three. The counts are the distinction.
+
+    `load_entries(..., report=report)` fills one in place; `build_index` and `sync` attach
+    one to the index as `index.load_report`. A report handed to a load is RESET first, so
+    it always describes that load rather than accumulating across refreshes.
+    """
+
+    rows_read: int = 0
+    admitted: int = 0
+    refused: int = 0
+    # {admission column: rows it refused}. A row refused by two columns is counted against
+    # the first one that refused it, so the totals here sum to `refused` rather than
+    # over-counting a row that fails everything.
+    refused_by_column: dict[str, int] = field(default_factory=dict)
+    # Rows with neither a business name nor a definition. Not a filter decision -- such a
+    # row cannot be matched to and has always been skipped -- but counted here so it is
+    # not mistaken for one.
+    skipped_unmatchable: int = 0
+    entries: int = 0
+    # Entries whose pass-through map hit `metadata_max_bytes`, and the total keys dropped.
+    metadata_truncated: int = 0
+    metadata_keys_dropped: int = 0
+
+    def reset(self) -> None:
+        self.rows_read = 0
+        self.admitted = 0
+        self.refused = 0
+        self.refused_by_column = {}
+        self.skipped_unmatchable = 0
+        self.entries = 0
+        self.metadata_truncated = 0
+        self.metadata_keys_dropped = 0
+
+    def __str__(self) -> str:
+        by_column = (
+            "  (" + ", ".join(f"{c} {n}" for c, n in sorted(self.refused_by_column.items())) + ")"
+            if self.refused_by_column
+            else ""
+        )
+        truncated = (
+            f"  !{self.metadata_truncated} metadata truncated" if self.metadata_truncated else ""
+        )
+        return (
+            f"{self.rows_read} rows read  {self.admitted} admitted  "
+            f"{self.refused} refused{by_column}  "
+            f"{self.skipped_unmatchable} unmatchable  ={self.entries} entries{truncated}"
+        )
+
+
+# Reader options `load_entries` forwards. Anything else is a typo, and a typo that reaches
+# the reader is silently discarded there -- which would make `admt={...}` a load with no
+# filter at all, indistinguishable from a load that was never configured.
+_READER_OPTIONS = frozenset({"sheet", "delimiter", "encoding", "header_row"})
+
+
 def load_entries(
     source: str | Path | Iterable[dict],
     query: str | None = None,
@@ -543,6 +822,12 @@ def load_entries(
     id_prefix: str = "",
     governance: GovernanceVocabulary | str | Path | Mapping[str, Any] | Sequence[Any] | None = None,
     governance_strict: bool = True,
+    admit: Mapping[str, Collection[str]] | None = None,
+    value_delimiters: Mapping[str, str] | None = None,
+    delimiter_strict: bool = True,
+    metadata_columns: Sequence[str] | None = None,
+    metadata_max_bytes: int | None = METADATA_MAX_BYTES,
+    report: LoadReport | None = None,
     **kwargs: Any,
 ) -> list[DictionaryEntry]:
     """
@@ -552,7 +837,9 @@ def load_entries(
         source: File path, SQLAlchemy connection string, or iterable of dicts.
         query: SQL, when source is a connection string.
         columns: Explicit {field: source_column} overrides. Anything not given is
-            inferred from the header via `map_columns`.
+            inferred from the header via `map_columns`. The multi-value fields
+            (`sample_values`, `enum_values`) are ONLY ever mapped explicitly -- inferring
+            them would change the text existing glossaries embed.
         id_prefix: Prefix for generated ids, useful when pooling several glossaries.
         governance: The caller's controlled vocabulary -- a `GovernanceVocabulary`, a
             path to its JSON file, or the parsed document. None (the default) leaves
@@ -564,7 +851,35 @@ def load_entries(
             -- the catalog still wins, so no entry inherits a contradicted tier, and each
             offending row carries its problems in
             `source_metadata['governance_problems']`.
+        admit: {column: accepted values} -- only rows whose named column holds one of the
+            accepted values become entries, all columns having to agree. Values are
+            compared trimmed and case-folded. Without this, a glossary's drafts and
+            retired terms are indexed alongside its approved ones, and they compete as
+            real terms because they ARE real terms; no threshold repairs that. The counts
+            land in `report`, because a filter that quietly drops nine rows in ten is
+            indistinguishable from a broken file.
+        value_delimiters: {field: separator} for the multi-value fields -- one file
+            routinely separates one such column with ';' and another with ',', and reading
+            either with the other's separator yields one value per row containing every
+            element, which indexes and matches and is simply wrong. Defaults to ',' for a
+            mapped multi-value column that declares nothing.
+        delimiter_strict: REFUSE the load when a declared separator does not appear in a
+            column that another separator plainly does. Set False to load the column as
+            the loader read it, having decided it really is single-valued.
+        metadata_columns: The DECLARED pass-through allow-list: exactly these source
+            columns reach `source_metadata`, whether or not they also feed a domain
+            field. Omit it and the existing behaviour stands -- every unmapped column is
+            carried -- which is convenient and unbounded in the number of keys.
+        metadata_max_bytes: Per-entry cap on the pass-through map, in bytes of key plus
+            rendered value; None lifts it. Over the cap, the largest keys are dropped
+            (never the loader's own -- see METADATA_RESERVED_KEYS) and the entry carries
+            `metadata_truncated` with the count. See METADATA_MAX_BYTES for how the
+            default was measured.
+        report: Filled in place with what this load admitted, refused and bounded. Reset
+            first, so it describes this load and not the last one too.
         **kwargs: Passed to the reader (`sheet`, `delimiter`, `encoding`, `header_row`).
+            Note that `delimiter` is the reader's -- the character between COLUMNS. The
+            character between values INSIDE a column is `value_delimiters`.
 
     Returns:
         Entries, skipping rows with no business name AND no definition -- such a row
@@ -572,13 +887,26 @@ def load_entries(
 
     Raises:
         ValueError: if neither a business name nor a definition column can be identified,
-            which means the mapping is wrong rather than the data being sparse; or, under
-            `governance_strict`, if any row's governance is defective or the source
-            carries a protection-code column with no vocabulary to interpret it.
+            which means the mapping is wrong rather than the data being sparse; if `admit`
+            or `metadata_columns` names a column the source does not have, or `admit`
+            refuses every row; under `delimiter_strict`, if a declared separator
+            contradicts the data; or, under `governance_strict`, if any row's governance
+            is defective or the source carries a protection-code column with no vocabulary
+            to interpret it.
     """
+    _check_reader_options(kwargs)
+    report = report or LoadReport()
+    report.reset()
+
     rows, header = read_source(source, query=query, **kwargs)
     mapping = {**map_columns(header), **(columns or {})}
     vocabulary = load_governance(governance)
+
+    unordered = [f for f in _UNORDERED_MULTI_VALUE_FIELDS if f in mapping]
+    if unordered:
+        raise _unordered_field_error(unordered[0], mapping[unordered[0]])
+
+    delimiters = _resolve_delimiters(value_delimiters, mapping)
 
     if "business_name" not in mapping and "definition" not in mapping:
         raise ValueError(
@@ -603,6 +931,12 @@ def load_entries(
     if vocabulary is None and governance_strict and mapping.get("governance_code"):
         raise _unread_code_column_error(source, mapping["governance_code"])
 
+    declared_metadata = _resolve_metadata_columns(metadata_columns, header, source)
+
+    admitted_rows = _admit_rows(rows, admit, header, source, report)
+    if delimiter_strict:
+        _check_delimiters(admitted_rows, delimiters, mapping)
+
     entries: list[DictionaryEntry] = []
     used_ids: set[str] = set()
     # The defects the refusal will SHOW, capped, plus a count of all of them.
@@ -624,7 +958,7 @@ def load_entries(
     # the comprehension below meant one set construction per row -- 30k of them on a 30k
     # glossary, measured at 3x the cost of the whole source_metadata build.
     mapped_columns = set(mapping.values())
-    for row_number, row in enumerate(rows, start=1):
+    for row_number, row in enumerate(admitted_rows, start=1):
         # `row` is bound as a default argument rather than captured. Capturing the loop
         # variable works only while the closure is called inside the same iteration --
         # true today, and silently wrong the moment anyone defers a call.
@@ -635,55 +969,40 @@ def load_entries(
         business_name = get("business_name")
         definition = get("definition")
         if not business_name and not definition:
+            report.skipped_unmatchable += 1
             continue
 
-        # Governance, resolved through the caller's vocabulary and NEVER from the row.
-        #
-        # `governance_code` is the CANONICAL code the vocabulary declares, so a legacy
-        # spelling is stored as the code it maps to and a token the vocabulary does not
-        # define is stored as nothing at all. Storing an unknown code would leave a field
-        # carrying a label nobody defined, which reads as governance and is not.
-        governance_code: str | None = None
-        problems: list[str] = []
-        if vocabulary is not None:
-            problems = vocabulary.problems_with(row)
-            protection_class = vocabulary.get(get("governance_code"))
-            governance_code = protection_class.code if protection_class is not None else None
-            if problems:
-                defect_count += 1
-                # A defective row with no class resolved is a rejected code -- the only
-                # other way to reach `problems` is a contradiction, which needs a class to
-                # contradict. Derived from the lookup rather than by reading the message
-                # text, so rewording a problem cannot silently change what gets printed.
-                rejected_a_code = rejected_a_code or protection_class is None
-                if governance_strict and len(defects) < _DEFECTS_SHOWN:
-                    defects.append(
-                        f"row {row_number} ({business_name or definition!r}): "
-                        + "; ".join(problems)
-                    )
+        multi: dict[str, tuple[str, ...]] = {
+            field_name: _split_values(get(field_name), delimiter)
+            for field_name, delimiter in delimiters.items()
+        }
 
-        raw_id = get("id")
-        if raw_id:
-            entry_id = f"{id_prefix}{raw_id}"
-        else:
-            # Derive a STABLE id from identifying content, never from row position.
-            #
-            # Positional ids ("row-0", "row-1", ...) look harmless and quietly destroy
-            # incremental sync: deleting one row of ten renumbers every row after it, so
-            # the diff sees 9 updates and 1 removal and re-embeds the whole glossary --
-            # measured, 9 of 9 rows re-embedded for a single deletion. Any source without
-            # an id column, which is most spreadsheets, would rebuild on every edit.
-            key = f"{business_name}{get('logical_name')}"
-            digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).hexdigest()
-            entry_id = f"{id_prefix}{digest}"
-            # Genuine duplicates (same name AND same technical name) still need distinct
-            # ids, so disambiguate deterministically by order of appearance.
-            if entry_id in used_ids:
-                n = 2
-                while f"{entry_id}-{n}" in used_ids:
-                    n += 1
-                entry_id = f"{entry_id}-{n}"
+        governance_code, problems, rejected = _row_governance(
+            vocabulary, row, get("governance_code")
+        )
+        if problems:
+            defect_count += 1
+            rejected_a_code = rejected_a_code or rejected
+            if governance_strict and len(defects) < _DEFECTS_SHOWN:
+                defects.append(
+                    f"row {row_number} ({business_name or definition!r}): " + "; ".join(problems)
+                )
+
+        entry_id = _entry_id(get("id"), business_name, get("logical_name"), id_prefix, used_ids)
         used_ids.add(entry_id)
+
+        metadata, dropped_keys = _row_metadata(
+            row,
+            mapped_columns,
+            declared_metadata,
+            metadata_max_bytes,
+            get("protection_level") if mapping.get("protection_level") else None,
+            get("governance_code") if mapping.get("governance_code") else None,
+            problems,
+        )
+        if dropped_keys:
+            report.metadata_truncated += 1
+            report.metadata_keys_dropped += dropped_keys
 
         entries.append(
             DictionaryEntry(
@@ -695,31 +1014,10 @@ def load_entries(
                 domain=get("domain"),
                 protection_level=_coerce_protection(get("protection_level")),
                 governance_code=governance_code,
-                # Everything unmapped is preserved, PLUS the raw governance strings. The
-                # classification column is usually the whole reason for matching -- an
-                # earlier version mapped it (which excluded it from here) and then never
-                # used it, so the value a caller most needs was silently dropped. The
-                # enum is lossy by design (an org's "Highly Restricted" collapses to
-                # RESTRICTED), so the original text is kept alongside it.
-                #
-                # `governance_code_raw` is the same guarantee for the controlled code,
-                # and it is the ONLY place a rejected token survives: it is evidence for
-                # whoever fixes the source file, sitting under a key that cannot be
-                # mistaken for an accepted class.
-                source_metadata={
-                    **{k: v for k, v in row.items() if k not in mapped_columns},
-                    **(
-                        {"governance_raw": get("protection_level")}
-                        if mapping.get("protection_level")
-                        else {}
-                    ),
-                    **(
-                        {"governance_code_raw": get("governance_code")}
-                        if mapping.get("governance_code")
-                        else {}
-                    ),
-                    **({"governance_problems": problems} if problems else {}),
-                },
+                sample_values=multi.get("sample_values", ()),
+                enum_values=multi.get("enum_values", ()),
+                is_enum=bool(multi.get("enum_values")),
+                source_metadata=metadata,
             )
         )
 
@@ -733,18 +1031,402 @@ def load_entries(
         # vocabulary reference is a source-data bug and it has to be fixed in the source.
         raise _defective_governance_error(defect_count, defects, vocabulary, rejected_a_code)
 
+    report.entries = len(entries)
     return entries
+
+
+def _check_reader_options(kwargs: Mapping[str, Any]) -> None:
+    """
+    Refuse an option `load_entries` does not understand, instead of forwarding it.
+
+    Everything not named in the signature went to the reader, and the reader pops what it
+    recognises and never looks at the rest -- so a misspelled option was a silent no-op,
+    and the load reported success having done something other than what was asked.
+    Recorded as NM-0032, where `sheet_name=` (the pandas spelling) read the wrong sheet of
+    a two-sheet workbook and indexed a glossary of retired terms without a word.
+    """
+    unsupported = sorted(set(kwargs) - _READER_OPTIONS)
+    if unsupported:
+        raise ValueError(
+            f"load_entries does not take {', '.join(repr(k) for k in unsupported)}. "
+            f"Reader options are {', '.join(sorted(_READER_OPTIONS))}; anything else is "
+            f"discarded by the reader without a word, so a misspelled option would read as "
+            f"a load that was never configured."
+        )
+
+
+def _row_metadata(
+    row: Mapping[str, Any],
+    mapped_columns: set[str],
+    declared_metadata: tuple[str, ...] | None,
+    cap: int | None,
+    governance_raw: str | None,
+    governance_code_raw: str | None,
+    problems: list[str],
+) -> tuple[dict[str, Any], int]:
+    """
+    One row's pass-through map, bounded. Returns (map, keys dropped to fit the cap).
+
+    `governance_raw` and `governance_code_raw` are None when the source has no such
+    column, and a string -- possibly empty -- when it has one. The distinction is the
+    point: an empty cell in a classification column is a row nobody classified, which is
+    not the same as a glossary with no classification column at all.
+    """
+    # THE PASS-THROUGH PLANE, and the loader is what decides what enters it.
+    #
+    # Declared, the allow-list IS the plane: exactly the named columns, in the order
+    # they were named, whether or not they also feed a domain field. Declaring a
+    # column is a statement that the deployment wants it back, and the protection
+    # class is the standing proof that "it is mapped, so you have it" is wrong -- the
+    # enum is lossy, which is why `governance_raw` exists.
+    #
+    # Undeclared, the historical behaviour stands: everything unmapped is preserved.
+    # Convenient, and unbounded in the number of keys, which is what
+    # `metadata_max_bytes` is for.
+    #
+    # PLUS the raw governance strings either way. The classification column is usually
+    # the whole reason for matching -- an earlier version mapped it (which excluded it
+    # from here) and then never used it, so the value a caller most needs was silently
+    # dropped. The enum is lossy by design (an org's "Highly Restricted" collapses to
+    # RESTRICTED), so the original text is kept alongside it.
+    #
+    # `governance_code_raw` is the same guarantee for the controlled code, and it is
+    # the ONLY place a rejected token survives: it is evidence for whoever fixes the
+    # source file, sitting under a key that cannot be mistaken for an accepted class.
+    metadata = {
+        **(
+            {k: v for k, v in row.items() if k not in mapped_columns}
+            if declared_metadata is None
+            else {c: row[c] for c in declared_metadata if c in row}
+        ),
+        **({"governance_raw": governance_raw} if governance_raw is not None else {}),
+        **({"governance_code_raw": governance_code_raw} if governance_code_raw is not None else {}),
+        **({"governance_problems": problems} if problems else {}),
+    }
+    return _bound_metadata(metadata, cap)
+
+
+def _row_governance(
+    vocabulary: GovernanceVocabulary | None,
+    row: Mapping[str, Any],
+    code_text: str,
+) -> tuple[str | None, list[str], bool]:
+    """
+    One row's governance, resolved through the caller's vocabulary and NEVER from the row.
+
+    Returns (canonical code, problems, code was rejected).
+
+    The code stored is the CANONICAL one the vocabulary declares, so a legacy spelling is
+    stored as the code it maps to and a token the vocabulary does not define is stored as
+    nothing at all. Storing an unknown code would leave a field carrying a label nobody
+    defined, which reads as governance and is not.
+
+    The third member distinguishes a REJECTED code from a row that merely contradicts its
+    own tier: only the first sends a reader looking for the list of declared codes. It is
+    derived from the lookup rather than by reading the message text, so rewording a problem
+    cannot silently change what a refusal prints.
+    """
+    if vocabulary is None:
+        return None, [], False
+    problems = vocabulary.problems_with(row)
+    protection_class = vocabulary.get(code_text)
+    code = protection_class.code if protection_class is not None else None
+    return code, problems, protection_class is None
+
+
+def _entry_id(
+    raw_id: str,
+    business_name: str,
+    logical_name: str,
+    id_prefix: str,
+    used_ids: set[str],
+) -> str:
+    """The entry's id: the source's own if it has one, else derived from content."""
+    if raw_id:
+        entry_id = f"{id_prefix}{raw_id}"
+    else:
+        # Derive a STABLE id from identifying content, never from row position.
+        #
+        # Positional ids ("row-0", "row-1", ...) look harmless and quietly destroy
+        # incremental sync: deleting one row of ten renumbers every row after it, so
+        # the diff sees 9 updates and 1 removal and re-embeds the whole glossary --
+        # measured, 9 of 9 rows re-embedded for a single deletion. Any source without
+        # an id column, which is most spreadsheets, would rebuild on every edit.
+        key = f"{business_name}{logical_name}"
+        digest = hashlib.blake2b(key.encode("utf-8"), digest_size=8).hexdigest()
+        entry_id = f"{id_prefix}{digest}"
+        # Genuine duplicates (same name AND same technical name) still need distinct
+        # ids, so disambiguate deterministically by order of appearance.
+        if entry_id in used_ids:
+            n = 2
+            while f"{entry_id}-{n}" in used_ids:
+                n += 1
+            entry_id = f"{entry_id}-{n}"
+    return entry_id
+
+
+def _subject_of(source: str | Path | Iterable[dict[str, Any]]) -> str:
+    """
+    A name for the source, for a refusal a human reads at deployment time.
+
+    "some glossary has a column" sends an operator looking through however many they
+    configured. An iterable of dicts has no name, and its repr would be the whole glossary.
+    """
+    return str(source) if isinstance(source, (str, Path)) else "this glossary"
+
+
+def _resolve_delimiters(
+    value_delimiters: Mapping[str, str] | None,
+    mapping: Mapping[str, str],
+) -> dict[str, str]:
+    """
+    {multi-value field: separator}, for the multi-value fields that were actually mapped.
+
+    Refuses a declaration naming something that is not a multi-value field. A declaration
+    the loader silently ignores is worse than no declaration: the caller believes a column
+    is being split and it is not, and the entry carries one value that looks like data.
+    """
+    declared = dict(value_delimiters or {})
+    unknown = sorted(set(declared) - set(MULTI_VALUE_FIELDS))
+    if unknown:
+        raise ValueError(
+            f"value_delimiters names {', '.join(repr(f) for f in unknown)}, which "
+            f"{'are' if len(unknown) > 1 else 'is'} not multi-value. The multi-value "
+            f"fields are {', '.join(MULTI_VALUE_FIELDS)}."
+        )
+    resolved: dict[str, str] = {}
+    for field_name in MULTI_VALUE_FIELDS:
+        if field_name not in mapping:
+            continue
+        delimiter = declared.get(field_name, _DEFAULT_VALUE_DELIMITER)
+        if not delimiter:
+            # The one input that shreds a value into single characters, and the only way
+            # `str.split` can produce that outcome at all. Python refuses it too, with a
+            # message ("empty separator") that names neither the column nor the field.
+            raise ValueError(
+                f"value_delimiters[{field_name!r}] is empty. An empty separator splits a "
+                f"value into single characters -- str.split refuses it outright -- so a "
+                f"column of terms would become a column of letters. Declare the character "
+                f"between values, e.g. value_delimiters={{{field_name!r}: ';'}}."
+            )
+        resolved[field_name] = delimiter
+    return resolved
+
+
+def _unordered_field_error(field_name: str, column: str) -> ValueError:
+    """The refusal for mapping a multi-value field whose container has no order."""
+    return ValueError(
+        f"columns maps {field_name!r} to {column!r}, and this loader cannot populate it.\n"
+        f"DictionaryEntry.{field_name} is a frozenset, and DictionaryEntry."
+        f"to_searchable_text() emits it unordered -- so an entry with two or more values "
+        f"embeds a different string, and therefore hashes and vectorises differently, in "
+        f"every process. Measured: five interpreters, five content hashes for one entry "
+        f"with four synonyms. Every restart would re-embed the whole glossary, and no two "
+        f"builds would agree on a vector.\n"
+        f"Map the column to an ordered multi-value field "
+        f"({', '.join(MULTI_VALUE_FIELDS)}), or carry it as pass-through metadata with "
+        f"metadata_columns=[{column!r}]."
+    )
+
+
+def _resolve_admission(
+    admit: Mapping[str, Collection[str]],
+    header: Sequence[str],
+    source: str | Path | Iterable[dict[str, Any]],
+) -> tuple[tuple[str, frozenset[str], tuple[str, ...]], ...]:
+    """
+    The admission filter, normalised, with both ways of writing it wrong refused here.
+
+    A column the file does not have would refuse every row; an accepted set with nothing
+    in it would too. Both produce an empty glossary, which is indistinguishable downstream
+    from a glossary of nothing but drafts.
+
+    Each entry is (column, comparison keys, the values AS THE CALLER SPELLED THEM). The
+    third member exists only for refusals: quoting a case-folded 'published' back at
+    someone who wrote 'Published' invites them to hunt for a bug in their own casing,
+    which is the one thing this filter does not care about.
+    """
+    missing = [column for column in admit if column not in header]
+    if missing:
+        raise ValueError(
+            f"admit names {', '.join(repr(c) for c in missing)}, which "
+            f"{_subject_of(source)} does not have. Its columns are "
+            f"{', '.join(repr(c) for c in header)}.\n"
+            f"Every row would be refused, and an empty glossary reads downstream exactly "
+            f"like a glossary with nothing approved in it."
+        )
+    resolved: list[tuple[str, frozenset[str], tuple[str, ...]]] = []
+    for column, values in admit.items():
+        accepted = frozenset(_admit_key(v) for v in values)
+        if not accepted:
+            raise ValueError(
+                f"admit[{column!r}] accepts nothing, so every row is refused. Name the "
+                f"values that ARE admitted, e.g. admit={{{column!r}: {{'Approved'}}}}."
+            )
+        resolved.append((column, accepted, tuple(sorted(str(v) for v in values))))
+    return tuple(resolved)
+
+
+def _admit_rows(
+    rows: list[dict],
+    admit: Mapping[str, Collection[str]] | None,
+    header: Sequence[str],
+    source: str | Path | Iterable[dict[str, Any]],
+    report: LoadReport,
+) -> list[dict]:
+    """
+    The rows that will become entries, and the counts for the ones that will not.
+
+    Deliberately its own pass rather than a `continue` inside the build loop. The
+    delimiter check has to judge a column on the cells that will actually be INDEXED -- a
+    draft row's punctuation is not evidence about the approved ones -- and the counts have
+    to be complete before the first entry is built, because the refusal for "this filter
+    admitted nothing" is only useful if it can also say what the column actually held.
+
+    A row that fails several columns is counted against the FIRST one that refused it, so
+    the per-column tallies sum to the total rather than over-counting a row that fails
+    everything.
+    """
+    report.rows_read = len(rows)
+    if admit is None:
+        report.admitted = len(rows)
+        return rows
+
+    accepted = _resolve_admission(admit, header, source)
+    admitted: list[dict] = []
+    for row in rows:
+        refused_by = next(
+            (
+                column
+                for column, keys, _spelled in accepted
+                if _admit_key(row.get(column)) not in keys
+            ),
+            None,
+        )
+        if refused_by is None:
+            admitted.append(row)
+        else:
+            report.refused += 1
+            report.refused_by_column[refused_by] = report.refused_by_column.get(refused_by, 0) + 1
+
+    if rows and not admitted:
+        raise _nothing_admitted_error(source, rows, accepted)
+    report.admitted = len(admitted)
+    return admitted
+
+
+def _check_delimiters(
+    rows: Sequence[Mapping[str, Any]],
+    delimiters: Mapping[str, str],
+    mapping: Mapping[str, str],
+) -> None:
+    """Refuse a declared separator that the column's own contents contradict."""
+    for field_name, delimiter in delimiters.items():
+        column = mapping[field_name]
+        cells = [text for row in rows if (text := _as_text(row.get(column)))]
+        actual = _wrong_delimiter(cells, delimiter)
+        if actual is not None:
+            raise _wrong_delimiter_error(column, field_name, delimiter, actual, cells)
+
+
+def _nothing_admitted_error(
+    source: str | Path | Iterable[dict[str, Any]],
+    rows: Sequence[Mapping[str, Any]],
+    accepted: Sequence[tuple[str, frozenset[str], tuple[str, ...]]],
+) -> ValueError:
+    """
+    The refusal for a filter that admitted no row at all.
+
+    Quotes what the column actually holds, because the bug is almost always that the
+    deployment named the neighbouring vocabulary -- "Published" against a file that says
+    "Approved" -- and no amount of staring at the configuration reveals that. Only the
+    data does.
+    """
+    lines = []
+    for column, _keys, spelled in accepted:
+        tally: dict[str, int] = {}
+        for row in rows:
+            seen = _as_text(row.get(column))
+            tally[seen] = tally.get(seen, 0) + 1
+        top = sorted(tally.items(), key=lambda kv: (-kv[1], kv[0]))[:_OBSERVED_SHOWN]
+        lines.append(
+            f"  {column!r} accepts {list(spelled)}; the column holds "
+            + ", ".join(f"{value!r} x{count}" for value, count in top)
+            + (f" (+{len(tally) - len(top)} more)" if len(tally) > len(top) else "")
+        )
+    return ValueError(
+        f"Row admission refused all {len(rows)} rows of {_subject_of(source)}.\n"
+        + "\n".join(lines)
+        + "\nEither the accepted values are wrong, or this is not the file you think it "
+        "is. Returning an empty glossary would look identical to a glossary with nothing "
+        "approved in it."
+    )
+
+
+def _wrong_delimiter_error(
+    column: str,
+    field_name: str,
+    delimiter: str,
+    actual: str,
+    cells: Sequence[str],
+) -> ValueError:
+    """
+    The refusal for a separator the data contradicts.
+
+    This is the failure the whole per-column delimiter feature exists for: one file
+    routinely separates one multi-value column with ';' and another with ',', and reading
+    either with the other's separator raises nothing. It yields ONE value per row
+    containing every element -- which embeds, indexes, and comes back as a match. There is
+    no downstream check that can notice, because the result is well-formed. Only the
+    loader is in a position to see it.
+    """
+    unsplit = sum(1 for cell in cells if delimiter not in cell)
+    present = sum(1 for cell in cells if actual in cell)
+    return ValueError(
+        f"Column {column!r} is mapped to {field_name!r} with delimiter {delimiter!r}, "
+        f"which appears in none of {unsplit} of its {len(cells)} non-empty cells -- while "
+        f"{actual!r} appears in {present} of them.\n"
+        f"Splitting on {delimiter!r} would give one value per row containing every "
+        f"element. That indexes and matches and is simply wrong, and nothing downstream "
+        f"can tell.\n"
+        f"Pass value_delimiters={{{field_name!r}: {actual!r}}}, or delimiter_strict=False "
+        f"if this column really does hold one value."
+    )
+
+
+def _resolve_metadata_columns(
+    metadata_columns: Sequence[str] | None,
+    header: Sequence[str],
+    source: str | Path | Iterable[dict[str, Any]],
+) -> tuple[str, ...] | None:
+    """
+    The declared pass-through allow-list, or None for "carry every unmapped column".
+
+    A declared column the source does not have is refused rather than skipped. The
+    declaration is the deployment's statement of what it is carrying; one that names
+    nothing carries nothing, and the response side has no way to tell that from a column
+    that was empty on every row.
+    """
+    if metadata_columns is None:
+        return None
+    declared = tuple(metadata_columns)
+    missing = [column for column in declared if column not in header]
+    if missing:
+        raise ValueError(
+            f"metadata_columns names {', '.join(repr(c) for c in missing)}, which "
+            f"{_subject_of(source)} does not have. Its columns are "
+            f"{', '.join(repr(c) for c in header)}.\n"
+            f"A declared pass-through column that carries nothing is indistinguishable, "
+            f"downstream, from one that was empty on every row."
+        )
+    return declared
 
 
 def _unread_code_column_error(
     source: str | Path | Iterable[dict[str, Any]], code_column: str
 ) -> ValueError:
     """The refusal for a glossary that carries protection codes nobody can interpret."""
-    # The path, when there is one. This message is read at deployment time -- it is what
-    # the HTTP app's own copy of the check was written to say -- and "some glossary has a
-    # column" sends an operator looking through however many they configured. An iterable
-    # of dicts has no name, and its repr would be the entire glossary.
-    subject = str(source) if isinstance(source, (str, Path)) else "this glossary"
+    subject = _subject_of(source)
     return ValueError(
         f"{subject} has a protection-code column ({code_column!r}) and no vocabulary to "
         f"interpret it, so every entry would come back carrying no class -- "
@@ -1080,6 +1762,11 @@ class GlossaryIndex:
     # accident -- dropping `columns` changes the derived ids, so the diff reports the whole
     # glossary added and removed instead of quietly re-describing it.
     load_options: dict[str, Any] = field(default_factory=dict)
+    # What the most recent load admitted, refused and bounded. Replaced by every `sync`,
+    # never accumulated, and deliberately NOT a member of `load_options` -- a mutable
+    # report replayed on every refresh would tally the whole history of the index under a
+    # name that reads as "this load".
+    load_report: LoadReport | None = None
 
     def __len__(self) -> int:
         return len(self.entries)
@@ -1124,12 +1811,18 @@ def build_index(
             connection string, or an iterable of dicts.
         provider: Embedding provider. Defaults to the bundled offline encoder.
         **kwargs: Passed to `load_entries` -- `query`, `columns`, `id_prefix`,
-            `governance`, `governance_strict`, and the reader options `sheet`,
-            `delimiter`, `encoding` and `header_row`. All of them are remembered on the
-            index and reused by `sync`, so a refresh reads the source the same way.
+            `governance`, `governance_strict`, `admit`, `value_delimiters`,
+            `delimiter_strict`, `metadata_columns`, `metadata_max_bytes`, and the reader
+            options `sheet`, `delimiter`, `encoding` and `header_row`. All of them are
+            remembered on the index and reused by `sync`, so a refresh reads the source
+            the same way -- same vocabulary, same admission filter, same separators.
+
+            `report` is the one exception: it is per-call and is never remembered, because
+            `load_options` is replayed by every refresh.
 
     Returns:
-        A GlossaryIndex ready to search or to `sync`.
+        A GlossaryIndex ready to search or to `sync`. `index.load_report` says what the
+        load admitted, refused and bounded.
 
     Example:
         index = build_index("glossary.xlsx")
@@ -1147,8 +1840,12 @@ def build_index(
     options = dict(kwargs)
     if "governance" in options:
         options["governance"] = load_governance(options["governance"])
+    # The report is per-call and never remembered: `load_options` is replayed by every
+    # `sync`, so a report stored in it would be refilled -- under the caller's own object
+    # -- on every refresh for the life of the index.
+    report = options.pop("report", None) or LoadReport()
 
-    entries = load_entries(source, **options)
+    entries = load_entries(source, report=report, **options)
     provider = provider or _default_provider()
 
     order = [e.id for e in entries]
@@ -1161,6 +1858,7 @@ def build_index(
         hashes={e.id: content_hash(e) for e in entries},
         provider=provider,
         load_options=options,
+        load_report=report,
     )
 
 
@@ -1187,6 +1885,8 @@ def sync(
     Returns:
         SyncReport, whose `embedded` count is the number of texts actually encoded and
         whose `governance_changed` lists the entries whose protection code moved.
+        `index.load_report` is REPLACED with what this refresh admitted and refused --
+        replaced rather than accumulated, so it always describes the current index.
 
     Example:
         report = sync(index, "glossary.xlsx")
@@ -1194,7 +1894,10 @@ def sync(
     """
     import numpy as np
 
-    entries = load_entries(source, **{**index.load_options, **kwargs})
+    options = {**index.load_options, **kwargs}
+    load_report = options.pop("report", None) or LoadReport()
+    entries = load_entries(source, report=load_report, **options)
+    index.load_report = load_report
     to_embed, removed, report = diff_entries(index.hashes, entries)
     # Before anything is mutated, and only for entries that exist on BOTH sides: an id
     # that is new is reported as added, and one that is gone is reported as removed, so

@@ -6,6 +6,8 @@ FastAPI application factory: health, introspection, and the matching endpoints.
 # DEPENDS_ON → application/use_cases/* :: use case orchestration
 # DEPENDS_ON → infrastructure/config :: application configuration
 # DEPENDS_ON → presentation/api/matching :: POST /api/v1/match[/batch]
+# DEPENDS_ON → presentation/api/lookup :: GET /api/v1/lookup/{id}, POST /api/v1/lookup
+# DEPENDS_ON → presentation/api/introspect :: GET /api/v1/status, POST /api/v1/diag/retrieval
 # DEPENDS_ON → presentation/api/feedback :: POST /api/v1/feedback
 # DEPENDS_ON → presentation/api/limits :: admission control and the deadline
 # DEPENDS_ON → shared/logging :: structured logging
@@ -88,7 +90,17 @@ from nexus_matcher.presentation.api.errors import (
     validation_exception_handler,
 )
 from nexus_matcher.presentation.api.feedback import FeedbackRecorder, create_feedback_router
+from nexus_matcher.presentation.api.introspect import (
+    IntrospectionService,
+    ProvenanceRecorder,
+    create_introspection_router,
+)
 from nexus_matcher.presentation.api.limits import BoundedWorkPool, MatchServiceLimits
+from nexus_matcher.presentation.api.lookup import (
+    DictionaryLookup,
+    LookupService,
+    create_lookup_router,
+)
 from nexus_matcher.presentation.api.matching import (
     DeterministicJSONResponse,
     MatcherHandle,
@@ -412,24 +424,26 @@ def _load_configured_matcher(environ: Mapping[str, str]) -> object | None:
 
     ## Why `ingest.load_entries` and not `matcher.load_dictionary`
 
-    Because `load_dictionary` LOSES THE GOVERNANCE CODE. It dispatches to the loader
-    registry, and neither `CsvDictionaryLoader` nor `ExcelDictionaryLoader` reads a
-    protection-code column -- verified 2026-08-10: a glossary row carrying
-    `protection_class,GROWERID` comes back with `governance_code=None`. The governance
-    columns are understood by `application.ingest`, which is a different reader.
+    RETRACTED, 2026-08-19. This paragraph used to say `load_dictionary` LOSES THE
+    GOVERNANCE CODE, and that a server routed through it answers 200 with
+    `"governance": null` on every field. That was true when it was written and is false
+    now: NM-0033 fixed it, and both paths were driven side by side afterwards -- a matcher
+    built with `from_config(governance=...) + load_dictionary(...)` produces a response
+    BYTE-IDENTICAL to this one, against a control that returns null when no vocabulary is
+    configured.
 
-    Routed through `load_dictionary`, this server starts cleanly, answers 200, returns the
-    right entry with the right id -- and `"governance": null` on every field of every
-    request, which a caller cannot distinguish from a glossary that genuinely carries no
-    classes. That is NM-0005's shape at the top of the stack: not an error, not a warning,
-    just a column that silently inherits nothing.
+    The sentence is kept rather than deleted because a comment asserting a defect that no
+    longer exists is exactly what NM-0029 is about: this file ships inside the wheel, and a
+    reader who trusts it would route around a path that works and re-derive a workaround
+    nobody needs.
 
-    `load_entries` reads the same file formats (`read_source` handles xlsx, csv and a
-    database URL) and additionally validates every row against the vocabulary, so the
-    honest wiring is one path, not two. `_index_dictionary` is the private half of
-    `load_dictionary` that does the indexing without the re-reading; the coupling is the
-    same one `matching.py` documents for `_match_fields`, and a public
-    `NexusMatcher.index(entries)` would remove both.
+    What remains true, and is the actual reason this line has not changed: `load_entries`
+    is the reader that understands the governance columns natively, so this route reads the
+    file once where `load_dictionary` now reads it twice -- once through the loader
+    registry and once for the codes. At 100k entries that second read is real. Either path
+    is correct; this one is cheaper here. `_index_dictionary` is the private half of
+    `load_dictionary` that indexes without re-reading, and a public
+    `NexusMatcher.index(entries)` would let both paths share it.
     """
     dictionary = (environ.get("NEXUS_API_DICTIONARY") or "").strip()
     if not dictionary:
@@ -547,9 +561,10 @@ def _bring_up_matcher(
     logger: Any,
     *,
     optional: bool,
+    provenance: ProvenanceRecorder,
 ) -> None:
     """
-    Resolve the matcher at startup and report it through readiness.
+    Resolve the matcher at startup, report it through readiness, and record its provenance.
 
     The `matcher` component is registered whether or not a dictionary was configured. It
     used to be registered only on success, and since `check_ready()` is `all()` over what
@@ -567,6 +582,19 @@ def _bring_up_matcher(
     remembered to set it, which are not the misconfigured ones. It is parsed in
     `create_app` rather than here so an unreadable value fails the process rather than one
     lifespan callback.
+
+    ## Provenance, and the one case where it stays null
+
+    `GET /api/v1/status` reports which dictionary is loaded and when it was indexed, and
+    THIS is the only place in the process that knows either. It is recorded on the success
+    path only: a load that failed indexed nothing, and stamping a source for it would let a
+    status body name a glossary this server is not answering out of.
+
+    An INJECTED matcher (`create_app(matcher=...)`) leaves both members null, deliberately.
+    That matcher was indexed before it arrived and this server cannot know from where or
+    when; a stamp taken here would record when the object was HANDED OVER and publish it as
+    when the index was built. Null reads as "this server did not load it", which is the
+    true answer.
     """
     if handle.is_ready:
         # Injected by the caller; nothing to load, but it is real and must be reported.
@@ -586,6 +614,10 @@ def _bring_up_matcher(
 
     if loaded is not None:
         handle.bind(loaded)
+        # Stamped from the same variable `_load_configured_matcher` read, stripped the same
+        # way, so the source `/api/v1/status` reports is the string that was actually loaded
+        # rather than a second reading of the environment that could differ from it.
+        provenance.stamp((environ.get("NEXUS_API_DICTIONARY") or "").strip())
         app_state.set_component_status("matcher", True)
         logger.info("matcher_ready", dictionary=environ.get("NEXUS_API_DICTIONARY"))
         return
@@ -721,6 +753,11 @@ def create_app(
     if matcher is not None:
         matcher_handle.bind(matcher)
     recorder = _feedback_recorder(feedback_path, env)
+    # Written once during startup, read on every `GET /api/v1/status`. Constructed here for
+    # the same reason `MatcherHandle` is: the route is registered at import time and the
+    # dictionary is loaded during the lifespan, so the two have to be joined by an object
+    # rather than by ordering.
+    provenance = ProvenanceRecorder()
 
     # Lifespan context manager
     @asynccontextmanager
@@ -741,7 +778,14 @@ def create_app(
             # A component that reports True unconditionally is not a check, it is a claim,
             # and this map is read by rollout gates. They come back when something
             # actually probes Qdrant and Redis.
-            _bring_up_matcher(matcher_handle, app_state, env, logger, optional=matching_optional)
+            _bring_up_matcher(
+                matcher_handle,
+                app_state,
+                env,
+                logger,
+                optional=matching_optional,
+                provenance=provenance,
+            )
 
             app_state.is_ready = True
             logger.info("application_ready", components=app_state.components)
@@ -770,8 +814,10 @@ neural reranking, and confidence scoring.
 ## Features
 
 - **Schema Matching**: Match Avro, JSON Schema, SQL DDL, or CSV schemas
+- **Dictionary Lookup**: Resolve ids you already know, exactly, without paying for matching
 - **Dictionary Management**: Load and sync data dictionaries
 - **Batch Processing**: Process multiple schemas efficiently
+- **Introspection**: Whether retrieval is degraded, and why a field retrieved what it did
 - **Flexible Deployment**: Use as library, API, or CLI
 
 ## Authentication
@@ -826,6 +872,24 @@ Cross-origin access is refused unless the operator names the permitted origins i
             service_limits,
         )
     )
+    # The lookup plane. Mounted unconditionally and next to matching, because it answers the
+    # same question about the same dictionary -- a caller who already knows the id must not
+    # have to pay retrieval to resolve it, and a route that existed only when a dictionary
+    # happened to be loaded would give a 404 meaning two different things.
+    app.include_router(
+        create_lookup_router(LookupService(DictionaryLookup(matcher_handle), service_limits))
+    )
+
+    # Introspection: what is loaded, and why a field retrieved what it did. Given the work
+    # pool because `/diag/retrieval` encodes a query and scans the corpus -- the same CPU
+    # work matching does, and therefore the same admission control. `/status` does none and
+    # takes no permit.
+    app.include_router(
+        create_introspection_router(
+            IntrospectionService(matcher_handle, service_limits, work_pool, provenance)
+        )
+    )
+
     app.include_router(create_feedback_router(recorder, DeterministicJSONResponse))
 
     # The byte cap on the request body, added LAST so it is the outermost middleware.

@@ -45,11 +45,19 @@
       Where the integration tests find a running service. Overridable, so the same suite can be
       pointed at a service somebody else started:
           mvn verify -Dnexus.matcher.baseUrl=http://127.0.0.1:8000
-      See README.md for the three fixture servers `verify` needs and the script that starts them.
+      See README.md for the four fixture servers `verify` needs and the script that starts them.
     -->
     <nexus.matcher.baseUrl>http://127.0.0.1:8000</nexus.matcher.baseUrl>
     <nexus.matcher.unavailableBaseUrl>http://127.0.0.1:8001</nexus.matcher.unavailableBaseUrl>
     <nexus.matcher.deadlineBaseUrl>http://127.0.0.1:8002</nexus.matcher.deadlineBaseUrl>
+    <!--
+      The pack with an absolute-score floor configured. A NO_MATCH field decision is reachable
+      only two ways: a field that came back with no candidates at all, or a configured floor that
+      rank 1 fails. The library ships no floor and will not invent one, so without a fixture that
+      sets one, the client's handling of NO_MATCH could only ever be tested against a response
+      body somebody typed. See clients/java/fixture-absolute-floor.json.
+    -->
+    <nexus.matcher.floorBaseUrl>http://127.0.0.1:8003</nexus.matcher.floorBaseUrl>
 
     <!--
       Extra JVM arguments for the integration-test fork.
@@ -150,6 +158,7 @@
             <nexus.matcher.baseUrl>${nexus.matcher.baseUrl}</nexus.matcher.baseUrl>
             <nexus.matcher.unavailableBaseUrl>${nexus.matcher.unavailableBaseUrl}</nexus.matcher.unavailableBaseUrl>
             <nexus.matcher.deadlineBaseUrl>${nexus.matcher.deadlineBaseUrl}</nexus.matcher.deadlineBaseUrl>
+            <nexus.matcher.floorBaseUrl>${nexus.matcher.floorBaseUrl}</nexus.matcher.floorBaseUrl>
           </systemPropertyVariables>
         </configuration>
         <executions>

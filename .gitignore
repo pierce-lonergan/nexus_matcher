@@ -211,3 +211,4 @@ nexus_matcher.zip
 # check_expectations.py already exits non-zero on the real one -- a stale copy in git
 # would be the second, unchecked answer.
 /examples/governance/out/
+.museum-replay.lock

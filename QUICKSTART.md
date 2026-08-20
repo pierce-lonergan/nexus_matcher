@@ -246,6 +246,10 @@ The complete route table:
 | POST | `/api/v1/match` | Up to 100 schema fields, keyed by the caller's own `path` |
 | POST | `/api/v1/match/batch` | The same contract with a 250-field cap |
 | POST | `/api/v1/feedback` | Appends a reviewer's verdict to an audit log |
+| POST | `/api/v1/lookup` | Resolve dictionary ids you already hold — entry text and governance, no scoring |
+| GET | `/api/v1/lookup/{governance_id:path}` | The single-id form; a miss is 200 with `null`, not a 404 |
+| GET | `/api/v1/status` | Entry count, encoder, thresholds and caps. Always 200; `degraded` is the pre-run check |
+| POST | `/api/v1/diag/retrieval` | Retrieval trace for one field: query text, per-channel candidates, expected-entry rank |
 | GET | `/` | Service identity |
 | GET | `/health` | Health check |
 | GET | `/health/live` | Liveness probe |
@@ -261,8 +265,9 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/match \
   -d '{"fields":[{"name":"legal_name","path":"booking.passenger.legal_name","doc":"Full legal name of the passenger as printed on the sailing manifest.","type":"string"}],"top_k":1}'
 ```
 
-Real output, pretty-printed here — the response itself is one line, in exactly this key
-order, byte-identical between two identical requests:
+Real output, captured from a live app on 2026-08-19 and pasted here unedited except for
+pretty-printing. The response itself is one line, in exactly this key order, ASCII-only,
+and byte-identical between two identical requests — all three checked on the capture:
 
 ```json
 {
@@ -283,7 +288,16 @@ order, byte-identical between two identical requests:
           "enhancement": "MASK_IN_LOGS"
         },
         "confidence": 0.904167,
-        "decision": "AUTO_APPROVE"
+        "decision": "AUTO_APPROVE",
+        "absoluteScore": 0.784332,
+        "sourceMetadata": {
+          "values": {
+            "personal_information": "yes",
+            "direct_identifier": "yes"
+          },
+          "droppedKeyCount": 0,
+          "renderedKeys": []
+        }
       }
     ]
   },
@@ -295,9 +309,45 @@ order, byte-identical between two identical requests:
       "BRIDGE_SENSITIVE",
       "SEALED_RESTRICTED"
     ]
+  },
+  "fieldDecisions": {
+    "booking.passenger.legal_name": "AUTO_APPROVE"
+  },
+  "scoring": {
+    "confidenceFloor": 0.63,
+    "absoluteScoreFloor": null,
+    "absoluteScoreMetric": "cosine",
+    "absoluteScorePooledOverAliases": false,
+    "thresholdableAcrossFields": [
+      "absoluteScore",
+      "explain.absoluteCosine",
+      "explain.scores.lexical",
+      "explain.scores.editDistance",
+      "explain.scores.type",
+      "explain.scores.domain"
+    ],
+    "comparabilityScopesNarrowestFirst": [
+      "WITHIN_FIELD",
+      "ACROSS_FIELDS",
+      "ACROSS_RUNS"
+    ],
+    "comparability": {
+      "confidence": "WITHIN_FIELD",
+      "absoluteScore": "ACROSS_FIELDS",
+      "explain.absoluteCosine": "ACROSS_FIELDS",
+      "explain.scores.fusedRetrieval": "WITHIN_FIELD",
+      "explain.scores.lexical": "ACROSS_FIELDS",
+      "explain.scores.editDistance": "ACROSS_FIELDS",
+      "explain.scores.type": "ACROSS_FIELDS",
+      "explain.scores.domain": "ACROSS_FIELDS"
+    }
   }
 }
 ```
+
+**Four top-level keys, in this order: `results`, `vocabulary`, `fieldDecisions`,
+`scoring`.** `results` was once the whole body, so everything since has been appended
+rather than placed in front of it.
 
 `vocabulary` echoes back the two things a caller cannot otherwise infer from a response:
 which tier an uncoded field sits at, and the order the caller's own file declares its
@@ -307,8 +357,37 @@ the vocabulary file, which a service consuming this API may not have.
 `enhancement` is the caller's own instruction for how to protect the field — it is
 whatever their vocabulary declares, and it is `null` for a class that declares none.
 
-Read `decision`, not `confidence`. `confidence` is rank-relative and will move with any
-retrieval change — do not diff against the number above.
+`sourceMetadata` is your glossary's own enrichment columns for the matched entry, carried
+through untouched. Nothing in the library reads it.
+
+**Read `fieldDecisions[path]`, not `decision` and not `confidence`.** The three are
+different claims:
+
+| Where | Scope | Vocabulary |
+|---|---|---|
+| `fieldDecisions[path]` | the **column** — the answer you write down | `AUTO_APPROVE`, `REVIEW`, `REJECT`, **`NO_MATCH`** |
+| `results[path][n].decision` | one **candidate** | `AUTO_APPROVE`, `REVIEW`, `REJECT` |
+| `results[path][n].confidence` | a rank-relative score, normalised inside this field | a number, comparable within the field only |
+
+`NO_MATCH` — *this response carries nothing this field may inherit* — exists only on the
+first row, and it is the state the other two cannot express. `confidence` has a structural
+floor of 0.63 (published as `scoring.confidenceFloor`) that sits above `review_threshold` =
+0.50, so a rank-1 candidate can never be `REJECT` on score alone: **every field comes back
+at least `REVIEW`, however irrelevant its best candidate is.**
+
+To make a field report `NO_MATCH` on a low score you have to configure
+`absolute_score_floor`, which is off by default because a floor is a statement about a
+score distribution and the distribution belongs to your glossary.
+[docs/guides/absolute_score_floor.md](docs/guides/absolute_score_floor.md) is the procedure
+for measuring one — including the measurement showing that a plausible-looking value can
+produce zero `NO_MATCH` verdicts and never fire at all.
+
+`scoring` says what the numbers beside it *mean*: `scoring.comparability` marks
+`confidence` `WITHIN_FIELD` and `absoluteScore` `ACROSS_FIELDS`, so `absoluteScore` is the
+only per-candidate number you may compare against a fixed constant or between two columns.
+
+Do not diff against `confidence`. It is rank-relative and will move with any retrieval
+change.
 
 The field keys are `name`, `path`, `doc` and `type` — **not** the `flattenedName` /
 `dataType` spellings used by `examples/governance/fields.json`, which is the pack's own
@@ -343,5 +422,7 @@ representation ablation in the [README](README.md#where-the-accuracy-comes-from)
 ## Next
 
 - [README.md](README.md) — measured accuracy, limitations, how to reproduce the benchmark
-- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — the real Python, CLI and REST surface
+- [docs/API_REFERENCE.md](docs/API_REFERENCE.md) — the real Python, CLI and REST surface, key by key
+- [docs/GOVERNANCE.md](docs/GOVERNANCE.md) — what a match confers, and what a `NO_MATCH` withholds
+- [docs/guides/absolute_score_floor.md](docs/guides/absolute_score_floor.md) — how to measure a floor for your own corpus
 - [docs/BENCHMARK_REGISTRY.md](docs/BENCHMARK_REGISTRY.md) — every benchmark run and its artifact

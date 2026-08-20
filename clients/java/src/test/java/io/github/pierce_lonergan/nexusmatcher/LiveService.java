@@ -17,7 +17,7 @@ import static org.junit.jupiter.api.Assertions.fail;
  * response members while this client was being written -- exactly the drift a mock cannot see. So a
  * missing service is a FAILURE that names the script which starts one.
  *
- * <p>Three fixtures, because three of the behaviours worth pinning are properties of a server's
+ * <p>Four fixtures, because four of the behaviours worth pinning are properties of a server's
  * configuration rather than of a request:
  *
  * <ul>
@@ -26,9 +26,14 @@ import static org.junit.jupiter.api.Assertions.fail;
  *       a real 503 and the retry loop can be watched against one.
  *   <li>{@code nexus.matcher.deadlineBaseUrl} -- the pack with a 1 ms deadline, so every match is a
  *       real 504.
+ *   <li>{@code nexus.matcher.floorBaseUrl} -- the pack with an absolute-score floor configured, so
+ *       a field the glossary does not describe earns a real
+ *       {@link io.github.pierce_lonergan.nexusmatcher.model.FieldDecision#NO_MATCH}. The library
+ *       ships no floor, so on any other fixture that verdict is unreachable and could only be
+ *       tested against a body somebody typed.
  * </ul>
  *
- * <p>{@code clients/java/serve-fixtures.ps1} (and {@code .sh}) starts all three.
+ * <p>{@code clients/java/serve-fixtures.ps1} (and {@code .sh}) starts all four.
  */
 final class LiveService {
 
@@ -53,6 +58,20 @@ final class LiveService {
         String base = required(
                 "nexus.matcher.unavailableBaseUrl", "NEXUS_MATCHER_UNAVAILABLE_BASE_URL");
         requireReachable(base);
+        return base;
+    }
+
+    /**
+     * The service with an absolute-score floor configured, on which NO_MATCH is reachable.
+     *
+     * <p>Same pack, same encoder, one extra config key -- so a NO_MATCH here differs from an
+     * AUTO_APPROVE on {@link #matching()} by the server's configuration alone, which is what makes
+     * the comparison worth making.
+     */
+    static String floor() {
+        String base = required("nexus.matcher.floorBaseUrl", "NEXUS_MATCHER_FLOOR_BASE_URL");
+        requireReachable(base);
+        requireMatcherReady(base);
         return base;
     }
 

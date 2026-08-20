@@ -571,15 +571,38 @@ table, enumerated from a live app:
 
 | Method | Path | What it serves |
 |---|---|---|
-| POST | `/api/v1/match` | Up to 100 schema fields; returns the ranked dictionary entries and the protection class each field would inherit |
+| POST | `/api/v1/match` | Up to 100 schema fields; returns the ranked dictionary entries and the protection class each field would inherit, one **verdict per column** in `fieldDecisions`, and a `scoring` block saying what the numbers mean |
 | POST | `/api/v1/match/batch` | The same contract with a 250-field cap, for chunked clients |
 | POST | `/api/v1/feedback` | Appends a reviewer's verdict to an audit log. Recorded, never fed back into ranking |
+| POST | `/api/v1/lookup` | Resolve dictionary ids you already hold. No scoring, no ranking, no decision. Every id comes back once, in the order sent, carrying an entry or an explicit `null` |
+| GET | `/api/v1/lookup/{governance_id:path}` | The single-id form of the above, answering the identical body under one key. A miss is **200** with `null`, not a 404 |
+| GET | `/api/v1/status` | Entry count, dictionary provenance, the active encoder and whether a fallback one is in force, the live thresholds and caps. Always **200**; read `degraded` before a bulk run |
+| POST | `/api/v1/diag/retrieval` | Why a field retrieved what it did: the query text it became, each channel's candidates with that channel's own raw scores, and where an expected entry ranked. Retrieval only |
 | GET | `/` | Service identity |
 | GET | `/health` | Health check |
 | GET | `/health/live` | Kubernetes liveness probe |
 | GET | `/health/ready` | Readiness probe (503 if a registered component is not ready) |
 | GET | `/health/startup` | Startup probe (503 while starting) |
 | GET | `/docs`, `/redoc`, `/openapi.json` | Generated OpenAPI documentation |
+
+**A match response has four top-level keys, in this order: `results`, `vocabulary`,
+`fieldDecisions`, `scoring`.** `results` was once the whole body and everything since has
+been appended to it, never placed in front, so a client generated against an earlier shape
+still reads every key it knew at the key it knew. The one a consumer writes down is
+`fieldDecisions[path]` — **one verdict per column**, and the only place the value
+`NO_MATCH` can appear. Each candidate carries `absoluteScore` beside `confidence`, and
+`scoring.comparability` says which of the two may be compared across fields (`absoluteScore`)
+and which is meaningful only inside one field (`confidence`). Every key is spelled out, with
+a captured response, in
+[docs/API_REFERENCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/API_REFERENCE.md#the-matching-response).
+
+`NO_MATCH` — *nothing in this response may be inherited by this field* — is the verdict the
+per-candidate `decision` cannot express, because `confidence` has a structural floor above
+`review_threshold` and no rank-1 match can therefore be rejected on score alone. Reaching it
+on a low score means configuring `absolute_score_floor`, which ships **off**: a floor is a
+statement about a score distribution and the distribution belongs to your glossary, not to
+this library. Measuring one is
+[docs/guides/absolute_score_floor.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/absolute_score_floor.md).
 
 The two match routes answer **503** until a dictionary is loaded, and `/api/v1/feedback`
 answers **503** until a feedback file is configured; each 503 names the setting to change.
@@ -663,6 +686,8 @@ observed to fail intermittently under load.
 - [QUICKSTART.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/QUICKSTART.md) — the verified five-minute path
 - [docs/API_REFERENCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/API_REFERENCE.md) — the Python, CLI and REST surfaces
 - [docs/GOVERNANCE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/GOVERNANCE.md) — governance inheritance, and the matching endpoint's wire contract
+- [docs/guides/absolute_score_floor.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/absolute_score_floor.md) — how to measure a `NO_MATCH` floor for your own corpus, and why no default ships
+- [docs/guides/governed_abbreviations.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/governed_abbreviations.md) — using your own approved-abbreviation catalog
 - [docs/BENCHMARK_REGISTRY.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/BENCHMARK_REGISTRY.md) — every benchmark run, with its artifact or an explicit note that it has none
 - [docs/ARCHITECTURE.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/ARCHITECTURE.md) — hexagonal layering and component wiring
 - [docs/ENHANCEMENT_JOURNEY.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/ENHANCEMENT_JOURNEY.md) — what was changed and what it measured

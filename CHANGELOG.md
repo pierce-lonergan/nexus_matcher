@@ -431,6 +431,38 @@ build artifact, not a release; everything in this section is unreleased work.
 
 ### Fixed
 
+- **NM-0033 — `from_config(governance=…)` accepted a controlled vocabulary and
+  `load_dictionary` never applied it, so every indexed entry carried no protection code and
+  every match came back with `governance: null` — indistinguishable from a glossary that
+  declares no classes.** The `DictionaryLoader` port hands back finished `DictionaryEntry`
+  objects and `ColumnMapping` has no field for a protection-code column, so neither shipped
+  loader ever read one; the vocabulary was consulted only at match time, where there was no
+  stored code left to resolve. Measured on `examples/governance/glossary.csv` against the
+  pack's own vocabulary: 30 entries indexed, **0** carrying a code before the fix and **27**
+  after — the remaining three rows declare none. The library's own HTTP app had already
+  worked around it by calling `ingest.load_entries` and the private `_index_dictionary`, and
+  the example pack printed a wiring-defect banner and rescued the class with a caller-side
+  join; both descriptions were accurate and neither was a gate. `load_dictionary` now
+  attaches the vocabulary's canonical code after the loader runs, refuses a self-contradicting
+  row with the same message `load_entries` gives for the same file, and refuses a
+  protection-code column it has no vocabulary to interpret. `governance_strict=False` is the
+  documented opt-out, and `tests/museum/NM-0033/test_nm_0033.py` pins the gate.
+
+- **NM-0032 — `load_entries` forwarded any unrecognised keyword to the reader, which
+  discarded it in silence, so a misspelled option loaded a different glossary than the one
+  asked for.** The reader's signature is `**kwargs` and it keeps only the four options it
+  knows, so everything else went nowhere and nothing said so. `sheet_name=` is the pandas
+  spelling and the obvious thing to type; the option this loader takes is `sheet=`.
+  Measured on a two-sheet workbook: `load_entries(book.xlsx, sheet_name="Approved")`
+  returned the **Retired** sheet's rows — a glossary of retired terms indexed, matched
+  against and inherited from, under a load report that said the load was healthy. It
+  needed no new option to reach and had been there since the reader was written. Every
+  ingest test passed the options it meant, so no test ever asked what happens to one that
+  is misspelled. `load_entries` now refuses a keyword it does not understand and names the
+  ones that exist; `read_source` underneath stays permissive, and
+  `tests/museum/NM-0032/test_nm_0032.py` pins that split so the refusal cannot drift down
+  a layer.
+
 - **NM-0030 — `sync()` stripped the protection code off every entry and reported the rows
   unchanged.** `GlossaryIndex` remembered the `provider` and nothing else, and `sync`'s own
   docstring example is `sync(index, "glossary.xlsx")` with no `governance=`, so the refresh
@@ -548,6 +580,71 @@ build artifact, not a release; everything in this section is unreleased work.
   wheel, two wheels.
 
 ### Fixed — documentation
+
+- **Three published wire keys and a fourth verdict value were documented nowhere a caller
+  reads.** `absoluteScore`, `fieldDecisions`, `scoring` and `NO_MATCH` appeared in zero of
+  `README.md`, `QUICKSTART.md`, `docs/API_REFERENCE.md` and `docs/GOVERNANCE.md`, and both
+  the QUICKSTART and GOVERNANCE worked examples printed a response body missing all of
+  them — under the words "real output" and "two identical requests produce identical
+  bytes". `tests/packaging/test_documented_routes.py` checks **paths**, so a route can gain
+  keys, gain a schema and gain an enum member with nothing failing.
+
+  `docs/API_REFERENCE.md` now names all four top-level response keys in wire order and
+  documents every member of the candidate, `fieldDecisions`, `scoring`, the status body and
+  the retrieval diagnostic, key by key. `docs/GOVERNANCE.md` rule 3 — *an unmatched field
+  inherits nothing* — now says **where** a consumer reads that rule (`fieldDecisions[path]`
+  over HTTP, `session.field_decisions()` in Python) and carries a captured `NO_MATCH`
+  response whose rank-1 candidate holds a populated `CREW_ONLY` class and a confidence of
+  0.82, which is the shape of the mistake the key exists to prevent. `QUICKSTART.md` and
+  `README.md` state the four keys and the read order.
+
+  **Every payload in those four documents was re-captured from a live app** rather than
+  edited, including the two that were stale, and each was checked for byte-identity across
+  two identical requests and for being ASCII-only. Measuring the gap that let this ship: a
+  script asserting that every property of every published response schema, and every value
+  of every published enum, appears in at least one of those four documents reported **37**
+  undocumented names at `HEAD` and **0** after this change. It is a script and not a test
+  because this lane does not own `tests/`; see the note under **Planned**.
+
+- **The `absolute_score_floor` figure quoted for the new `NO_MATCH` verdict was a
+  stand-in-encoder number and would never have fired.** The reported floor of 0.30, derived
+  from an unmatchable field scoring 0.123, came from a fixture that substitutes a
+  bag-of-tokens provider for the encoder. Re-measured on the **shipped bundled int8 ONNX
+  encoder** against the 30-entry Gravel Bay glossary, driven through a live
+  `POST /api/v1/match` with the floor loaded from `NEXUS_API_MATCHING_CONFIG` on each run:
+  the lowest rank-1 `absoluteScore` produced by any of 72 fields across two field sets was
+  **0.4966**, so **a floor of 0.30 — or 0.40, or 0.45 — produces zero `NO_MATCH` verdicts
+  and cannot fire on any input.** A caller who read 0.30 as a starting point would have
+  configured a floor that is on, monitored, and inert.
+
+  No number replaces it, because there is nothing to replace it with: a floor is a statement
+  about a score distribution and the distribution belongs to the caller's glossary. The new
+  [`docs/guides/absolute_score_floor.md`](docs/guides/absolute_score_floor.md) is a
+  **procedure** — build a labelled sample that includes fields with no correct answer, split
+  the rank-1 absolute scores into two piles, compare `max(negatives)` against
+  `min(positives)`, and take the midpoint if they separate or sweep the trade if they do
+  not.
+
+  Its worked example is the argument for the procedure existing. The **same** glossary,
+  encoder, library and route over two different field sets gave two different answers. 26
+  described fields plus four invented unmatchable ones separate cleanly,
+  `(0.650861, 0.720624]` — a 0.07-wide band whose midpoint, 0.685, catches all six
+  unanswerable fields and costs none of the 24 correct ones. The pack's own 42-row
+  `labels.jsonl`, which is bare column names with no descriptions, **overlaps**: its
+  apparent gap is **0.0027** wide (0.614483 to 0.617166), which is under a third of the
+  request-shape wobble below, so the defensible floor is 0.59 — catching 5 of 8 rather than
+  7 of 8. Nothing changed but the field text.
+
+  The guide also records a hazard nothing in the tree had measured: **`absoluteScore` for
+  one field moves with what else is in the same request.** The bundled encoder pads a batch
+  to its longest member, so the same text encoded alone and again beside a longer sibling
+  gives query vectors whose cosine with each other is 0.994260. Over 30 fields scored once
+  one-per-request and once as a single 30-field request, `max|delta|` was **0.010036** and
+  two fields changed which entry ranked first. Responses stay byte-identical for identical
+  requests — the dependence is on request *shape*, not on the run — but a floor placed
+  within 0.02 of anything it cares about is not calibrated. `docs/API_REFERENCE.md` gains
+  the `absolute_score_floor` row its `MatchingConfig` table was missing, and
+  `docs/GOVERNANCE.md`'s H-002 note now points at the two-corpus measurement.
 
 - **Eleven sentences across six documents denied that the matching endpoint existed**, in
   this repository's own register for being honest about what is missing, while
@@ -810,6 +907,18 @@ The following claims appeared in the README, this changelog, the package docstri
   comparing with `hmac.compare_digest` and declared as a security scheme so it reaches
   `/openapi.json`. Until then the service is unauthenticated and says so — see Security
   above.
+- **A Python twin of the Java client-drift gate**, asserting that every property of every
+  published response schema and every value of every published enum appears in at least one
+  of `README.md`, `QUICKSTART.md`, `docs/API_REFERENCE.md` and `docs/GOVERNANCE.md`.
+  `tests/packaging/test_java_client_contract.py` already does this against a generated
+  client, so the *wire* cannot drift from the *client* unnoticed; nothing does it against
+  the *documents*, and `test_documented_routes.py` checks paths only. That is the exact hole
+  `absoluteScore`, `fieldDecisions`, `scoring` and `NO_MATCH` fell through. Run as a script
+  over this tree it reports 37 undocumented names at `HEAD` and 0 now, so it is both
+  non-vacuous and currently satisfiable. It is not committed here because it belongs in
+  `tests/`, which this change does not own; the design note, including the two judgement
+  calls it needs (which documents count as caller-facing, and how to declare a key
+  deliberately undocumented) is in the change's report.
 
   "An HTTP matching endpoint" used to head this list. It is delivered in this release, so
   it is gone from it rather than annotated: a Planned list that keeps items it shipped is

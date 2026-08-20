@@ -152,6 +152,10 @@ def create_app() -> FastAPI:
 | `/api/v1/match` | POST | Match schema fields; each candidate carries the protection class it would confer |
 | `/api/v1/match/batch` | POST | The same service and the same projection, at a higher field cap |
 | `/api/v1/feedback` | POST | Append a reviewer's verdict to an audit log |
+| `/api/v1/lookup` | POST | Resolve known dictionary ids — the lookup plane, deliberately carrying no score, rank or decision |
+| `/api/v1/lookup/{governance_id:path}` | GET | The single-id form of the lookup plane, answering the identical body |
+| `/api/v1/status` | GET | The introspection plane: dictionary, encoder, active thresholds and caps. Always 200 |
+| `/api/v1/diag/retrieval` | POST | Retrieval trace for one field — query text, per-channel candidates, expected-entry rank |
 | `/` | GET | Service identity |
 | `/health` | GET | Health check |
 | `/health/live` | GET | Kubernetes liveness probe |

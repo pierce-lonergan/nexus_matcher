@@ -4,6 +4,8 @@ POST /api/v1/match and /api/v1/match/batch -- matching over HTTP.
 
 ## Relationships
 # DEPENDS_ON → application/use_cases/match_schema :: the matcher this wraps
+# DEPENDS_ON → application/ingest :: METADATA_RESERVED_KEYS -- which keys of the
+#              pass-through plane the LOADER wrote, as against the deployment's own
 # DEPENDS_ON → domain/models/entities :: SchemaField in, MatchResult out
 # DEPENDS_ON → presentation/api/limits :: admission control and the deadline
 # DEPENDS_ON → presentation/api/errors :: every failure mode
@@ -22,7 +24,8 @@ introspection. This is the one thing blocking them.
 own `path`. A dict silently absorbs a collision, and a field that vanishes from a result
 map inherits no governance while nothing raises -- the only symptom is a count nobody has
 reason to check. `_project_results` checks it three independent ways and refuses the
-response rather than trimming it.
+response rather than trimming it. It holds for `fieldDecisions` too: a column with
+candidates and no verdict is the same failure wearing a different key.
 
 **DETERMINISM.** Two identical requests produce byte-identical bodies: keys in input
 order, a fixed key order inside every object, floats rounded to a fixed precision, and an
@@ -31,6 +34,24 @@ pasted into tickets and diffed.
 
 **DETERMINISTIC DEGRADATION.** Overload sheds with 503, the deadline answers 504, a
 matcher failure is a named 500. It never hangs. See `limits.py`.
+
+## The pass-through plane, and the one rule that keeps it safe
+
+A deployment's glossary carries columns this library has no opinion about. The loader
+already carried them onto the entry and into the index; this module is where they finally
+reach a response, as `sourceMetadata` on every candidate. Without that last hop the
+capability was unreachable over HTTP -- a deployment could send its own glossary through
+this service and get back none of its own columns -- so the plane ended at the index and
+the feature was, from a client's side, absent.
+
+THE RULE THAT MAKES IT SAFE IS THAT NOTHING READS IT. No score, no ranking, no threshold
+and no verdict may depend on a key or a value in that map. A library that starts branching
+on one is no longer a generic matcher; it is one enterprise's matcher with a generic name,
+and the next enterprise's columns mean something else. This module reads the plane's key
+NAMES once, to tell the loader's own four annotations from the deployment's columns using
+the list the loader publishes for it, and never reads a value at all. `test_metadata_plane`
+holds the line by matching one schema against two dictionaries that differ ONLY in these
+values and diffing the two responses.
 
 ## Coupling that is deliberate, and how it is made safe
 
@@ -63,14 +84,23 @@ remove all three couplings; that file belongs to another lane.
 from __future__ import annotations
 
 import json
+import math
 from collections import Counter
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, status
 from fastapi.responses import JSONResponse
 
+# The names the LOADER writes into the pass-through plane, imported rather than restated.
+# That constant is published for exactly this reader: whatever emits the plane has to tell
+# the loader's own annotations from the deployment's columns, and a second hand-maintained
+# copy of the list in this layer is how the two drift. Import-time rather than deferred
+# because `application.ingest` is stdlib plus domain -- it does not pull the matching
+# stack, which is the reason `MatchingConfig` below is deferred.
+from nexus_matcher.application.ingest import METADATA_RESERVED_KEYS
 from nexus_matcher.domain.governance import OPEN_CLASSIFICATION
-from nexus_matcher.domain.models.entities import SchemaField
+from nexus_matcher.domain.models.entities import SchemaField, derive_field_decision
 from nexus_matcher.presentation.api.errors import (
     ConservationViolationError,
     MalformedRequestError,
@@ -133,11 +163,182 @@ _SCORE_COMPONENTS: tuple[tuple[str, str, str], ...] = (
     ("domain", "domain_score", "domain_weight"),
 )
 
+# The scale vocabulary, NARROWEST FIRST. Published in the response so a client can rank
+# two scopes without hard-coding an order, exactly as `tiersMostOpenFirst` does for
+# governance tiers. A wider scope implies every narrower one.
+_COMPARABILITY_SCOPES: tuple[str, ...] = ("WITHIN_FIELD", "ACROSS_FIELDS", "ACROSS_RUNS")
+
+_WITHIN_FIELD, _ACROSS_FIELDS = _COMPARABILITY_SCOPES[:2]
+
+# The widest scope over which two values of each emitted number may be compared, keyed by
+# the number's PATH IN THE RESPONSE BODY -- which is what a client actually holds.
+#
+# This is the answer to the question the library has so far given two contradictory
+# answers to: `confidence` is documented as rank-relative with "do not threshold on it",
+# and the server ships `auto_approve_threshold = 0.87`, a threshold on it. Both are true
+# of different uses, and the resolution is the table below.
+#
+# `confidence` and `fusedRetrieval` are WITHIN_FIELD because the fused retrieval score is
+# min-max normalised over the candidates retrieved FOR ONE FIELD: rank 1 lands at or above
+# `fusion_alpha` whether the match is excellent or absurd, so 0.72 on one field and 0.72
+# on another are not the same claim. The remaining four signals are computed per
+# (field, entry) pair with no per-field rescaling, so they carry the same meaning
+# everywhere in one response.
+#
+# NOTHING IS ACROSS_RUNS, and that is the honest state of this library rather than a gap
+# in this table. None of these numbers is calibrated -- none behaves like P(correct) --
+# and every one of them moves with the configuration, the embedding model or the
+# dictionary. `absoluteScore` is the closest, and it is stable between runs only while all
+# three are unchanged, which is a precondition rather than a property of the number.
+_COMPARABILITY: dict[str, str] = {
+    "confidence": _WITHIN_FIELD,
+    "absoluteScore": _ACROSS_FIELDS,
+    "explain.absoluteCosine": _ACROSS_FIELDS,
+    "explain.scores.fusedRetrieval": _WITHIN_FIELD,
+    "explain.scores.lexical": _ACROSS_FIELDS,
+    "explain.scores.editDistance": _ACROSS_FIELDS,
+    "explain.scores.type": _ACROSS_FIELDS,
+    "explain.scores.domain": _ACROSS_FIELDS,
+}
+
 # Distinguishes "the attribute is absent" from "the attribute is None". The governance
 # contract needs both: an absent `MatchResult.governance` means the field has not landed
 # yet, while a present None means the entry genuinely has no code and the response must
 # carry an explicit null.
 _ABSENT = object()
+
+# =============================================================================
+# THE PASS-THROUGH METADATA PLANE
+# =============================================================================
+
+# The loader's own keys, as a set for the one membership test below.
+_RESERVED_METADATA_KEYS = frozenset(METADATA_RESERVED_KEYS)
+
+# The loader's marker for "this map is a bounded subsequence of the source row", carrying
+# the number of keys it dropped to meet the per-entry cap. Named here because this layer
+# has to LIFT it out of the caller's vocabulary and publish it as a declared member --
+# until now it was reachable only by a library caller, so a consumer over HTTP could not
+# tell a whole plane from a trimmed one, which is the half of AR-1's bound that a bound
+# nobody can observe does not deliver. Pinned against `METADATA_RESERVED_KEYS` by
+# `test_metadata_plane`, so a rename in the loader is a red test rather than a marker that
+# quietly stops being surfaced and starts being emitted as a caller column.
+_TRUNCATION_MARKER = "metadata_truncated"
+
+# How deep a nested pass-through value is walked before it is rendered as text instead.
+# A glossary read from JSON or Parquet can hold arrays and objects in one cell, and those
+# are honest JSON that must survive; a structure deeper than this is either a whole
+# document raked in by a careless mapping or a cycle, and neither should be able to put
+# this renderer into unbounded recursion on the event loop. Six is well past any real
+# enrichment column and far short of Python's recursion limit.
+_MAX_METADATA_DEPTH = 6
+
+
+def _renders_as_json(value: Any, depth: int = 0) -> bool:
+    """
+    Whether `json.dumps` can render this value AS ITSELF under this module's settings.
+
+    The question is not "is it convenient", it is which of two failures the caller gets. A
+    glossary column holding a date cell, a decimal or a blob is ordinary -- a spreadsheet
+    or a database gives back real objects, not text -- and this renderer runs with no
+    `default=` hook and `allow_nan=False`, so an unrenderable leaf is a `TypeError` inside
+    the response and therefore a 500 on EVERY match against that dictionary. One date
+    column would take the whole matching service down for a value nobody scores on.
+
+    So an unrenderable value is rendered as text and NAMED in `renderedKeys`, which is the
+    same posture the rest of this module takes towards a lossy conversion: never silent,
+    always declared. Everything JSON can carry natively -- text, numbers, booleans, nulls,
+    arrays and objects -- passes through untouched, which is every value a delimited-text
+    glossary can produce and so is the case that AR-1's byte-for-byte round trip is about.
+
+    Three exclusions are deliberate. A non-finite float is refused because `allow_nan=
+    False` refuses it, and `NaN` is not JSON. A dict with a non-string key is refused
+    because `json.dumps` would COERCE it, silently, and two keys can coerce to one. Depth
+    beyond `_MAX_METADATA_DEPTH` is refused so a cycle cannot recurse forever.
+    """
+    if value is None or isinstance(value, str | bool | int):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if depth >= _MAX_METADATA_DEPTH:
+        return False
+    if isinstance(value, list | tuple):
+        return all(_renders_as_json(item, depth + 1) for item in value)
+    if isinstance(value, dict):
+        return all(
+            isinstance(key, str) and _renders_as_json(item, depth + 1)
+            for key, item in value.items()
+        )
+    return False
+
+
+def _source_metadata_payload(entry: object) -> dict[str, Any]:
+    """
+    The entry's pass-through plane, and what this response is not telling you about it.
+
+    ONE reader for both planes: `matching._candidate_payload` and `lookup._entry_payload`
+    both call this, so "a looked-up entry carries the same enrichment as a matched one" is
+    a fact by construction rather than a convention two files have to remember. It is also
+    why this lives here and not in `lookup.py` -- the candidate is the surface the lookup
+    plane is defined against.
+
+    THIS LAYER READS THE KEY NAMES AND NOTHING ELSE, and the distinction is AR-1's first
+    rule. No score, no ranking, no threshold and no verdict in this response depends on
+    anything in this map; what happens below is that the loader's own four annotations are
+    told apart from the deployment's columns BY NAME, using the list the loader publishes
+    for the purpose. That is emission, not interpretation: no branch here can change a
+    number, and `test_metadata_plane` pins it by matching the same fields against two
+    dictionaries that differ only in these values and diffing the responses.
+
+    The three reserved keys that are not `metadata_truncated` are dropped rather than
+    emitted. They are the loader's evidence about the source FILE -- the raw classification
+    text, the raw protection-code token, the per-row governance problems -- and the second
+    of those is the only place a token the caller's own vocabulary REFUSED survives.
+    Publishing a refused code next to `governance.code`, on a body whose reader is deciding
+    how to protect a column, is how a class nobody defined gets applied. A library caller
+    still has all four on `DictionaryEntry.source_metadata`.
+
+    A NEW dict is built rather than the entry's own handed out, so nothing downstream can
+    reach the index's live map through a response. It is deliberately shallow, and worth
+    saying rather than implying: a nested list or object from a JSON glossary is placed in
+    it by reference. Nothing here mutates one, and the renderer only reads -- but a future
+    reader of this function should not take "a copy is built" to mean more than it does.
+    """
+    plane = getattr(entry, "source_metadata", None)
+    if not isinstance(plane, Mapping):
+        # A caller's own entry-shaped object with no plane at all. An empty one is the
+        # honest answer -- it carries no enrichment -- and is what an entry loaded from a
+        # glossary with no spare columns reports too.
+        plane = {}
+
+    values: dict[str, Any] = {}
+    rendered: list[str] = []
+    for key, value in plane.items():
+        if key in _RESERVED_METADATA_KEYS:
+            continue
+        # `str(key)` is defensive only: every loader path builds this map from a header
+        # row, so the keys are already text. It is here because `json.dumps` would coerce
+        # a non-string key silently and two of them can coerce to one, which is a key
+        # quietly answering for another key -- the shape of defect this whole module is
+        # written against.
+        name = str(key)
+        if _renders_as_json(value):
+            values[name] = value
+        else:
+            values[name] = str(value)
+            rendered.append(name)
+
+    # The count the loader recorded when it trimmed this entry, read by the loader's own
+    # marker name. `type(...) is int` rather than `isinstance` on purpose: `True` is an
+    # `int` in Python, and a source column that happened to carry this reserved name with
+    # a boolean in it would otherwise be published as "one key was dropped".
+    marker = plane.get(_TRUNCATION_MARKER)
+    dropped = marker if type(marker) is int and marker >= 0 else 0
+
+    return {
+        "values": values,
+        "droppedKeyCount": dropped,
+        "renderedKeys": rendered,
+    }
 
 
 # =============================================================================
@@ -416,14 +617,33 @@ def _results_per_field(matcher: object) -> int:
     return MatchingConfig().results_per_field
 
 
-def _explain_payload(match: MatchResult, weights: dict[str, float]) -> dict[str, Any]:
+def _absolute_score(match: MatchResult) -> float | None:
+    """
+    The raw dense-retrieval score for one candidate, rounded for the wire.
+
+    ONE reader, so the top-level `absoluteScore` and `explain.absoluteCosine` cannot come
+    back as two different numbers for the same candidate -- a response that reported the
+    same quantity twice with a disagreement in the sixth decimal would be a governance
+    artifact arguing with itself.
+
+    None stays None. It means the dense arm never returned this candidate, which is not
+    zero: zero is a similarity the retriever measured, None is one it never took.
+    """
+    value = getattr(match.score_breakdown, "absolute_cosine", None)
+    return None if value is None else round(float(value), _PRECISION)
+
+
+def _explain_payload(
+    match: MatchResult, weights: dict[str, float], absolute_score: float | None
+) -> dict[str, Any]:
     """
     Everything needed to recompute the confidence from the response alone.
 
-    `absoluteCosine` is carried because it is the ONLY number here comparable across
-    fields: `fusedRetrieval` is min-max normalised per field, so its 0.9 says "won this
-    field's shortlist", not "is 90% similar". It is null when the dense arm did not return
-    this candidate at all.
+    `absoluteCosine` is the SAME number as the candidate's `absoluteScore` and is passed
+    in rather than re-read, so the two cannot drift. It is kept here although it is now
+    duplicated: a client already generated against `explain` reads it at this path, and
+    removing a published key to tidy up a duplication is a breaking change bought with
+    nothing.
     """
     breakdown = match.score_breakdown
     scores: dict[str, float] = {}
@@ -438,13 +658,10 @@ def _explain_payload(match: MatchResult, weights: dict[str, float]) -> dict[str,
             )
         scores[key] = round(float(value), _PRECISION)
 
-    absolute_cosine = getattr(breakdown, "absolute_cosine", None)
     return {
         "scores": scores,
         "weights": dict(weights),
-        "absoluteCosine": (
-            None if absolute_cosine is None else round(float(absolute_cosine), _PRECISION)
-        ),
+        "absoluteCosine": absolute_score,
     }
 
 
@@ -488,10 +705,27 @@ def _candidate_payload(
 
     The dict literal IS the wire order -- `DeterministicJSONResponse` does not sort -- so
     the order below is load-bearing and must match `MatchCandidateView`.
+
+    `absoluteScore` is APPENDED to the literal, after `decision`. It is the raw dense
+    score, and promoting it out of the optional `explain` block is what gives a client one
+    number it may compare against a constant across fields: `confidence` cannot serve,
+    because it is min-max normalised per field and its rank-1 value has a structural floor
+    (0.63 shipped) that sits above the review threshold, so a rank 1 that matches nothing
+    still scores well above it. `explain` is still added afterwards, so this key holds a
+    stable position whether or not `explain` was requested.
+
+    `sourceMetadata` is appended after it, in the same way and for the same reason, and it
+    is the last key of the enrichment surface rather than the last key of the object:
+    `explain` still goes last. It carries the entry's pass-through plane -- the
+    deployment's own enrichment columns, which had reached the index and stopped there, so
+    a deployment could send its glossary through this service and get back none of what its
+    own pipeline needed. Unconditional: it does not wait for `explain`, because a column a
+    deployment declared is not diagnostic output.
     """
     entry = match.dictionary_entry
     confidence = round(float(match.final_confidence), _PRECISION)
     decision = match.decision
+    absolute_score = _absolute_score(match)
     payload: dict[str, Any] = {
         "rank": int(match.rank),
         "governanceId": _governance_id(match),
@@ -501,12 +735,84 @@ def _candidate_payload(
         "governance": _governance_payload(match),
         "confidence": confidence,
         "decision": getattr(decision, "value", str(decision)),
+        "absoluteScore": absolute_score,
+        "sourceMetadata": _source_metadata_payload(entry),
     }
     if weights is not None:
-        explain = _explain_payload(match, weights)
+        explain = _explain_payload(match, weights, absolute_score)
         _verify_reproducible(confidence, explain)
         payload["explain"] = explain
     return payload
+
+
+def _absolute_score_floor(matcher: object) -> float | None:
+    """
+    The absolute-score floor this server applies, or None when none is configured.
+
+    None is the shipped default and it is not a stub: a floor is a statement about a score
+    distribution, and the distribution belongs to a dictionary this library has never
+    seen. Read through the PUBLIC property rather than the private config, unlike the
+    weights and the vocabulary above, because that property was added in the same change
+    as this reader and there is no older matcher to be compatible with. A matcher that
+    does not have it -- a caller's own object, a test double -- reports no floor, which is
+    the same answer as "not configured" and degrades to the documented default rather than
+    taking matching down.
+    """
+    floor = getattr(matcher, "absolute_score_floor", None)
+    return None if floor is None else float(floor)
+
+
+def _scoring_payload(
+    matcher: object,
+    floor: float | None,
+    projected: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """
+    What every number in this response MEANS, travelling with the response that has them.
+
+    Same argument as `_vocabulary_payload`: the body is a governance artifact that gets
+    pasted into a ticket and diffed, so an artifact whose numbers can only be interpreted
+    by reading this library's source is not one. It extends that block's pattern rather
+    than inventing a second one.
+
+    `confidenceFloor` IS VERIFIED AGAINST THE RESPONSE IT SHIPS WITH. The derivation
+    `semantic_weight * fusion_alpha` is a bound with preconditions -- no reranker, and at
+    least two distinct dense scores so min-max maps the top candidate to 1.0 rather than
+    to 0.0. The second is easy to violate by ordinary means (a one-entry dictionary,
+    `dense_top_k=1`, a perfect tie), and when it is violated the real confidences sit far
+    below while the config still reports 0.63. Publishing that number would tell a client
+    to set every threshold above a floor its own fields are underneath, which is NM-0027's
+    failure re-shipped on the wire. So the bound is checked against the rank-1 confidences
+    actually emitted, and reported as null if any of them is below it. A self-verifying
+    claim cannot be wrong about its own response. `NexusMatcher._session_confidence_floor`
+    does the same thing for a library caller, for the same reason.
+    """
+    declared = getattr(matcher, "minimum_achievable_confidence", None)
+    confidence_floor: float | None = None
+    if declared is not None:
+        tops = [candidates[0]["confidence"] for candidates in projected.values() if candidates]
+        if tops and min(tops) >= float(declared):
+            confidence_floor = round(float(declared), _PRECISION)
+
+    config = getattr(matcher, _MATCHER_CONFIG_ATTR, None)
+    alias_count = getattr(config, "dictionary_alias_count", 0)
+
+    return {
+        "confidenceFloor": confidence_floor,
+        "absoluteScoreFloor": None if floor is None else round(floor, _PRECISION),
+        "absoluteScoreMetric": str(getattr(matcher, "absolute_score_metric", "unknown")),
+        "absoluteScorePooledOverAliases": bool(alias_count),
+        # Derived from the table rather than typed a second time: a number whose declared
+        # scope changes must not keep a stale entry in a hand-written list saying a client
+        # may still compare it against a constant.
+        "thresholdableAcrossFields": [
+            key
+            for key, scope in _COMPARABILITY.items()
+            if _COMPARABILITY_SCOPES.index(scope) >= _COMPARABILITY_SCOPES.index(_ACROSS_FIELDS)
+        ],
+        "comparabilityScopesNarrowestFirst": list(_COMPARABILITY_SCOPES),
+        "comparability": dict(_COMPARABILITY),
+    }
 
 
 def _project_results(
@@ -515,7 +821,8 @@ def _project_results(
     matched: dict[str, tuple[MatchResult, ...]],
     top_k: int,
     weights: dict[str, float] | None,
-) -> dict[str, list[dict[str, Any]]]:
+    floor: float | None,
+) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
     """
     THE CONSERVATION LAW, checked three ways, before anything is sent.
 
@@ -542,6 +849,15 @@ def _project_results(
 
     A field with no candidates gets `[]`. Dropping it would be the exact defect: the
     caller's map would be short one key and nothing would say so.
+
+    THE FIELD DECISION IS BUILT IN THE SAME PASS and returned alongside, so the two maps
+    carry the same keys in the same order by construction. The equality check afterwards
+    is therefore not proof today -- it is an identity, and this file says elsewhere what
+    an identity is worth. It stays as a guard against the edit that filters one map and
+    not the other, which is exactly how a key goes missing from a response that still
+    passes a count check: `fieldDecisions` short one key is a column with no verdict, and
+    a client defaulting an absent verdict to "nothing matched" would silently unclassify
+    it while a client defaulting the other way would silently classify it.
     """
     if len(matched) != len(fields):
         raise ConservationViolationError(
@@ -554,6 +870,7 @@ def _project_results(
         )
 
     projected: dict[str, list[dict[str, Any]]] = {}
+    decisions: dict[str, str] = {}
     for (key, matches), spec, field in zip(matched.items(), specs, fields, strict=True):
         if key != spec.path:
             raise ConservationViolationError(
@@ -574,8 +891,29 @@ def _project_results(
                     details={"path": spec.path, "computed_for": match.schema_field.full_path},
                 )
         projected[spec.path] = [_candidate_payload(m, weights) for m in matches[:top_k]]
+        # Derived from the FULL match list rather than from `matches[:top_k]`, and the
+        # honest note about that is that NOTHING HERE PROVES THE DIFFERENCE MATTERS:
+        # `MatchRequest.top_k` is `ge=1`, `derive_field_decision` reads rank 1 only, so
+        # the two expressions are equal for every request this endpoint accepts --
+        # mutating it to the truncated list leaves every test green. It stays because the
+        # verdict is a property of what the matcher FOUND rather than of how many
+        # candidates the caller asked to see, and that reading does not depend on the
+        # request contract keeping its lower bound. Written down rather than left as a
+        # confident comment, because a claim no mutation can falsify is exactly the kind
+        # this repository has shipped as coverage twice.
+        decisions[spec.path] = derive_field_decision(matches, floor).value
 
-    return projected
+    if list(decisions) != list(projected):
+        raise ConservationViolationError(
+            message=(
+                "the field decisions and the results disagree about which fields this "
+                "response covers, so at least one column would come back with candidates "
+                "and no verdict, or with a verdict and no candidates."
+            ),
+            details={"results": len(projected), "field_decisions": len(decisions)},
+        )
+
+    return projected, decisions
 
 
 # =============================================================================
@@ -646,12 +984,21 @@ class MatchService:
         )
 
         weights = _scoring_weights(matcher) if request.explain else None
+        floor = _absolute_score_floor(matcher)
+        projected, decisions = _project_results(
+            specs, fields, matched, request.top_k, weights, floor
+        )
         # `results` first: it was the whole body, and the key order IS the wire contract.
         # `vocabulary` is what makes a `governance` of null readable without the caller
-        # holding a copy of the server's vocabulary file.
+        # holding a copy of the server's vocabulary file. The two below are APPENDED for
+        # the same reason: `fieldDecisions` is the one verdict per column a consumer
+        # writes down, and `scoring` is what stops that verdict and the numbers beside it
+        # from needing this library's source to interpret.
         return {
-            "results": _project_results(specs, fields, matched, request.top_k, weights),
+            "results": projected,
             "vocabulary": _vocabulary_payload(matcher),
+            "fieldDecisions": decisions,
+            "scoring": _scoring_payload(matcher, floor, projected),
         }
 
 
@@ -773,7 +1120,10 @@ def create_matching_router(service: MatchService, limits: MatchServiceLimits) ->
         description=(
             "One entry per input field, keyed by the caller's own `path`, in the order "
             "sent. Every input field appears exactly once, with an empty list when "
-            "nothing matched it."
+            "nothing matched it. `fieldDecisions` carries the single verdict per column "
+            "-- including NO_MATCH, which the per-candidate `decision` cannot express -- "
+            "and `scoring` states, per number, whether it may be compared within a field, "
+            "across fields, or not at all."
         ),
     )
     async def match(request: MatchRequest) -> DeterministicJSONResponse:

@@ -22,9 +22,12 @@ classifications against each other — for that last one it hands you
 `Vocabulary.tiersMostOpenFirst()` and stops, because the ordering belongs to your vocabulary and
 this library ships no taxonomy at all.
 
-Nothing in your controlled vocabulary is typed as a Java enum. `code`, `name`, `classification`
-and `enhancement` are open `String`s and will stay open. The one enum here is `MatchDecision`,
-which is the library's own vocabulary and is published as a closed set in `/openapi.json`.
+Nothing in your controlled vocabulary is typed as a Java enum. `code`, `name`, `classification`,
+`enhancement`, `tier`, `absoluteScoreMetric`, a status warning's `code` and every key and value of
+`sourceMetadata` are open and will stay open. The only Java enums here are `MatchDecision` and
+`FieldDecision`, which are the library's own vocabularies and are published as closed sets in
+`/openapi.json` — and they behave differently on an unknown value. See
+[Two enums, two answers](#two-enums-two-answers-about-an-unknown-value).
 
 ## Using it
 
@@ -34,19 +37,40 @@ NexusMatcherClient client = NexusMatcherClient.builder("http://127.0.0.1:8000")
         .maxRetries(2)                     // 503 only
         .build();
 
+String path = "booking.passenger.legal_name";
 MatchResponse response = client.match(List.of(
-        FieldSpec.of("legal_name", "booking.passenger.legal_name",
+        FieldSpec.of("legal_name", path,
                      "Full legal name as printed on the sailing manifest.", "string")));
 
-MatchCandidate top = response.topCandidateFor("booking.passenger.legal_name").orElseThrow();
-switch (top.governanceStatus()) {
-    case CONFERRED                   -> apply(top.governance());
-    case OPEN_TIER                   -> applyOpenTier(response.vocabulary().openClassification());
-    case WITHHELD_REJECTED_TOP_MATCH -> sendToAHuman();
+// The FIELD verdict first. It is the authority for a column; a candidate's own decision is
+// about that candidate, and a NO_MATCH field still arrives with candidates that look fine.
+switch (response.verdictFor(path).map(FieldVerdict::decision).orElse(FieldDecision.UNKNOWN)) {
+    case AUTO_APPROVE -> response.inheritableGovernanceFor(path).ifPresentOrElse(
+            governance -> apply(governance),
+            ()         -> applyOpenTier(response.vocabulary().openClassification()));
+    case REVIEW, REJECT, NO_MATCH, UNKNOWN -> sendToAHuman(response.candidatesFor(path));
 }
 ```
 
 The client is immutable and thread-safe; build one and share it.
+
+### Routes
+
+| method | route | returns |
+|---|---|---|
+| `match` / `matchBatch` | `POST /api/v1/match`, `/match/batch` | `MatchResponse` |
+| `lookup` | `POST /api/v1/lookup` | `LookupResponse` |
+| `status` | `GET /api/v1/status` | `ServiceStatus` |
+| `diagnoseRetrieval` | `POST /api/v1/diag/retrieval` | `RetrievalDiagnostic` |
+| `submitFeedback` | `POST /api/v1/feedback` | `FeedbackReceipt` |
+| `health` / `readiness` | `GET /health`, `/health/ready` | `HealthStatus` / `Readiness` |
+
+`lookup(String)` goes over the **POST** route rather than the service's single-id
+`GET /api/v1/lookup/{id}`. A dictionary id is an opaque string of yours that may contain a slash,
+a space or a non-ASCII character, and putting one in a path segment means percent-encoding it
+against a catch-all route where an encoded `%2F` and a raw `/` mean the same thing to the server
+and different things to every proxy in between. The POST route takes the identical string in a
+JSON body and answers the identical DTO. The GET form is still there for a terminal.
 
 ### Field keys
 
@@ -84,6 +108,106 @@ nothing, it only says which kind of nothing.
 — so a high number is not evidence of a good match, and on the example pack a field nothing
 governs scores higher than several that matched correctly. `REVIEW` means "a human must decide",
 never "probably fine". Do not diff against `confidence` either; it moves with any retrieval change.
+
+### One verdict per column: `fieldDecisions`
+
+`decision` on a candidate is about **that candidate**. The value that goes into a metadata sheet is
+the field verdict, and the server publishes it rather than leaving every client to reconstruct the
+roll-up rule differently:
+
+```java
+FieldVerdict verdict = response.verdictFor(path).orElseThrow();
+verdict.decision();     // AUTO_APPROVE | REVIEW | REJECT | NO_MATCH | UNKNOWN
+verdict.wireValue();    // the server's own string, verbatim
+```
+
+`NO_MATCH` is the state a per-candidate verdict cannot express: rank-1 `confidence` has a
+structural floor (`scoring.confidenceFloor`, 0.63 shipped) that sits **above** the review threshold
+(0.50), so rank 1 can never be `REJECT` on score alone and every field would otherwise come back at
+least `REVIEW` however irrelevant its best candidate is.
+
+**A `NO_MATCH` field still carries candidates.** The server chose that over an empty list on
+purpose — the candidates are evidence for the reviewer who now has to decide — so:
+
+* do **not** find no-match fields by testing `candidatesFor(path).isEmpty()`; you will find none;
+* do **not** read `results[path].get(0).governance()` on one. Against the shipped pack, a
+  `NO_MATCH` field's rank 1 arrives at confidence 0.82 with a populated protection class and a
+  per-candidate verdict of `REVIEW`. Applying it classifies a column from an entry the server has
+  just told you describes nothing.
+
+`response.inheritableGovernanceFor(path)` reads the verdict and the candidate together and is empty
+for everything but `AUTO_APPROVE`.
+
+### `absoluteScore`: the one number comparable across fields
+
+Present on **every** candidate, not gated behind `explain`. It is the raw dense-retrieval score,
+with no normalisation and no floor, and `scoring.thresholdableAcrossFields` names it as the number
+you may legitimately compare against a constant across different columns — which `confidence`
+is not.
+
+**`null` is not zero.** Null means the dense retriever never returned that candidate at all; it
+reached the shortlist through the lexical arm alone. Zero would mean "measured, and as far from the
+query as this metric goes", which is a very different claim, and on a cosine metric a very bad
+score. The component is therefore a boxed `Double`, deliberately: a primitive would let Jackson
+bind the absent number to `0.0` in silence and a caller filtering `>= floor` would drop the
+candidate as *failed* rather than as *unmeasured*. Prefer `absoluteScoreValue()`, which is an
+`OptionalDouble` with no null to forget, or `hasAbsoluteScore()`. There is no
+`absoluteScoreOrZero()` and there should not be.
+
+Read `scoring.absoluteScoreMetric()` before treating it as a cosine, and
+`scoring.absoluteScorePooledOverAliases()` before treating it as a similarity to the entry's own
+text. A floor measured on a deployment where either differs does not transfer.
+
+### `sourceMetadata`: your own columns, carried and not read
+
+Every candidate and every looked-up entry carries the deployment's own enrichment columns — a
+steward, a review date, an upstream identifier — passed through the pipeline untouched.
+
+```java
+SourceMetadata plane = candidate.sourceMetadata();
+plane.value("steward");        // Optional<Object>
+plane.isComplete();            // false => the loader trimmed this entry to its size cap
+plane.wasRendered("review_date");  // true => this is the TEXT FORM of a non-JSON source value
+```
+
+`values()` is a `Map<String, Object>` and must never become a typed record: both the keys and the
+values are your vocabulary, and typing either would compile one organisation's spreadsheet into
+this artifact. Nothing in it was read by the server — no score, ranking, threshold or verdict
+depends on it — so nothing in it can justify a classification either.
+
+Check `isComplete()` before treating the map as a record of the glossary row. When it is false, an
+absent key may have been *dropped to fit the cap* rather than *not populated*, and those are
+different conclusions about your glossary.
+
+### Two enums, two answers about an unknown value
+
+Both closed sets in this client are the library's own vocabulary. They behave differently when a
+newer server sends a value this build has never heard of, and the difference is deliberate:
+
+| | unknown value | why |
+|---|---|---|
+| `MatchDecision` (per candidate) | **throws**, naming the value | the service has committed to freezing it. Putting `NO_MATCH` on a *new* enum instead of widening this one **is** that commitment |
+| `FieldDecision` (per field) | becomes `UNKNOWN`, keeps the raw string, grants nothing | this is the vocabulary that grows — it was born by growing |
+
+Binding `FieldDecision` closed would re-create, on the new field, the exact deserialisation break
+the new field was invented to avoid. The blast radius also differs by the batch size: a `decision`
+sits inside one candidate of one field, while a field verdict sits in a map with one entry per
+field — up to 250 on the batch route — so refusing the whole body over one unrecognised verdict
+would discard 249 that decoded perfectly.
+
+Degrading here is not a guess, because `UNKNOWN` is not usable as an answer:
+
+* `maySafelyInherit()` is false for it, and `inheritableGovernanceFor()` returns empty;
+* `FieldVerdict.wireValue()` hands back the exact string the server sent, so the new value can be
+  named in a ticket rather than merely counted;
+* `response.pathsWithUnknownVerdicts()` lists the columns affected;
+* the client never maps it onto the nearest value it does know. That silent reinterpretation — a
+  new `APPROVE_WITH_CONDITIONS` quietly becoming an auto-approval — is the failure this seam exists
+  to prevent, and it is a different thing from degrading loudly.
+
+`tests/packaging/test_java_client_contract.py` asserts that `UNKNOWN` is **not** a value the
+service publishes. The day it becomes one, that gate goes red — because at that moment the client's
+sentinel would start absorbing a real server verdict.
 
 ### Errors
 
@@ -190,18 +314,17 @@ rather than only by a flag on the client's own mapper — so a stricter mapper y
 works. This is not hypothetical: `vocabulary` and `governance.enhancement` were both added to this
 contract while this client was being written.
 
-Unknown *values* in a closed set are refused loudly. A `decision` this client does not know
-decides whether a class is applied without a human, and mapping it onto the nearest known one
-would be a silent lie.
+Unknown *values* in a closed set are handled per set, not by one rule — see
+[Two enums, two answers](#two-enums-two-answers-about-an-unknown-value).
 
 ## Building and testing
 
 ```
-mvn test        # 38 unit tests. No service, no network
-mvn verify      # + 33 integration tests against a REAL service
+mvn test        # 73 unit tests. No service, no network
+mvn verify      # + 57 integration tests against a REAL service
 ```
 
-`mvn verify` needs three running fixtures, because three of the behaviours worth pinning are
+`mvn verify` needs four running fixtures, because four of the behaviours worth pinning are
 properties of a server's configuration rather than of a request:
 
 | | | |
@@ -209,6 +332,7 @@ properties of a server's configuration rather than of a request:
 | `http://127.0.0.1:8000` | the example pack, loaded | everything normal |
 | `http://127.0.0.1:8001` | no dictionary at all | every match is a real 503 |
 | `http://127.0.0.1:8002` | the pack, `NEXUS_API_DEADLINE_SECONDS=0.001` | every match is a real 504 |
+| `http://127.0.0.1:8003` | the pack, `NEXUS_API_MATCHING_CONFIG=clients/java/fixture-absolute-floor.json` | `NO_MATCH` is reachable |
 
 From the repository root:
 
@@ -217,16 +341,58 @@ From the repository root:
 ```
 
 Override the URLs with `-Dnexus.matcher.baseUrl=`, `-Dnexus.matcher.unavailableBaseUrl=`,
-`-Dnexus.matcher.deadlineBaseUrl=`.
+`-Dnexus.matcher.deadlineBaseUrl=`, `-Dnexus.matcher.floorBaseUrl=`.
+
+**8003 exists because `NO_MATCH` is otherwise untestable against a live server.** The verdict is
+earned two ways: a field that came back with no candidates at all, or a configured
+`absolute_score_floor` that rank 1 fails. The library ships no floor and will not invent one — a
+floor is a statement about a score distribution, and the distribution belongs to a glossary the
+library has never seen — and a 30-entry glossary never returns zero candidates. So without this
+fixture the whole verdict could only be tested against a response body somebody typed, which is the
+half of a hand-written client that goes stale silently.
+
+`fixture-absolute-floor.json` sets **0.65**, and that number is a test fixture, not a recommended
+default. It is the middle of a gap that was measured rather than guessed: sending all 26 fields of
+`examples/governance/fields.json` at `top_k=1` to the bundled encoder over the example glossary,
+
+| | n | rank-1 `absoluteScore` |
+|---|---|---|
+| fields the pack declares a correct answer for | 24 | min **0.7139** |
+| fields the pack declares `expected_id: null` | 2 | max **0.5839** |
+
+so 0.65 sits clear of both sides with ~0.06 of margin either way. Reproduce it by matching that
+file and reading `absoluteScore` — it takes one request.
+
+**None of that transfers.** A floor is a statement about a score distribution, and the distribution
+belongs to a glossary, an encoder and a metric. Calibrate against your own corpus, and read
+`scoring.absoluteScoreMetric` and `scoring.absoluteScorePooledOverAliases` before comparing against
+a floor measured anywhere else — the same number under `dot` or `euclidean`, or over an index that
+pools aliases, is not the same number.
 
 **The integration tests do not mock the service and do not skip when it is missing.** A skipped
 integration test is a green build that proved nothing, and this contract moved twice while the
 client was being written — exactly the drift a mock cannot see. A missing fixture fails the build
 and names the script above.
 
+### The captured bodies
+
 The unit tests decode response bodies **captured verbatim** from a running service, in
 `src/test/resources/captured/`. They are captures rather than hand-written expectations, which is
 the difference between testing the contract and testing what the author believed it was.
+
+**Regenerate them; never edit them.** With the fixtures running, from the repository root:
+
+```
+./clients/java/capture-fixtures.sh
+git diff --stat clients/java/src/test/resources/captured
+```
+
+The script re-derives every byte of every file, and it exists so that "the fixture disagrees with
+the test" can only ever be resolved the honest way. A body somebody typed to make a test pass tests
+the author's belief about the contract — the exact belief the fixture was there to check. A diff
+after running it is the service having changed; read it before you accept it.
+
+`match-response-no-match.json` is the one capture taken from 8003 rather than 8000.
 
 ### One case the shipped configuration cannot reach — and how to reach it anyway
 
@@ -238,7 +404,8 @@ caller who raises `review_threshold` past that floor.
 
 That does **not** mean it takes somebody else's deployment to see. `review_threshold` is settable
 on a local fixture through `NEXUS_API_MATCHING_CONFIG`, and the case has been provoked and the
-client's mapping confirmed end to end against a real server:
+client's mapping confirmed end to end against a real server. Port **8004** below, because 8003 is
+now the shipped `NO_MATCH` fixture:
 
 ```bash
 cat > /tmp/reject.json <<'JSON'
@@ -250,7 +417,7 @@ NEXUS_API_DICTIONARY=examples/governance/glossary.csv \
 NEXUS_API_GOVERNANCE=examples/governance/protection_classes.json \
 NEXUS_API_MATCHING_CONFIG=/tmp/reject.json \
   .venv/Scripts/python -m uvicorn nexus_matcher.presentation.api.app:create_app \
-  --factory --host 127.0.0.1 --port 8003
+  --factory --host 127.0.0.1 --port 8004
 ```
 
 Matching `terminal_name` at `top_k=3` against that server returns, and the client reads it as:
@@ -264,11 +431,16 @@ Matching `terminal_name` at `top_k=3` against that server returns, and the clien
 That is the whole rule in one response: a rejected **rank 1** confers nothing, a rejected
 **runner-up** keeps its class, and the two nulls stay distinguishable.
 
-The shipped suite does not start that fourth fixture. `GovernanceNullsIT` instead asserts against
+The shipped suite does not start that fifth fixture. `GovernanceNullsIT` instead asserts against
 the live pack that no rank-1 candidate is `REJECT`, and fails with an explanation if that ever
 stops being true; `MatchResponseDecodingTest` pins the client's decoding from a body labelled in
 place as hand-built. If you are changing anything in this area, run the fixture above rather than
 trusting either — it is ten seconds of work and it exercises the real server.
+
+`NO_MATCH` used to sit in this same category and no longer does. 8003 makes it reachable, and
+`FieldDecisionIT` asserts it against a live server from both sides: the same field is `REVIEW` with
+no floor configured and `NO_MATCH` with one, from the same pack, the same glossary and the same
+encoder, differing by one configuration key.
 
 ### If the integration tests cannot start an HTTP client
 
@@ -324,9 +496,20 @@ workaround needs.
 - **No `threshold` request parameter.** `/openapi.json` publishes `fields`, `top_k` and `explain`
   and nothing else. The server now ignores unrecognised top-level request keys rather than
   refusing them, so sending one would be silently discarded.
-- **No client-side field caps.** `max_fields`, `max_batch_fields` and the string-length bounds are
-  per-deployment settings; a copy of them compiled in here would refuse requests a tuned server
-  accepts and go stale silently the first time an operator raised one.
+- **No client-side field caps.** `max_fields`, `max_batch_fields`, the lookup id-length bound and
+  the string-length bounds are per-deployment settings; a copy of them compiled in here would
+  refuse requests a tuned server accepts and go stale silently the first time an operator raised
+  one. Read them from `status().limits()` and chunk against the answer. The two checks
+  `LookupRequest` *does* make locally — a blank id and a duplicated id — are structural rather than
+  configured: the response is a map keyed by the id, so no deployment can answer either, and
+  mirroring them cannot go stale.
+- **No absolute-score floor, and no suggestion of one.** `NO_MATCH` on a stock server means "this
+  field came back with no candidates". Turning it into "rank 1 was not good enough" takes a floor,
+  and the floor is yours to measure — see the fixture note above for what measuring it looks like
+  and for why the fixture's own 0.65 is not a recommendation.
+- **No opinion about `sourceMetadata`.** The pass-through plane is carried and never read. Nothing
+  in this client branches on a key or a value in it, and nothing should: the moment it did, this
+  artifact would be one specific enterprise's client wearing a generic name.
 - **No feedback-driven improvement.** `submitFeedback` writes to an audit trail and nothing else.
   Training on that signal was measured on the server's own benchmark and *lost* accuracy, so no
   accuracy claim is made for it here either.

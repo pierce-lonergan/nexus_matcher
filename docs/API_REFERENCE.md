@@ -75,14 +75,17 @@ and the Excel + CSV dictionary loaders.
 
 | Method | Returns | Notes |
 |---|---|---|
-| `load_dictionary(source, column_mapping=None, source_type=None)` | `LoadStatistics` | Loads **and indexes**. Loader auto-detected from the file extension against the registry. Raises `ValueError` if no loader matches. Re-loading replaces the previous index. |
+| `load_dictionary(source, column_mapping=None, source_type=None, governance_strict=True)` | `LoadStatistics` | Loads **and indexes**, reading the source *through* the vocabulary given to `from_config(governance=…)`. Loader auto-detected from the file extension. Re-loading replaces the previous index. Raises `ValueError` if no loader matches, if the source's governance is defective, or if the source has a protection-code column and no vocabulary was configured to read it — pass `governance_strict=False` to load anyway and treat that column as plain metadata. |
 | `match_schema(schema_source, schema_format=None)` | `dict[str, tuple[MatchResult, ...]]` | Keyed by the caller's own field identity: `source_metadata['flattened_name']` when the parser set one (flattened Avro), otherwise `full_path`. Keys are unique, and every input field appears exactly once. Raises `RuntimeError` if no dictionary is loaded. |
-| `match_schema_session(schema_source, schema_format=None)` | `MatchingSession` | Same matching, plus the parsed `Schema` and timing metadata. |
+| `match_schema_session(schema_source, schema_format=None)` | `MatchingSession` | Same matching, plus the parsed `Schema` and timing metadata. **Also the only way to get the per-field verdicts from Python**: `session.field_decisions()` returns `dict[str, FieldDecision]`, one entry per field in schema order, and it is a *method*, not a property. `match_schema` returns candidates only. |
 
 | Property | Returns |
 |---|---|
 | `dictionary_size` | `int` |
 | `is_ready` | `bool` |
+| `absolute_score_floor` | `float` or `None` — the configured floor, `None` when off. The same number the service publishes as `scoring.absoluteScoreFloor`. |
+| `absolute_score_metric` | `str` — what produced `ScoreBreakdown.absolute_cosine`; `"cosine"` under the shipped wiring, `"unknown"` when the store does not declare one. |
+| `minimum_achievable_confidence` | `float` or `None` — the structural floor of `final_confidence`, `None` when a reranker makes the derivation unsound. |
 
 There is no public method to register a parser or loader on an existing matcher; pass
 `schema_parser_registry` / `dictionary_loader_registry` at construction time.
@@ -106,6 +109,7 @@ Frozen dataclass, `nexus_matcher.application.use_cases.match_schema.MatchingConf
 | `auto_approve_threshold` | 0.87 | Calibrated — `benchmarks/results/exp_calibration_combined.json`, where 0.87 is the point that holds auto-approve precision at 0.95 (coverage 0.12). An earlier revision of this table printed 0.85; that is the 0.90-precision point on the same curve, and it was never the shipped default. |
 | `review_threshold` | 0.50 | Below this, `REJECT` |
 | `min_confidence_gap` | 0.10 | Minimum margin over the runner-up required to auto-approve |
+| `absolute_score_floor` | `None` | The rank-1 `absolute_cosine` beneath which a field is reported `NO_MATCH`. `None` means **off**, and it is the only default a library with no view of the caller's corpus may ship — `0.0` means on with a floor at zero, which is a different thing. It is compared against the raw retrieval score, not against `final_confidence`, because `final_confidence` has a structural floor of `semantic_weight × fusion_alpha` = 0.63 that sits above `review_threshold` and makes "nothing matched" inexpressible. Measuring one for your own corpus: [Calibrating the absolute score floor](guides/absolute_score_floor.md). |
 | `results_per_field` | 5 | Matches returned per field |
 | `expand_query_abbreviations` | `False` | Query-side abbreviation expansion. Off because the evidence does not support turning it on — **not** because it is proven harmful. The "-2.0 points" an earlier revision of this table printed does not survive a paired test; re-measured on the full 688-pair corpus it is **-1.60 points, exact McNemar p = 0.099**: inconclusive, point estimate negative. The mechanism is the bundled *dictionary*, not the idea — it asserts wrong long forms on short tokens (`st` → state, `no` → number). Supply your own approved catalog and this flag becomes the largest lever in the pipeline: see [governed abbreviations](guides/governed_abbreviations.md). |
 | `dictionary_alias_count` | 0 | Dictionary-side alias generation. Off because the gain inverts with corpus size — +1.9 at 688 entries, **-13.7 at 10k and -18.8 at 30k**. Never enable without re-measuring at your own corpus size. |
@@ -181,9 +185,13 @@ is also created for `uvicorn nexus_matcher.presentation.api.app:app`.
 
 | Method | Path | Response |
 |---|---|---|
-| POST | `/api/v1/match` | `MatchResponseView` — `results`, one entry per input field, keyed by the caller's own `path`, in the order sent, plus the top-level `vocabulary` block described below. Field cap `NEXUS_API_MAX_FIELDS` (default 100). |
+| POST | `/api/v1/match` | `MatchResponseView` — four top-level keys in this order: `results` (one entry per input field, keyed by the caller's own `path`, in the order sent), `vocabulary`, `fieldDecisions` (one verdict per column, the only place `NO_MATCH` is expressible) and `scoring`. Each candidate carries `absoluteScore` beside `confidence`. Every key is spelled out under [The matching response](#the-matching-response) rather than restated here. Field cap `NEXUS_API_MAX_FIELDS` (default 100). |
 | POST | `/api/v1/match/batch` | Identical contract and one shared implementation; the only difference is the cap, `NEXUS_API_MAX_BATCH_FIELDS` (default 250). |
 | POST | `/api/v1/feedback` | **201** and `FeedbackResponseView` — the stored record echoed back, server `receivedAt` included. Appended to `NEXUS_API_FEEDBACK_PATH`; **503** when that is unset, **422** on a malformed record, **500** when the append itself fails. |
+| POST | `/api/v1/lookup` | `LookupResponseView` — `results` maps every id you sent, once and in the order sent, to an entry or an explicit `null`; `missing` names exactly the nulls; `vocabulary` is the same block `/match` carries. No score, no rank, no decision. Id cap `NEXUS_API_MAX_BATCH_FIELDS`; **413** over it, **422** on a duplicate, blank or oversized id, **503** with no dictionary. |
+| GET | `/api/v1/lookup/{governance_id:path}` | The single-id form, answering the identical `LookupResponseView` under one key. A miss is **200** with `null` — 404 on this service means no such route. The `:path` converter is what keeps an id containing `/` addressable; OpenAPI publishes the path as `/api/v1/lookup/{governance_id}`. |
+| GET | `/api/v1/status` | `StatusResponseView` — `ready`, `degraded`, `warnings[]`, `dictionary`, `encoder`, `thresholds`, `limits`. Always **200**, including with no dictionary loaded, because a pre-run degradation check that refused when the condition holds is unusable exactly when it is needed. Every threshold is nullable: `null` means this matcher does not expose it, never `0.0`. |
+| POST | `/api/v1/diag/retrieval` | `RetrievalDiagnosticView` — `queryText`, the `dense`/`sparse`/`fused` channels with their own raw scores and full result counts, `rerankerWired`, and, when `expected_governance_id` is given, that entry's rank per channel plus `inDictionary`. Retrieval only: it does not reproduce scoring, the decision, or reranking. Scores are each channel's own number and are **not** comparable across channels. |
 | GET | `/` | `{"service": "nexus-matcher", "version": …, "docs": "/docs"}`. `version` is the installed package's `__version__`, resolved at startup — this document used to print a literal here, and a literal is a second copy that drifts. |
 | GET | `/health` | `HealthResponse` — `status`, `timestamp`, `version`, `checks.uptime_seconds`. `status` is `healthy` unless a registered component is unhealthy, then `degraded`. |
 | GET | `/health/live` | `{"status": "alive"}` — Kubernetes liveness probe |
@@ -225,9 +233,21 @@ Both match routes answer **503** until a dictionary is loaded — see
 
 ### The matching response
 
-Two top-level keys, in this order: `results`, then `vocabulary`. `results` was once the
-whole body, so `vocabulary` is appended rather than placed first — a client generated
-against the earlier shape keeps reading `results` at the same key.
+**Four top-level keys, in this order: `results`, `vocabulary`, `fieldDecisions`,
+`scoring`.** The order is the wire contract. `results` was once the whole body, so
+everything since has been **appended** rather than placed in front of it — a client
+generated against any earlier shape keeps reading every key it already knew at the key it
+already knew.
+
+| Key | What it is | Why it is not derivable from the ones before it |
+|---|---|---|
+| `results` | One entry per input field, keyed by the caller's own `path`, in the order sent. A field nothing matched gets `[]`, never a missing key. | — |
+| `vocabulary` | The caller's own `openClassification` and tier ladder, echoed back. | Without it a `"governance": null` cannot be read. |
+| `fieldDecisions` | **One verdict per column**, under the same keys in the same order. Vocabulary: `AUTO_APPROVE`, `REVIEW`, `REJECT`, **`NO_MATCH`**. | The per-candidate `decision` cannot express `NO_MATCH`. See below. |
+| `scoring` | What every number in this body *means*: which are comparable across fields, which floors are in force, and what metric produced `absoluteScore`. | A governance artifact whose numbers can only be interpreted by reading this library's source is not one. |
+
+`fieldDecisions` and `results` are checked against each other before the response is sent;
+a body where one covers a field the other does not is refused rather than returned.
 
 Everything below was captured from a live server started with
 [`examples/governance/serve.sh`](../examples/governance/serve.sh), which loads the
@@ -266,7 +286,16 @@ edited:
           "enhancement": "MASK_IN_LOGS"
         },
         "confidence": 0.925,
-        "decision": "AUTO_APPROVE"
+        "decision": "AUTO_APPROVE",
+        "absoluteScore": 0.881982,
+        "sourceMetadata": {
+          "values": {
+            "personal_information": "yes",
+            "direct_identifier": "yes"
+          },
+          "droppedKeyCount": 0,
+          "renderedKeys": []
+        }
       }
     ],
     "roster.crew_member_id": [
@@ -285,7 +314,16 @@ edited:
           "enhancement": null
         },
         "confidence": 0.925,
-        "decision": "AUTO_APPROVE"
+        "decision": "AUTO_APPROVE",
+        "absoluteScore": 0.935079,
+        "sourceMetadata": {
+          "values": {
+            "personal_information": "yes",
+            "direct_identifier": "yes"
+          },
+          "droppedKeyCount": 0,
+          "renderedKeys": []
+        }
       }
     ],
     "timetable.route_cd": [
@@ -297,13 +335,61 @@ edited:
         "domain": "Published",
         "governance": null,
         "confidence": 0.925,
-        "decision": "AUTO_APPROVE"
+        "decision": "AUTO_APPROVE",
+        "absoluteScore": 0.879752,
+        "sourceMetadata": {
+          "values": {
+            "personal_information": "",
+            "direct_identifier": ""
+          },
+          "droppedKeyCount": 0,
+          "renderedKeys": []
+        }
       }
     ]
   },
   "vocabulary": {
     "openClassification": "OPEN_DECK",
-    "tiersMostOpenFirst": ["OPEN_DECK", "CREW_ONLY", "BRIDGE_SENSITIVE", "SEALED_RESTRICTED"]
+    "tiersMostOpenFirst": [
+      "OPEN_DECK",
+      "CREW_ONLY",
+      "BRIDGE_SENSITIVE",
+      "SEALED_RESTRICTED"
+    ]
+  },
+  "fieldDecisions": {
+    "booking.pax_legal_nm": "AUTO_APPROVE",
+    "roster.crew_member_id": "AUTO_APPROVE",
+    "timetable.route_cd": "AUTO_APPROVE"
+  },
+  "scoring": {
+    "confidenceFloor": 0.63,
+    "absoluteScoreFloor": null,
+    "absoluteScoreMetric": "cosine",
+    "absoluteScorePooledOverAliases": false,
+    "thresholdableAcrossFields": [
+      "absoluteScore",
+      "explain.absoluteCosine",
+      "explain.scores.lexical",
+      "explain.scores.editDistance",
+      "explain.scores.type",
+      "explain.scores.domain"
+    ],
+    "comparabilityScopesNarrowestFirst": [
+      "WITHIN_FIELD",
+      "ACROSS_FIELDS",
+      "ACROSS_RUNS"
+    ],
+    "comparability": {
+      "confidence": "WITHIN_FIELD",
+      "absoluteScore": "ACROSS_FIELDS",
+      "explain.absoluteCosine": "ACROSS_FIELDS",
+      "explain.scores.fusedRetrieval": "WITHIN_FIELD",
+      "explain.scores.lexical": "ACROSS_FIELDS",
+      "explain.scores.editDistance": "ACROSS_FIELDS",
+      "explain.scores.type": "ACROSS_FIELDS",
+      "explain.scores.domain": "ACROSS_FIELDS"
+    }
   }
 }
 ```
@@ -311,17 +397,47 @@ edited:
 `POST /api/v1/match/batch` returns the same body for the same request — one implementation
 behind two field caps.
 
-A candidate carries a ninth key, `explain`, only when the request set `explain: true`. It
-is **absent**, not present-and-null, otherwise. Requesting it for `booking.pax_email_addr`
-against the same pack returns:
+#### The candidate
+
+Ten keys, in this order: `rank`, `governanceId`, `businessName`, `definition`, `domain`,
+`governance`, `confidence`, `decision`, `absoluteScore`, `sourceMetadata`.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `rank` | `int` | 1-based position within this field's candidate list. |
+| `governanceId` | `string` | The dictionary entry's id — the thing you join on. |
+| `businessName` | `string` | The entry's business name. |
+| `definition` | `string` | The entry's definition. |
+| `domain` | `string` | The entry's subject area. |
+| `governance` | object or `null` | The protection class the entry confers. Six keys; see below. `null` is a documented value. |
+| `confidence` | `float` | The scored confidence. **Comparable within this field only** — see `scoring.comparability`. |
+| `decision` | `string` | `AUTO_APPROVE`, `REVIEW` or `REJECT`. **Per candidate.** It cannot say `NO_MATCH`; the per-field verdict is in `fieldDecisions`. |
+| `absoluteScore` | `float` or `null` | The raw dense-retrieval score for this candidate. `null` means the dense arm never proposed it — which is not zero: zero is a similarity that was measured, `null` is one that was never taken. |
+| `sourceMetadata` | object | The matched entry's **pass-through plane**: `values` (your glossary's own enrichment columns, in loader order, never interpreted), `droppedKeyCount` (how many keys the loader's per-entry size cap discarded; `0` means this is the whole plane) and `renderedKeys` (keys whose value JSON could not hold natively and which were rendered as text). Always present, `values` empty rather than the key missing. Nothing in it is read by any score, ranking, threshold or governance decision. |
+
+**`absoluteScore` is the only per-candidate number comparable across fields**, and it is
+the number `absolute_score_floor` is compared against. It is present on every candidate
+whether or not `explain` was requested; when `explain` is requested it is read once and
+emitted twice, so `absoluteScore` and `explain.absoluteCosine` cannot disagree. Read
+`scoring.absoluteScoreMetric` before treating it as a cosine, and
+`scoring.absoluteScorePooledOverAliases` before comparing it against a floor measured on a
+deployment that pooled differently. Choosing a floor is
+[a measurement, not a constant](guides/absolute_score_floor.md).
+
+A candidate carries an eleventh key, `explain`, only when the request set `explain: true`.
+It is **absent**, not present-and-null, otherwise. The identical request above with
+`"explain": true` returns, on `booking.pax_legal_nm`:
 
 ```json
 "explain": {
-  "scores":  {"fusedRetrieval": 1.0, "lexical": 1.0, "editDistance": 1.0, "type": 0.5, "domain": 0.5},
+  "scores": {"fusedRetrieval": 1.0, "lexical": 1.0, "editDistance": 1.0, "type": 1.0, "domain": 0.5},
   "weights": {"fusedRetrieval": 0.7, "lexical": 0.05, "editDistance": 0.05, "type": 0.05, "domain": 0.15},
-  "absoluteCosine": 0.840633
+  "absoluteCosine": 0.881982
 }
 ```
+
+`absoluteCosine` here is byte-for-byte the `absoluteScore` in the response above, because
+both are the same read.
 
 `scores` and `weights` are open maps carrying the same keys, so
 `sum(scores[k] * weights[k])` clamped to [0, 1] reproduces `confidence` from the response
@@ -407,6 +523,274 @@ real taxonomy uses, so it cannot be mistaken for one. Reaching it requires a glo
 no protection-code column at all — pointing `NEXUS_API_DICTIONARY` at a glossary that *has*
 one while leaving `NEXUS_API_GOVERNANCE` unset is refused at startup, and both match routes
 then answer **503** (`NEXUS-1002`) rather than serving every field as `null`.
+
+#### `fieldDecisions`, the one verdict per column
+
+```json
+"fieldDecisions": {
+  "booking.pax_legal_nm": "AUTO_APPROVE",
+  "roster.crew_member_id": "AUTO_APPROVE",
+  "timetable.route_cd": "AUTO_APPROVE"
+}
+```
+
+Same keys as `results`, same order, one string each. **This is the value a consumer writes
+down.** `results[path][0].decision` is a statement about a candidate; this is a statement
+about the column.
+
+Four values, and the fourth is the reason this block exists:
+
+| Value | Meaning |
+|---|---|
+| `AUTO_APPROVE` | Rank 1 cleared the auto-approve bar and its margin over the runner-up. Inherit. |
+| `REVIEW` | A human decides. Never read it as "probably fine". |
+| `REJECT` | Rank 1 is below `review_threshold`. Unreachable at the shipped numbers — see below. |
+| **`NO_MATCH`** | **This response carries nothing this field may inherit.** |
+
+`NO_MATCH` is the state the per-candidate vocabulary cannot express, and it is not a
+convenience. `confidence` is min-max normalised within a field, so rank 1 has a structural
+floor of `semantic_weight × fusion_alpha` = **0.63** (published as
+`scoring.confidenceFloor`), which sits above `review_threshold` = 0.50. No rank-1 candidate
+can therefore be `REJECT` on score alone: **every field comes back at least `REVIEW`,
+however irrelevant its best candidate is.** No setting of `review_threshold` recovers the
+missing state, because the floor moves with the weights and the thresholds do not move
+with it.
+
+A field is `NO_MATCH` when either:
+
+1. **it came back with no candidates at all** — which happens with **no floor configured**,
+   so `NO_MATCH` is reachable on the shipped defaults; or
+2. **`scoring.absoluteScoreFloor` is configured and rank 1's `absoluteScore` does not clear
+   it** — including when that `absoluteScore` is `null`, meaning the dense retriever never
+   proposed the candidate and so offers no evidence it clears anything.
+
+The verdict alone does not distinguish the two. Read `results[path]` beside it: empty is
+case 1, non-empty is case 2.
+
+**The candidates on a `NO_MATCH` field are still returned and still carry `governance`.**
+They are evidence for a reviewer, not a classification. Captured from a live server with
+`absolute_score_floor` set to 0.70, sending one field the pack answers and one it cannot:
+
+```json
+{
+  "results": {
+    "telemetry.quasar_flux_index": [
+      {
+        "rank": 1,
+        "governanceId": "GBF-0022",
+        "businessName": "Vessel Heading Degrees",
+        "definition": "The compass heading a vessel reported at the last telemetry ping.",
+        "domain": "Voyage",
+        "governance": {
+          "code": "VESSEL_TELEMETRY",
+          "name": "Vessel operational telemetry",
+          "classification": "CREW_ONLY",
+          "personalInformation": false,
+          "directIdentifier": false,
+          "enhancement": null
+        },
+        "confidence": 0.823333,
+        "decision": "REVIEW",
+        "absoluteScore": 0.586716,
+        "sourceMetadata": {
+          "values": {
+            "personal_information": "no",
+            "direct_identifier": "no"
+          },
+          "droppedKeyCount": 0,
+          "renderedKeys": []
+        }
+      }
+    ]
+  },
+  "fieldDecisions": {
+    "booking.passenger.legal_name": "AUTO_APPROVE",
+    "telemetry.quasar_flux_index": "NO_MATCH"
+  },
+  "scoring": {
+    "absoluteScoreFloor": 0.7,
+    "absoluteScoreMetric": "cosine"
+  }
+}
+```
+
+That candidate has a `confidence` of 0.82 — well above `review_threshold` — a `decision` of
+`REVIEW`, and a fully populated `CREW_ONLY` protection class. Nothing in it says the field
+is unanswerable. Its `absoluteScore` of 0.5867 does, and `fieldDecisions` is where that
+reading is published. **Read `fieldDecisions[path]` first.**
+
+`absolute_score_floor` is off by default and this library ships no value for it: a floor is
+a statement about a score distribution, and the distribution belongs to your dictionary.
+[Calibrating the absolute score floor](guides/absolute_score_floor.md) is the procedure for
+measuring one, and includes the measurement showing that a plausible-sounding floor can
+produce zero `NO_MATCH` verdicts on any real corpus.
+
+#### `scoring`, so the numbers can be read without this library's source
+
+```json
+"scoring": {
+  "confidenceFloor": 0.63,
+  "absoluteScoreFloor": null,
+  "absoluteScoreMetric": "cosine",
+  "absoluteScorePooledOverAliases": false,
+  "thresholdableAcrossFields": ["absoluteScore", "explain.absoluteCosine", "explain.scores.lexical", "explain.scores.editDistance", "explain.scores.type", "explain.scores.domain"],
+  "comparabilityScopesNarrowestFirst": ["WITHIN_FIELD", "ACROSS_FIELDS", "ACROSS_RUNS"],
+  "comparability": {"confidence": "WITHIN_FIELD", "absoluteScore": "ACROSS_FIELDS", "explain.absoluteCosine": "ACROSS_FIELDS", "explain.scores.fusedRetrieval": "WITHIN_FIELD", "explain.scores.lexical": "ACROSS_FIELDS", "explain.scores.editDistance": "ACROSS_FIELDS", "explain.scores.type": "ACROSS_FIELDS", "explain.scores.domain": "ACROSS_FIELDS"}
+}
+```
+
+Same argument as `vocabulary` one section up: the body is a governance artifact that gets
+pasted into a ticket and diffed, so an artifact whose numbers can only be interpreted by
+reading this library's source is not one.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `confidenceFloor` | `float` or `null` | The lowest `confidence` a rank-1 candidate can structurally take, `semantic_weight × fusion_alpha`. **Self-verifying**: it is checked against the rank-1 confidences in *this* response and published as `null` if any of them is below it, because the bound has preconditions (no reranker; at least two distinct dense scores) that an ordinary one-entry dictionary violates. A threshold set above a floor your own fields sit under is this repository's NM-0027 defect on the wire. |
+| `absoluteScoreFloor` | `float` or `null` | The `absoluteScore` beneath which this server reports a field as `NO_MATCH`. `null` — the shipped default — means no floor is configured, and `fieldDecisions` can then only report `NO_MATCH` for a field with no candidates at all. |
+| `absoluteScoreMetric` | `string` | What actually produced `absoluteScore`. `cosine` under the shipped wiring; a store that cannot say reports `unknown` rather than guessing. Open string, never an enum. |
+| `absoluteScorePooledOverAliases` | `bool` | Whether the score is the best over an entry's generated aliases rather than over the entry alone. `true` shifts the whole distribution upward, so a floor measured on a deployment with a different setting means something else here. |
+| `thresholdableAcrossFields` | `string[]` | The response paths whose numbers a caller may compare against a fixed constant. |
+| `comparabilityScopesNarrowestFirst` | `string[]` | The scope ladder, narrowest first, so a client can order two scopes without hard-coding them. |
+| `comparability` | `object` | Response path → scope. `WITHIN_FIELD` means the number is normalised inside one field's shortlist and comparing it across fields is meaningless. |
+
+The single most important row: **`confidence` is `WITHIN_FIELD` and `absoluteScore` is
+`ACROSS_FIELDS`.** A rank-1 `confidence` lands near `fusion_alpha` whether the match is
+excellent or absurd, so thresholding it across a schema compares nothing. That is why a
+floor exists on the absolute number and not on the confidence.
+
+`absoluteScoreFloor` is **not** published on `GET /api/v1/status` — that route's
+`thresholds` block carries `autoApprove`, `review`, `minConfidenceGap`, `resultsPerField`,
+`fusionAlpha`, `minimumAchievableConfidence` and `reviewThresholdBelowFloor`, and no floor.
+To read a deployment's floor without matching anything, send a one-field match and read
+this block.
+
+### The status response
+
+`GET /api/v1/status`, captured from the same live server:
+
+```json
+{
+  "ready": true,
+  "degraded": false,
+  "warnings": [],
+  "dictionary": {
+    "entryCount": 30,
+    "source": "examples/governance/glossary.csv",
+    "indexedAt": "2026-08-20T01:33:09.809092+00:00"
+  },
+  "encoder": {
+    "provider": "BundledOnnxProvider",
+    "modelName": "bge-small-en-v1.5-onnx-int8 (bundled)",
+    "dimension": 384,
+    "tier": "bundled",
+    "bundledEncoderAvailable": true,
+    "fallbackInForce": false
+  },
+  "thresholds": {
+    "autoApprove": 0.87,
+    "review": 0.5,
+    "minConfidenceGap": 0.1,
+    "resultsPerField": 5,
+    "fusionAlpha": 0.9,
+    "minimumAchievableConfidence": 0.63,
+    "reviewThresholdBelowFloor": true
+  },
+  "limits": {
+    "maxFields": 100,
+    "maxBatchFields": 250,
+    "bodyByteCap": 9873024,
+    "deadlineSeconds": 25.0,
+    "capacity": 36
+  }
+}
+```
+
+Always **200**, including with no dictionary loaded — a pre-run degradation check that
+refused whenever the condition it reports on held would be unusable exactly when it is
+needed.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `ready` | `bool` | A dictionary is loaded and the match routes will answer. |
+| `degraded` | `bool` | Something is answerable but not as configured — read `warnings` for what. |
+| `warnings` | `object[]` | Zero or more `{code, message}` records. Empty list, never `null`. **Branch on `code`, never on `message`**: the codes are `NO_DICTIONARY`, `EMPTY_DICTIONARY` and `FALLBACK_ENCODER`; the message is human-readable and not part of the contract. |
+| `dictionary.entryCount` | `int` or `null` | Entries indexed. `null` — not `0` — when no dictionary is loaded, so "loaded and empty" stays distinguishable from "not loaded". |
+| `dictionary.source` | `string` or `null` | What `NEXUS_API_DICTIONARY` named, stamped at startup — the provenance of the numbers this server is producing. `null` when the matcher was handed over already indexed, in which case this server did not load it and cannot name a source. |
+| `dictionary.indexedAt` | `string` or `null` | UTC ISO-8601 instant the index was built. |
+| `encoder.provider` | `string` | The provider class actually in use. |
+| `encoder.modelName` | `string` | The model actually loaded. |
+| `encoder.dimension` | `int` | Embedding width. |
+| `encoder.tier` | `string` | Which tier of the preference order resolved — `bundled`, and the other tiers a deployment can land on. An open string, not an enum. |
+| `encoder.bundledEncoderAvailable` | `bool` | Whether the bundled int8 ONNX encoder could be loaded at all. |
+| `encoder.fallbackInForce` | `bool` | **`true` means this server is not scoring with the encoder its benchmarks were measured on.** Read it before comparing any number against a published one. |
+| `thresholds.*` | `float`/`int`/`bool` or `null` | The live matcher's numbers, not the shipped defaults. **Every threshold is nullable, and `null` means "this matcher does not expose it" — never `0.0`.** |
+| `thresholds.minimumAchievableConfidence` | `float` or `null` | The structural floor of rank-1 `confidence`, `semantic_weight × fusion_alpha`. |
+| `thresholds.reviewThresholdBelowFloor` | `bool` or `null` | `true` says `review_threshold` sits *under* that floor, so no rank-1 match can be `REJECT` on score alone. It is `true` at the shipped numbers, and it is the condition `absolute_score_floor` exists to answer. |
+| `limits.maxFields` | `int` | Cap on `/api/v1/match`. |
+| `limits.maxBatchFields` | `int` | Cap on `/api/v1/match/batch`. |
+| `limits.bodyByteCap` | `int` | Request bytes accepted before a **413**, derived from the field caps rather than typed as a literal. |
+| `limits.deadlineSeconds` | `float` | Wall-clock budget for one match before it is shed. |
+| `limits.capacity` | `int` | Concurrent + queued requests admitted before a **503**. |
+
+**`absoluteScoreFloor` is deliberately not here.** The `thresholds` block is the seven keys
+above and no floor; the active floor is published per response at
+`scoring.absoluteScoreFloor`. To read a deployment's floor without matching anything, send a
+one-field match and read `scoring`.
+
+### The retrieval diagnostic response
+
+`POST /api/v1/diag/retrieval` answers **why a field retrieved what it did**. It is retrieval
+only: it does not reproduce scoring, the decision, or reranking. Same server, one field,
+`top_k: 3`, `expected_governance_id: "GBF-0001"` — abbreviated here to the `dense` channel,
+with `sparse` and `fused` carrying the identical shape:
+
+```json
+{
+  "field": {"name": "legal_name", "path": "booking.passenger.legal_name", "doc": "Full legal name of the passenger as printed on the sailing manifest.", "type": "string"},
+  "queryText": "booking, passenger legal name Full legal name of the passenger as printed on the sailing manifest.",
+  "encoderModel": "bge-small-en-v1.5-onnx-int8 (bundled)",
+  "rerankerWired": false,
+  "channels": {
+    "dense": {
+      "available": true,
+      "detail": null,
+      "requestedTopK": 100,
+      "returned": 30,
+      "candidates": [
+        {"rank": 1, "governanceId": "GBF-0001", "businessName": "Passenger Legal Name", "score": 0.784332},
+        {"rank": 2, "governanceId": "GBF-0002", "businessName": "Passenger Date Of Birth", "score": 0.668792},
+        {"rank": 3, "governanceId": "GBF-0012", "businessName": "Boarding Pass Serial", "score": 0.650669}
+      ]
+    }
+  },
+  "expected": {
+    "governanceId": "GBF-0001",
+    "inDictionary": true,
+    "rankByChannel": {"dense": 1, "sparse": 1, "fused": 1}
+  }
+}
+```
+
+| Key | Type | Meaning |
+|---|---|---|
+| `field` | object | The field as parsed, echoed back. |
+| `queryText` | `string` | **The text that was actually embedded**, after the parent context is prepended and any expansion applied. The single most useful line here: most retrieval surprises are a query that does not say what the caller thought it said. |
+| `encoderModel` | `string` | The model that produced the dense scores in this body. |
+| `rerankerWired` | `bool` | Whether a reranker is configured. `false` means these channel orders *are* the retrieval order. |
+| `channels.{dense,sparse,fused}.available` | `bool` | Whether the channel ran. `false` with `detail` saying why. |
+| `channels.*.detail` | `string` or `null` | Why an unavailable channel did not run. `null` when it did. |
+| `channels.*.requestedTopK` | `int` or `null` | What this channel was asked for — `dense_top_k`, `sparse_top_k`. `null` on `fused`, which asks for nothing: it re-ranks what the two arms already returned. |
+| `channels.*.returned` | `int` | How many the channel actually produced — the **full** count, not the truncated candidate list. `returned` far below `requestedTopK` is the diagnosis. |
+| `channels.*.candidates` | object[] | `rank`, `governanceId`, `businessName`, `score`, truncated to `top_k`. |
+| `expected.governanceId` | `string` | The id you asked about. Block absent when you asked about none. |
+| `expected.inDictionary` | `bool` | Whether that id is indexed at all. `false` means the retrieval question is moot. |
+| `expected.rankByChannel` | object | Where that id landed per channel, or `null` for a channel that did not return it. |
+
+**Scores are each channel's own number and are not comparable across channels.** `dense`
+is the raw retrieval score — the same quantity as a candidate's `absoluteScore`, which is
+why 0.784332 here is 0.784332 there. `sparse` is a BM25 score on its own unbounded scale
+(33.7 above). `fused` is min-max normalised, so its rank 1 is 1.0 by construction and says
+nothing about quality. Compare ranks across channels; compare scores only within one.
 
 ### Published failure responses
 
@@ -547,6 +931,33 @@ answers to "whose class is this?" is worse than none.
 `MatchDecision` is a `str`-backed enum, so `result.decision == "AUTO_APPROVE"`,
 `result.decision.value` and `result.decision.name` all work. Prefer comparing against
 `MatchDecision.AUTO_APPROVE`.
+
+### `FieldDecision`
+
+`nexus_matcher.domain.models.entities.FieldDecision`. **Not re-exported from the package
+root** — import it from that path.
+
+A `str`-backed enum with four members: `AUTO_APPROVE`, `REVIEW`, `REJECT`, **`NO_MATCH`**.
+It is the verdict for a **field**, where `MatchDecision` is the verdict for a **candidate**.
+The first three spellings are shared with `MatchDecision` by contract; `NO_MATCH` is the
+member that closes the hole `MatchDecision` cannot express, and the reason the two enums are
+separate rather than one enum widened — widening `MatchDecision` would have sent a fourth
+value down a wire whose existing clients deserialise three.
+
+```python
+session = matcher.match_schema_session("customer.avsc")
+for path, verdict in session.field_decisions().items():
+    if verdict is FieldDecision.NO_MATCH:
+        ...   # inherit nothing, whatever session.results[path] contains
+```
+
+`field_decisions()` returns one entry per field in schema order, including fields with no
+candidates, which come back `NO_MATCH` rather than being dropped. It is derived through
+`derive_field_decision(matches, absolute_score_floor)` in the same module, so a library
+caller and an HTTP caller are reading the same rule and not two implementations of it.
+`MatchingSession.absolute_score_floor` carries the floor the session was matched under; over
+HTTP the same number is `scoring.absoluteScoreFloor`. Measuring one:
+[Calibrating the absolute score floor](guides/absolute_score_floor.md).
 
 ### `ScoreBreakdown`
 

@@ -36,6 +36,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from nexus_matcher.domain.models.entities import FieldDecision
 from nexus_matcher.shared.types.base import MatchDecision
 
 # =============================================================================
@@ -213,6 +214,13 @@ class GovernanceView(BaseModel):
     runner-up, and the class is what lets a reviewer see that rank 1 is a direct
     identifier and rank 2 is not.
 
+    THIS IS A CANDIDATE-LEVEL FACT, NOT AN INSTRUCTION TO INHERIT. It answers "what class
+    does the matched entry carry", which stays true whatever the field's verdict is. A
+    field whose `fieldDecisions` entry is `NO_MATCH` inherits NOTHING even though its
+    rank-1 candidate here may show a populated class -- the candidates on a NO_MATCH field
+    are evidence for a reviewer, not a classification. Read `fieldDecisions[path]` first;
+    it is the field-level authority and this is not.
+
     `code`, `name` and `classification` are deliberately typed `str` and NOT as an enum or
     a `Literal`. They carry the caller's own controlled vocabulary; closing them would
     hard-code one organisation's taxonomy into the schema a Java client generates from, and
@@ -277,8 +285,103 @@ class ExplainView(BaseModel):
     # service contradicts on its own fixture.
     absoluteCosine: float | None = Field(
         description=(
-            "Dense cosine similarity -- the only number here comparable ACROSS fields. "
-            "Null when the dense retriever did not return this candidate."
+            "THE SAME NUMBER as the candidate's `absoluteScore`, which is now present on "
+            "every candidate without `explain`. Kept, and kept identical, for clients "
+            "already reading it here; new clients should read `absoluteScore` and the "
+            "`scoring` block that says what metric produced it. The only number in this "
+            "object comparable ACROSS fields. Null when the dense retriever did not "
+            "return this candidate."
+        )
+    )
+
+
+class SourceMetadataView(BaseModel):
+    """
+    The dictionary entry's PASS-THROUGH PLANE: the deployment's own enrichment columns,
+    carried the length of the pipeline and never interpreted.
+
+    ## What it is for
+
+    A deployment's glossary carries columns this library has no opinion about -- a
+    steward, a review date, an upstream system's own identifier, a lifecycle token. The
+    loader is told which columns to carry (`metadata_columns=`, or every unmapped column
+    by default); they ride on the entry, through the index, and come back here. The
+    library never has to know what any of them MEAN, and the deployment never has to join
+    the response back against its own spreadsheet to find out.
+
+    ## The three rules a consumer may rely on
+
+    **NOTHING IN HERE IS READ.** No score, no ranking, no threshold and no governance
+    decision depends on a key or a value in this map. Two responses that differ only in
+    what these values say are identical everywhere else, byte for byte. That is the whole
+    bargain: the plane is carried BECAUSE it is not interpreted, and a library that
+    started branching on `values['...']` would be one specific enterprise's matcher
+    wearing a generic name.
+
+    **VALUES ARE THE CALLER'S OWN VOCABULARY, so they are open.** Deliberately not an
+    enum, not a `Literal` and not typed narrower than the source: the keys come from the
+    deployment's configuration and the values from its cells. Anything closed here would
+    hard-code one organisation's spreadsheet into the schema a client generates from.
+
+    **WHAT WENT IN COMES BACK.** No trimming, no case folding, no re-ordering, no
+    re-encoding: keys keep the order the loader wrote them in, and a string is the same
+    string. This body is ASCII-only (see `matching.DeterministicJSONResponse`), so a value
+    carrying a non-breaking space, an em-dash or an accent travels as its `\\uXXXX`
+    escape -- a JSON escape, not a substitution, so any conformant parser hands back the
+    original characters. Leading and trailing whitespace is significant and is preserved.
+
+    ## What is NOT in here
+
+    The loader writes four keys of its own into the same map (`ingest.
+    METADATA_RESERVED_KEYS`) and those are not the caller's enrichment, so they are not in
+    `values`. `metadata_truncated` is surfaced properly as `droppedKeyCount` below. The
+    other three are the loader's evidence about the SOURCE FILE -- the raw classification
+    text, the raw protection-code token and the per-row governance problems -- and they
+    stay on the library side of the boundary on purpose: the raw code token is the one
+    place a token the caller's vocabulary REFUSED survives, and publishing it beside
+    `governance.code` on a governance artifact is an invitation to apply a class nobody
+    defined. A library caller reads them off `DictionaryEntry.source_metadata`; the load
+    report counts them.
+    """
+
+    values: dict[str, Any] = Field(
+        description=(
+            "The deployment's own enrichment columns for the matched entry, in the order "
+            "the loader carried them, passed through untouched and never interpreted by "
+            "this library. Keys are the deployment's configured column names and values "
+            "are its cells, so BOTH are open: this library ships no taxonomy and cannot "
+            "enumerate either. Empty when the entry carries no pass-through columns -- "
+            "an empty object, never a missing key. Values are whatever the source held "
+            "(usually text; a JSON or Parquet glossary can hold numbers, booleans, nulls, "
+            "lists or nested objects), preserved as-is; anything JSON cannot represent "
+            "natively is rendered as text and named in `renderedKeys`."
+        )
+    )
+    droppedKeyCount: int = Field(
+        description=(
+            "How many pass-through keys the LOADER dropped from this entry to fit its "
+            "per-entry size cap (`metadata_max_bytes`, 1 KiB by default). 0 means this "
+            "map is the whole plane the source row supplied; any other number means "
+            "`values` is a BOUNDED SUBSEQUENCE of it and this response is not the place "
+            "to read that row from. It is a count and not a list of names because the "
+            "loader keeps the count -- the dropped names went with the dropped values. "
+            "The cap exists so a careless column mapping cannot rake an entire "
+            "spreadsheet row into the index; raise or lift it at load time if a "
+            "deployment needs wider rows, having measured its own."
+        )
+    )
+    renderedKeys: list[str] = Field(
+        description=(
+            "The keys of `values` whose value is the source value RENDERED AS TEXT rather "
+            "than the source value itself, in the same order they appear in `values`. "
+            "Empty for every source JSON can represent natively, which is every "
+            "delimited-text glossary. It is non-empty when a spreadsheet or database "
+            "column held something JSON has no form for -- a date or timestamp cell, a "
+            "decimal, a binary blob, a non-finite number -- in which case that key's "
+            "value is that object's text form and the exact original type is not "
+            "recoverable from this response. Named rather than silently coerced, and "
+            "rendered rather than refused, because one date column in a glossary must not "
+            "turn every match response into a 500."
         )
     )
 
@@ -305,7 +408,51 @@ class MatchCandidateView(BaseModel):
             "compared against the server's review threshold, so runner-ups are routinely "
             "REJECT on a field whose top match is fine. Only a REJECT at rank 1 means "
             "'no entry describes this field', and only that combination nulls "
-            "`governance`."
+            "`governance`. For the ONE verdict per column, read `fieldDecisions[path]` -- "
+            "this value cannot express 'nothing matched' (see `FieldDecision.NO_MATCH`)."
+        )
+    )
+    # APPENDED to the candidate object, after `decision`, because `CANDIDATE_KEYS` and
+    # their order are the contract a Java client generated against and appending is the
+    # only additive edit to a key order. `explain` is still emitted last, when asked for,
+    # so this key sits at a stable position whether or not `explain` was requested.
+    #
+    # `float | None`, not `float`: null when the dense retriever did not return this
+    # candidate at all, so a narrower published type would be a schema the service
+    # contradicts on its own fixture.
+    absoluteScore: float | None = Field(
+        description=(
+            "The RAW dense-retrieval score for this candidate, present on EVERY "
+            "candidate and not gated behind `explain`. The only number on a candidate "
+            "comparable ACROSS fields: `confidence` is min-max normalised within one "
+            "field's shortlist, so its floor is structural (see "
+            "`scoring.confidenceFloor`) and a terrible rank-1 match still scores above "
+            "it. This one has no floor. Identical to `explain.absoluteCosine`, which is "
+            "kept for clients already reading it. Read `scoring.absoluteScoreMetric` "
+            "before treating it as a cosine, and `scoring.absoluteScorePooledOverAliases` "
+            "before treating it as a similarity to the entry's own text. Null when the "
+            "dense retriever did not return this candidate -- it reached the shortlist "
+            "through the lexical arm alone -- which is not the same as zero."
+        )
+    )
+    # APPENDED after `absoluteScore` and BEFORE `explain`, which is the only position that
+    # is additive twice over: the nine keys before it are the shape a Java client has
+    # already generated against, and `explain` keeps its place as the last key of the
+    # object whether or not it was asked for. Same rule, same reason, as `absoluteScore`
+    # one member up and `enhancement` inside `governance`.
+    #
+    # Present on EVERY candidate, never null and never absent -- an entry with no
+    # pass-through columns gets an empty `values`. "This entry carries no enrichment" and
+    # "this response dropped it" must not look alike to a client whose pipeline is about
+    # to write these columns into its own model.
+    sourceMetadata: SourceMetadataView = Field(
+        description=(
+            "The deployment's own enrichment columns for the MATCHED ENTRY, carried "
+            "through the pipeline and never interpreted -- see `SourceMetadataView`. This "
+            "is a fact about the entry, not about the match: the identical object comes "
+            "back from `GET /api/v1/lookup/{id}` for the same id, so a caller can feed a "
+            "looked-up entry and a matched one into one code path. Present on every "
+            "candidate, with an empty `values` when the entry carries none."
         )
     )
     explain: ExplainView | None = None
@@ -346,20 +493,154 @@ class VocabularyView(BaseModel):
     )
 
 
+class ScoringContractView(BaseModel):
+    """
+    What each number in this response MEANS, shipped in the response that carries them.
+
+    The same instinct as `VocabularyView` one class up, and deliberately the same pattern
+    rather than a second one: that block ships the tier ordering so a client need not
+    hard-code somebody's taxonomy, and this block ships the scale contract so a client
+    need not read this library's source to learn whether a number may be compared against
+    a constant.
+
+    ## The contradiction this exists to settle
+
+    The library documents `confidence` as rank-relative and says do not threshold on it,
+    and then ships `auto_approve_threshold = 0.87`, which is a threshold on it. Both
+    cannot be right, and a consumer cannot tell which to believe. The resolution, stated
+    here in machine-readable form: `confidence` is comparable WITHIN one field -- rank 1
+    against rank 2 of the same field, and against a fixed cut point applied per field --
+    and is NOT a cross-field quality score, because min-max normalisation puts every
+    field's rank 1 at or above `confidenceFloor` whether the match is excellent or
+    absurd. `absoluteScore` is the number that is comparable across fields.
+
+    ## The scopes
+
+    `WITHIN_FIELD` -- two values may be compared only when they come from the same field.
+    `ACROSS_FIELDS` -- also comparable between two fields of the same response.
+    `ACROSS_RUNS` -- also comparable between responses.
+
+    Ordered narrowest first in `comparabilityScopesNarrowestFirst`, so a client can rank
+    them without hard-coding the order, and a wider scope implies the narrower ones.
+
+    **Nothing this library emits is `ACROSS_RUNS` today.** That is not an omission from
+    this block, it is the honest state of the art here: none of these numbers is
+    calibrated, so none behaves like a probability that a match is correct. `absoluteScore`
+    comes closest and is stable between runs only while the embedding model, the
+    dictionary and the vector store's metric are unchanged -- which is a precondition, not
+    a property of the number.
+    """
+
+    confidenceFloor: float | None = Field(
+        description=(
+            "The lowest `confidence` a rank-1 candidate can carry under this server's "
+            "configuration -- `semantic_weight * fusion_alpha`, which is 0.63 for the "
+            "shipped defaults. NEVER SET A CONFIDENCE THRESHOLD AT OR BELOW IT: it "
+            "selects nothing however bad the matches are, which is a filter that reports "
+            "'nothing to review' on a schema where nothing is trustworthy. This library "
+            "shipped exactly that defect once. Null means the floor does not hold or "
+            "could not be verified for this response -- a reranker replaces the fused "
+            "score with its own and the derivation lapses, and the value is also nulled "
+            "rather than published if any rank-1 confidence in THIS response sits below "
+            "it. A bound that is wrong about its own response is worse than no bound."
+        )
+    )
+    absoluteScoreFloor: float | None = Field(
+        description=(
+            "The `absoluteScore` beneath which this server reports a field as NO_MATCH, "
+            "or null when no floor is configured -- which is the default. This library "
+            "ships no floor and will not invent one: a floor is a statement about a score "
+            "distribution, and the distribution belongs to a dictionary and a set of "
+            "field names this library has never seen. While it is null, `fieldDecisions` "
+            "can only report NO_MATCH for a field that came back with no candidates at "
+            "all."
+        )
+    )
+    absoluteScoreMetric: str = Field(
+        description=(
+            "The distance metric the configured vector store declares, so a client never "
+            "has to ASSUME `absoluteScore` is a cosine. `cosine` under the shipped "
+            "wiring, in which case it is a genuine cosine similarity in [-1, 1]. A "
+            "deployment supplying its own store may report `dot` or `euclidean`, in which "
+            "case the number is monotone in similarity but is neither bounded nor a "
+            "cosine, and a floor chosen for one metric is meaningless under another. "
+            "`unknown` means the store declares nothing, which is NOT a synonym for "
+            "cosine. Free text from the store, deliberately not a closed set."
+        )
+    )
+    absoluteScorePooledOverAliases: bool = Field(
+        description=(
+            "True when this server indexes fabricated technical spellings of each "
+            "dictionary entry (`dictionary_alias_count` above zero). `absoluteScore` is "
+            "then the BEST score over an entry's spellings rather than the similarity to "
+            "the entry's own text, so an entry can look confident on a spelling that was "
+            "invented for it. False under the shipped configuration. Read it before "
+            "comparing an absoluteScore against a floor measured on a deployment where it "
+            "was the other value."
+        )
+    )
+    thresholdableAcrossFields: list[str] = Field(
+        description=(
+            "The response numbers a client may legitimately compare against a CONSTANT "
+            "across different fields. Everything absent from this list is comparable only "
+            "within one field, or not at all. Derived from `comparability`, and stated "
+            "separately because it is the one question a consumer actually has."
+        )
+    )
+    comparabilityScopesNarrowestFirst: list[str] = Field(
+        description=(
+            "The scale vocabulary, narrowest first, so a client can rank two scopes "
+            "without hard-coding the order. A wider scope implies every narrower one."
+        )
+    )
+    comparability: dict[str, str | None] = Field(
+        description=(
+            "One entry per numeric field this response can carry, keyed by its path in "
+            "the response body (`confidence`, `absoluteScore`, `explain.scores.lexical`, "
+            "...), naming the WIDEST scope over which two of its values may be compared. "
+            "Null means this server does not declare a scope for that number -- a signal "
+            "added after this contract was written -- and an undeclared number must not "
+            "be compared with anything."
+        )
+    )
+
+
 class MatchResponseView(BaseModel):
     """
     The whole response: one list per input field, keyed by the caller's own `path`.
 
     Every input path appears exactly once, in the order it was sent, whether or not
     anything matched it -- a field with no candidates gets an empty list, never a missing
-    key. That is the conservation law this endpoint is built around (NM-0005).
+    key. That is the conservation law this endpoint is built around (NM-0005), and it
+    holds for `fieldDecisions` too: the two maps carry the same keys in the same order.
     """
 
     results: dict[str, list[MatchCandidateView]]
     # Second, never first: `results` was the whole body and a Java client generated against
     # that shape must keep reading it at the same key. Appending is additive on the wire;
-    # reordering is not.
+    # reordering is not. Everything below is appended for the same reason.
     vocabulary: VocabularyView
+    fieldDecisions: dict[str, FieldDecision] = Field(
+        description=(
+            "ONE verdict per field, keyed and ordered exactly like `results`. This is the "
+            "value a consumer writes into a per-column decision, and it is published "
+            "rather than left to the client to derive, because a roll-up rule every "
+            "client reconstructs for itself is a contract nobody wrote down.\n\n"
+            "AUTO_APPROVE, REVIEW and REJECT are rank 1's own `decision`, passed through "
+            "unchanged. NO_MATCH is the state the per-candidate vocabulary cannot "
+            "express: rank-1 `confidence` has a structural floor (`scoring."
+            "confidenceFloor`, 0.63 shipped) above the server's review threshold (0.50), "
+            "so rank 1 can never be REJECT on score alone and every field would otherwise "
+            "come back at least REVIEW however irrelevant its best candidate is.\n\n"
+            "NO_MATCH means: this response carries nothing this field may inherit from. "
+            "Either the field came back with no candidates, or `scoring."
+            "absoluteScoreFloor` is configured and rank 1 does not clear it. The "
+            "candidates are still returned either way -- they are evidence for a reviewer, "
+            "not an inheritance -- so on NO_MATCH read THIS field, not `results[path][0]."
+            "governance`."
+        )
+    )
+    scoring: ScoringContractView
 
 
 class FeedbackResponseView(BaseModel):

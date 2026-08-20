@@ -4,7 +4,9 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.github.pierce_lonergan.nexusmatcher.model.Feedback;
 import io.github.pierce_lonergan.nexusmatcher.model.FieldSpec;
+import io.github.pierce_lonergan.nexusmatcher.model.LookupRequest;
 import io.github.pierce_lonergan.nexusmatcher.model.MatchRequest;
+import io.github.pierce_lonergan.nexusmatcher.model.RetrievalDiagnosticRequest;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
@@ -119,6 +121,46 @@ class RequestSerialisationTest {
         assertThrows(NullPointerException.class, () -> FieldSpec.of(null));
         assertThrows(IllegalArgumentException.class, () -> MatchRequest.of(List.of()));
         assertThrows(IllegalArgumentException.class, () -> FieldSpec.chunk(List.of(), 0));
+    }
+
+    @Test
+    @DisplayName("the diagnostic request is snake_case too, and omits the knobs it was not given")
+    void diagnosticRequestSpellsTheWireNames() throws Exception {
+        // This envelope is extra="forbid" on the server -- unlike MatchRequest -- so a wrong key
+        // here is a 422 rather than a silently defaulted knob, and an explicit null on `top_k`
+        // is refused because the server types it as an int with a default.
+        JsonNode full = mapper.valueToTree(
+                RetrievalDiagnosticRequest.of(FieldSpec.of("a", "t.a"), "GBF-0001").withTopK(3));
+
+        List<String> keys = new ArrayList<>();
+        full.fieldNames().forEachRemaining(keys::add);
+        assertEquals(List.of("field", "expected_governance_id", "top_k"), keys);
+        assertFalse(full.has("expectedGovernanceId"), "the wire name is snake_case here");
+
+        JsonNode minimal = mapper.valueToTree(RetrievalDiagnosticRequest.of(FieldSpec.of("a")));
+        List<String> minimalKeys = new ArrayList<>();
+        minimal.fieldNames().forEachRemaining(minimalKeys::add);
+        assertEquals(List.of("field"), minimalKeys);
+    }
+
+    @Test
+    @DisplayName("a lookup request emits its ids and refuses the two the server cannot answer")
+    void lookupRequestEmitsIdsAndRefusesTheUnanswerable() throws Exception {
+        JsonNode node = mapper.valueToTree(LookupRequest.of(List.of("GBF-0001", "GBF-0028")));
+
+        List<String> keys = new ArrayList<>();
+        node.fieldNames().forEachRemaining(keys::add);
+        assertEquals(List.of("ids"), keys);
+        assertEquals("GBF-0001", node.get("ids").get(0).asText());
+
+        // Refused locally because both are STRUCTURAL, not configured: the response is a map
+        // keyed by the id, so no deployment can answer a blank one or two of the same one. The
+        // length cap is a server number and is deliberately not mirrored -- see LookupIT.
+        assertThrows(IllegalArgumentException.class, () -> LookupRequest.of(List.of()));
+        assertThrows(IllegalArgumentException.class, () -> LookupRequest.of(List.of(" ")));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> LookupRequest.of(List.of("GBF-0001", "GBF-0001")));
     }
 
     @Test

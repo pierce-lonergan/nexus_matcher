@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import dataclass, field
-from typing import Any
+from enum import Enum
+from typing import TYPE_CHECKING, Any
 
 from nexus_matcher.domain.governance import ProtectionClass
 from nexus_matcher.shared.types.base import (
@@ -32,6 +33,9 @@ from nexus_matcher.shared.types.base import (
     Score,
     ScoreBreakdown,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 # =============================================================================
 # SCHEMA FIELD - Represents a field from any schema format
@@ -358,6 +362,158 @@ class MatchResult:
 
 
 # =============================================================================
+# FIELD-LEVEL VERDICT - one answer per column, including "nothing matched"
+# =============================================================================
+
+
+class FieldDecision(str, Enum):
+    """
+    ONE verdict per FIELD. `MatchDecision` is per CANDIDATE, and they are not the same
+    question.
+
+    A consumer of this library writes one decision per column -- into a metadata sheet, a
+    model attribute, a review queue. `MatchDecision` cannot answer that on its own for two
+    reasons:
+
+    **It is a per-candidate verdict.** Every rank is compared against `review_threshold`,
+    so runner-ups are routinely REJECT on a field whose top match is excellent. Rolling
+    that up is a rule, and a rule nobody wrote down is a rule every client guesses
+    differently.
+
+    **It has no way to say "nothing matched".** Measured on the shipped configuration:
+    `final_confidence` for rank 1 has a structural floor of `semantic_weight *
+    fusion_alpha` = 0.70 * 0.90 = **0.63**, and `review_threshold` is **0.50**. 0.63 > 0.50,
+    so a rank-1 candidate can never be REJECT on score alone and every field comes back at
+    least REVIEW. `NO_MATCH` is the member that closes that hole.
+
+    That is not a hypothetical. Measured 2026-08-19 on the shipped bundled encoder
+    (`bge-small-en-v1.5-onnx-int8`) over the 30-entry fictional glossary in
+    `examples/governance/`, all 26 fields of the pack's own schema:
+
+        rank-1 confidence      0.8058 .. 0.8958      not one below review_threshold
+        rank-1 absolute cosine 0.5830 .. 0.9688
+
+    The two fields the pack declares `expected_id: null` -- the ones for which NO glossary
+    term is a right answer -- score **0.5830** and **0.5943** absolute, and come back at
+    confidence 0.8058 and 0.8792. Every field that does have a right answer scores
+    **>= 0.7352** absolute. The confidence tells the two groups apart not at all; the
+    absolute score separates them with a gap of 0.14 and nothing in it.
+
+    ## Reading a floor off a fixture is how you get one that never fires
+
+    An earlier version of this docstring illustrated the same point with the field
+    `misc.zzz_unmatchable` in `tests/unit/presentation/api/_support.py` at an absolute
+    similarity of **0.123**, and that number is real -- re-measured 2026-08-19 at 0.1231,
+    confidence 0.7350. It is also a `BagOfTokensProvider` number: that fixture substitutes
+    a deterministic stand-in for the encoder precisely so a unit test need not load a
+    33 MB model, and a bag-of-tokens cosine between two texts sharing no tokens is near
+    zero in a way a sentence encoder's never is.
+
+    On the shipped encoder, total nonsense scores about **0.58**, not 0.12. A floor chosen
+    from the fixture's spread -- 0.30, say -- is below every score any real field will ever
+    produce, so it can never fire, and a caller who set it would believe they had
+    configured a safety net they do not have. The useful range on this encoder and this
+    pack is roughly 0.60 to 0.65; on another corpus it is another number, which is the
+    whole reason this library ships none. Calibrate against your own glossary, on the
+    encoder you will actually deploy, and read the spread before picking.
+
+    ## What NO_MATCH claims, exactly
+
+    *This response carries nothing this field may inherit from.* Two ways to earn it:
+
+      1. the field came back with **no candidates at all**; or
+      2. an **absolute floor is configured** (`MatchingConfig.absolute_score_floor`) and
+         rank 1 does not clear it.
+
+    Case 2 requires the caller to have chosen a floor. This library ships none and will
+    not invent one -- a floor is a statement about a score distribution, and the
+    distribution belongs to a corpus this library has never seen. With no floor
+    configured, case 2 never fires and `NO_MATCH` can only come from case 1.
+
+    Case 1 needs no calibration and is therefore not gated on the floor: the response
+    already says the candidate list is empty, and this only names the claim the response
+    was making anyway.
+
+    ## What NO_MATCH does NOT distinguish
+
+    An empty candidate list means "nothing came back", which is not quite the same as
+    "the dictionary holds nothing relevant" -- a retrieval or encoding failure inside
+    `_match_field` also produces an empty list. What it IS reliably distinguished from is
+    **"this field was not processed"**: a field decision exists for every field that was,
+    keyed the same way the results are, so a missing key means unprocessed and a present
+    `NO_MATCH` means processed-and-empty. That distinction is the reason the recommended
+    design returns candidates plus a verdict rather than an empty candidate list on its
+    own -- an empty list alone cannot tell the two apart.
+
+    ## Why this is a separate enum from `MatchDecision`
+
+    Two reasons, and only the first is about meaning.
+
+    A per-candidate REJECT ("this candidate is below the bar") and a per-field NO_MATCH
+    ("no candidate is worth inheriting from") are different claims about the world, and a
+    vocabulary that spells them the same way loses the difference.
+
+    And on the wire, `decision` is an enum a Java client has already generated a closed
+    Java `enum` from. Adding a value to it turns an ordinary 200 into a deserialisation
+    failure on a client built against last week's schema. A NEW field carrying a WIDER
+    vocabulary is additive; widening an existing one is not.
+
+    The three shared members are the rank-1 candidate's own `MatchDecision`, passed
+    through unchanged and spelled identically, which
+    `tests/unit/domain/test_field_decision.py` pins so the two cannot drift apart.
+    """
+
+    AUTO_APPROVE = "AUTO_APPROVE"
+    REVIEW = "REVIEW"
+    REJECT = "REJECT"
+    NO_MATCH = "NO_MATCH"
+
+
+def derive_field_decision(
+    matches: Sequence[MatchResult],
+    absolute_score_floor: float | None = None,
+) -> FieldDecision:
+    """
+    The one verdict for one field, derived from rank 1 and an optional absolute floor.
+
+    ONE implementation, so the HTTP surface, the CLI and a library caller cannot disagree
+    about what a field's decision is. A roll-up rule that lives in three places is three
+    rules.
+
+    `absolute_score_floor` is compared against rank 1's `ScoreBreakdown.absolute_cosine` --
+    the RAW dense score, which unlike `final_confidence` has no structural floor and is
+    the only number in the breakdown comparable across fields. `None` means no floor is
+    configured, which is the default and the only honest default for a library that has
+    never seen the caller's corpus.
+
+    A floor is configured and rank 1 has **no** absolute score -- the dense arm never
+    returned it, so it reached the shortlist through the lexical arm alone -- also gives
+    NO_MATCH. A candidate the dense retriever never proposed offers no evidence that it
+    clears an absolute similarity floor, and clearing a floor on evidence that does not
+    exist is the direction of this failure that costs a wrong classification rather than a
+    human review.
+
+    Reading `matches[0]` is deliberate and matches the domain's existing rule that a field
+    inherits from rank 1 only (see `MatchResult.__post_init__`). The sequence is assumed
+    to be in rank order, which is the order every producer in this package emits.
+    """
+    if not matches:
+        return FieldDecision.NO_MATCH
+
+    top = matches[0]
+    if absolute_score_floor is not None:
+        absolute = top.score_breakdown.absolute_cosine
+        if absolute is None or absolute < absolute_score_floor:
+            return FieldDecision.NO_MATCH
+
+    # `MatchDecision` and `FieldDecision` share these three spellings by contract, so the
+    # value carries across. Going through the VALUE rather than the name means a member
+    # `FieldDecision` does not have raises here instead of being silently mapped to
+    # something plausible.
+    return FieldDecision(top.decision.value)
+
+
+# =============================================================================
 # SCHEMA - Container for a complete schema
 # =============================================================================
 
@@ -425,6 +581,11 @@ class MatchingSession:
             (a reranker was wired, or the session was not built by `NexusMatcher`).
             Supplied by `NexusMatcher.match_schema_session`; see
             `MatchingConfig.minimum_achievable_confidence` for the derivation.
+        absolute_score_floor: The absolute-score floor beneath which a field is reported
+            `NO_MATCH`, or None when no floor is configured -- which is the default, and
+            the only default a library with no view of the caller's corpus may ship.
+            Supplied by `NexusMatcher.match_schema_session` from
+            `MatchingConfig.absolute_score_floor`.
     """
 
     session_id: EntityId
@@ -437,11 +598,33 @@ class MatchingSession:
     # hand -- every existing caller and test -- keeps working, at the cost of losing the
     # threshold check below, which is the honest trade: the floor genuinely is unknown.
     minimum_achievable_confidence: float | None = None
+    # Defaults to None -- no floor -- for the same reason `MatchingConfig` does: a floor
+    # is a calibration decision about a score distribution, and the distribution belongs
+    # to the caller's corpus.
+    absolute_score_floor: float | None = None
 
     @property
     def field_count(self) -> int:
         """Get number of fields matched."""
         return len(self.results)
+
+    def field_decisions(self) -> dict[str, FieldDecision]:
+        """
+        One verdict per field, in schema order -- the answer a consumer writes down.
+
+        Every result key appears exactly once, including a field nothing matched, which
+        gets `NO_MATCH` rather than being dropped. That is the conservation law applied to
+        the verdict: a field missing from this map would inherit nothing while nothing
+        said so.
+
+        Derived through `derive_field_decision` using this session's own
+        `absolute_score_floor`, so the numbers a library caller reads here and the ones an
+        HTTP caller reads over the wire come out of the same rule.
+        """
+        return {
+            path: derive_field_decision(matches, self.absolute_score_floor)
+            for path, matches in self.results.items()
+        }
 
     @property
     def total_matches(self) -> int:

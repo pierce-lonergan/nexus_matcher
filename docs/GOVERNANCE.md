@@ -85,6 +85,26 @@ The open tier is named by the caller (`open_classification`). Left unset it is t
 sentinel `UNCLASSIFIED`, which is deliberately not a word a real taxonomy uses, so an
 unconfigured vocabulary cannot be mistaken for a configured one.
 
+**Where a consumer reads this rule.** "The match was not accepted" is a verdict about the
+*field*, and the field is where it is published:
+
+| Reading from | Key | Note |
+|---|---|---|
+| HTTP | `fieldDecisions[path]` | One verdict per column, same keys and order as `results`. |
+| Python | `session.field_decisions()[path]` | From `match_schema_session`; a method, not a property. Returns `FieldDecision`. |
+
+Both take four values — `AUTO_APPROVE`, `REVIEW`, `REJECT` and **`NO_MATCH`** — and
+`NO_MATCH` is this rule stated on the wire: *this response carries nothing this field may
+inherit*. It is a **per-field** verdict and has no per-candidate equivalent: the `decision`
+on a candidate has only the first three values, and its `REJECT` says "this candidate is
+below the bar", which is a different claim.
+
+The candidates on a `NO_MATCH` field are still returned and still carry their class. They
+are evidence for a reviewer, not a classification — **read `fieldDecisions[path]` first, and
+on `NO_MATCH` inherit nothing regardless of what `results[path][0].governance` says.** A
+captured example, and the reason `REJECT` alone cannot carry this,
+are [under `fieldDecisions` below](#where-rule-3-is-published-fielddecisions).
+
 ### 4. Unknown codes are rejected; legacy tokens are declared
 
 A code the vocabulary does not define is not a class. It is never stored — a field
@@ -194,6 +214,15 @@ Two consequences that matter for governance, both demonstrated in the example pa
 What separated the bad matches from the good ones on that pack was the **margin over the
 runner-up** (`min_confidence_gap`), not the confidence.
 
+**The number that *is* comparable across fields is `absolute_cosine`** —
+`absoluteScore` on the wire, `ScoreBreakdown.absolute_cosine` in Python. It is the raw
+retrieval score, before any per-field normalisation, so it has no structural floor and can
+be compared against a constant. Setting `MatchingConfig.absolute_score_floor` turns a
+rank-1 below that constant into `NO_MATCH`, which is the missing verdict this section is
+otherwise describing the absence of. It ships **off**, and choosing a value for it is a
+measurement on your own corpus, not a number to copy:
+[docs/guides/absolute_score_floor.md](guides/absolute_score_floor.md).
+
 ## Matching over HTTP
 
 Everything above is reachable over HTTP. `create_app()` registers `POST /api/v1/match`,
@@ -295,7 +324,8 @@ curl -s -X POST http://127.0.0.1:8000/api/v1/match \
   -d '{"fields":[{"name":"legal_name","path":"booking.passenger.legal_name","doc":"Full legal name of the passenger as printed on the sailing manifest.","type":"string"}],"top_k":1}'
 ```
 
-Against the ferry pack, pretty-printed here — the response is one line, and two identical
+Against the ferry pack, captured from a live app on 2026-08-19 and pasted here unedited
+except for pretty-printing. The response is one line, ASCII-only, and two identical
 requests produce identical bytes:
 
 ```json
@@ -317,13 +347,59 @@ requests produce identical bytes:
           "enhancement": "MASK_IN_LOGS"
         },
         "confidence": 0.904167,
-        "decision": "AUTO_APPROVE"
+        "decision": "AUTO_APPROVE",
+        "absoluteScore": 0.784332,
+        "sourceMetadata": {
+          "values": {
+            "personal_information": "yes",
+            "direct_identifier": "yes"
+          },
+          "droppedKeyCount": 0,
+          "renderedKeys": []
+        }
       }
     ]
   },
   "vocabulary": {
     "openClassification": "OPEN_DECK",
-    "tiersMostOpenFirst": ["OPEN_DECK", "CREW_ONLY", "BRIDGE_SENSITIVE", "SEALED_RESTRICTED"]
+    "tiersMostOpenFirst": [
+      "OPEN_DECK",
+      "CREW_ONLY",
+      "BRIDGE_SENSITIVE",
+      "SEALED_RESTRICTED"
+    ]
+  },
+  "fieldDecisions": {
+    "booking.passenger.legal_name": "AUTO_APPROVE"
+  },
+  "scoring": {
+    "confidenceFloor": 0.63,
+    "absoluteScoreFloor": null,
+    "absoluteScoreMetric": "cosine",
+    "absoluteScorePooledOverAliases": false,
+    "thresholdableAcrossFields": [
+      "absoluteScore",
+      "explain.absoluteCosine",
+      "explain.scores.lexical",
+      "explain.scores.editDistance",
+      "explain.scores.type",
+      "explain.scores.domain"
+    ],
+    "comparabilityScopesNarrowestFirst": [
+      "WITHIN_FIELD",
+      "ACROSS_FIELDS",
+      "ACROSS_RUNS"
+    ],
+    "comparability": {
+      "confidence": "WITHIN_FIELD",
+      "absoluteScore": "ACROSS_FIELDS",
+      "explain.absoluteCosine": "ACROSS_FIELDS",
+      "explain.scores.fusedRetrieval": "WITHIN_FIELD",
+      "explain.scores.lexical": "ACROSS_FIELDS",
+      "explain.scores.editDistance": "ACROSS_FIELDS",
+      "explain.scores.type": "ACROSS_FIELDS",
+      "explain.scores.domain": "ACROSS_FIELDS"
+    }
   }
 }
 ```
@@ -337,6 +413,90 @@ contract: a field cannot silently vanish from the map and inherit nothing unnoti
 vocabulary's own strings — the library defines none of them and does not type any of them
 as a closed set, so a generated client gets `String` and not an enum of somebody else's
 tiers. `enhancement` is `null` on a class that declares none.
+
+`sourceMetadata` is your glossary's own enrichment columns for the matched entry, carried
+through untouched. It is not governance and nothing in the library reads it.
+
+### Where rule 3 is published: fieldDecisions
+
+```json
+"fieldDecisions": {
+  "booking.passenger.legal_name": "AUTO_APPROVE"
+}
+```
+
+Same keys as `results`, same order, **one verdict per column** — and this is the value that
+decides whether the field inherits anything. `results[path][0].decision` is a statement
+about a *candidate*.
+
+Four values: `AUTO_APPROVE`, `REVIEW`, `REJECT` and **`NO_MATCH`**, and the fourth exists
+only here. `NO_MATCH` means *this response carries nothing this field may inherit* — either
+the field came back with no candidates at all, or an
+[absolute score floor](guides/absolute_score_floor.md) is configured and rank 1 does not
+clear it.
+
+**On `NO_MATCH`, inherit nothing — however authoritative `results[path][0].governance`
+looks.** The candidates are still returned and still carry their class, because a reviewer
+needs to see what the matcher found. They are evidence, not a classification. Captured from
+a live server with `absolute_score_floor` set to 0.70, sending one field the ferry glossary
+answers and one it cannot:
+
+```json
+{
+  "results": {
+    "telemetry.quasar_flux_index": [
+      {
+        "rank": 1,
+        "governanceId": "GBF-0022",
+        "businessName": "Vessel Heading Degrees",
+        "definition": "The compass heading a vessel reported at the last telemetry ping.",
+        "domain": "Voyage",
+        "governance": {
+          "code": "VESSEL_TELEMETRY",
+          "name": "Vessel operational telemetry",
+          "classification": "CREW_ONLY",
+          "personalInformation": false,
+          "directIdentifier": false,
+          "enhancement": null
+        },
+        "confidence": 0.823333,
+        "decision": "REVIEW",
+        "absoluteScore": 0.586716,
+        "sourceMetadata": {
+          "values": {
+            "personal_information": "no",
+            "direct_identifier": "no"
+          },
+          "droppedKeyCount": 0,
+          "renderedKeys": []
+        }
+      }
+    ]
+  },
+  "fieldDecisions": {
+    "booking.passenger.legal_name": "AUTO_APPROVE",
+    "telemetry.quasar_flux_index": "NO_MATCH"
+  },
+  "scoring": {
+    "absoluteScoreFloor": 0.7,
+    "absoluteScoreMetric": "cosine"
+  }
+}
+```
+
+A consumer reading only `results` would tag a quasar telemetry column `CREW_ONLY` on a
+candidate with a confidence of 0.82. That is rule 5 — over-inheriting is the expensive
+error — happening silently, and `fieldDecisions` is the key that stops it.
+
+**`REJECT` is unreachable for a rank-1 match at the shipped numbers**, which is why the
+floor exists. `confidence` is min-max normalised inside one field's shortlist, so it has a
+structural floor of `semantic_weight × fusion_alpha` = 0.63 (published as
+`scoring.confidenceFloor`) sitting above `review_threshold` = 0.50. No lowering of
+`review_threshold` recovers "nothing matched"; the floor moves with the weights and the
+threshold does not move with it. `absolute_score_floor` is compared against
+`absoluteScore` — the raw retrieval score, which has no such floor — and it ships **off**,
+because a floor is a statement about a score distribution and the distribution belongs to
+your glossary. [Measuring one](guides/absolute_score_floor.md).
 
 ### `vocabulary`, and why a `null` needs it
 
@@ -382,6 +542,13 @@ regime change, not a scaling factor: one option in this library measures +1.9 P@
 entries and −18.8 at 30,000. Calibrate against your own glossary, at its size, and
 re-calibrate after any change to the encoder, the fusion weights, the query representation
 or the glossary itself.
+
+This applies with full force to `absolute_score_floor`, which is why the library ships no
+value for it. Measured against this repository's own ferry pack, the *same* 30-entry
+glossary, the *same* encoder and the *same* route gave a 0.07-wide band of free choice for
+one field set and a 0.0027-wide illusion of one for another — the two differed only in
+whether the fields carried descriptions. Both measurements, and the procedure that produced
+them, are in [docs/guides/absolute_score_floor.md](guides/absolute_score_floor.md).
 
 ## Getting started
 

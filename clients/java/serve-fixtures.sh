@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
-# Start the three services `mvn verify` needs. Run from the repository root.
+# Start the four services `mvn verify` needs. Run from the repository root.
 #
 #     ./clients/java/serve-fixtures.sh
 #
-# Three, not one, because three of the behaviours the client has to get right are properties
+# Four, not one, because four of the behaviours the client has to get right are properties
 # of a server's CONFIGURATION rather than of a request, and none of them can be provoked
 # against a correctly configured one:
 #
 #   8000  the example pack, loaded            everything normal
 #   8001  no dictionary at all                every match is a real 503
 #   8002  the pack with a 1 ms deadline       every match is a real 504
+#   8003  the pack + an absolute-score floor  NO_MATCH is reachable
 #
-# Ctrl-C stops all three. PIDs are also written to clients/java/.fixture-pids.
+# 8003 is the newest and the least obvious. `fieldDecisions` can report NO_MATCH two ways: a
+# field that came back with no candidates, and a field whose rank-1 absolute score does not
+# clear a configured floor. The library SHIPS NO FLOOR and will not invent one, so on 8000 the
+# second way can never fire and the first does not occur against a 30-entry glossary -- which
+# means the whole verdict would go untested against a live service. 8003 configures a floor so
+# that it does. See clients/java/fixture-absolute-floor.json for the number and why it is that
+# number; it is a test fixture, not a recommended default.
+#
+# Ctrl-C stops all four. PIDs are also written to clients/java/.fixture-pids.
 set -euo pipefail
 
 if [[ ! -f examples/governance/glossary.csv ]]; then
@@ -50,6 +59,7 @@ trap cleanup EXIT INT TERM
 
 DICT="NEXUS_API_DICTIONARY=examples/governance/glossary.csv"
 VOCAB="NEXUS_API_GOVERNANCE=examples/governance/protection_classes.json"
+FLOOR="NEXUS_API_MATCHING_CONFIG=clients/java/fixture-absolute-floor.json"
 
 # The pack, served normally.
 start_fixture 8000 "$DICT" "$VOCAB" \
@@ -61,11 +71,16 @@ start_fixture 8001
 # The pack with a deadline shorter than a match takes, so every match answers 504.
 start_fixture 8002 "$DICT" "$VOCAB" NEXUS_API_DEADLINE_SECONDS=0.001
 
+# The pack with an absolute-score floor configured, so a field the glossary does not describe
+# earns a NO_MATCH field decision -- with its candidates still attached, which is the half a
+# client gets wrong.
+start_fixture 8003 "$DICT" "$VOCAB" "$FLOOR"
+
 printf '%s\n' "${PIDS[@]}" > clients/java/.fixture-pids
 
 echo
-echo "Waiting for 8000 and 8002 to load their encoder..."
-for port in 8000 8002; do
+echo "Waiting for 8000, 8002 and 8003 to load their encoder..."
+for port in 8000 8002 8003; do
     for _ in $(seq 1 120); do
         if curl -fsS -m 2 "http://127.0.0.1:${port}/health/ready" > /dev/null 2>&1; then
             echo "  ${port} ready"
@@ -77,5 +92,5 @@ done
 
 echo
 echo "Now, in another shell:  cd clients/java && mvn verify"
-echo "Ctrl-C here stops all three."
+echo "Ctrl-C here stops all four."
 wait

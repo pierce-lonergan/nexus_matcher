@@ -56,6 +56,20 @@ CANDIDATE_KEYS = (
     "governance",
     "confidence",
     "decision",
+    # Last, and appended rather than inserted, for the same reason `enhancement` is last
+    # inside `governance`: the eight before it are the shape a Java client has already
+    # generated against. It is the raw dense score, promoted out of the optional `explain`
+    # block because it is the only number on a candidate comparable ACROSS fields --
+    # `confidence` is min-max normalised per field and has a structural floor above the
+    # review threshold, so a rank 1 that matches nothing still scores well.
+    "absoluteScore",
+    # Appended after it, and still before `explain`, which stays the object's last key
+    # whenever it is present. The deployment's own pass-through columns for the matched
+    # entry: they reached the index and stopped there, so a deployment could send its own
+    # glossary through this service and get none of its own columns back. Its contract --
+    # the byte-for-byte round trip, the truncation marker, and the rule that nothing in
+    # this library reads it -- is pinned in `test_metadata_plane.py`.
+    "sourceMetadata",
 )
 
 GOVERNANCE_KEYS = (
@@ -72,7 +86,10 @@ GOVERNANCE_KEYS = (
 # The top level, which was `results` alone. `vocabulary` is what makes a `governance` of
 # null readable -- it names the tier an uncoded field sits at -- and it is second because
 # appending is the only additive edit to a key order that is itself the contract.
-RESPONSE_KEYS = ("results", "vocabulary")
+# `fieldDecisions` and `scoring` are appended for the same reason: the first is the one
+# verdict per column a consumer writes down, the second is what the numbers beside it
+# mean. Their contract is pinned in `test_score_contract.py`.
+RESPONSE_KEYS = ("results", "vocabulary", "fieldDecisions", "scoring")
 
 
 def client_for(matcher: object, **kwargs: object) -> TestClient:

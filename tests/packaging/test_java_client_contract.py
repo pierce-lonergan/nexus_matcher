@@ -92,6 +92,8 @@ _SCHEMA_TO_JAVA = {
     "GovernanceView": "model/Governance.java",
     "VocabularyView": "model/Vocabulary.java",
     "MatchResponseView": "model/MatchResponse.java",
+    "ScoringContractView": "model/ScoringContract.java",
+    "SourceMetadataView": "model/SourceMetadata.java",
     "ExplainView": "model/Explain.java",
     "FieldSpec": "model/FieldSpec.java",
     "MatchRequest": "model/MatchRequest.java",
@@ -99,6 +101,25 @@ _SCHEMA_TO_JAVA = {
     "FeedbackResponseView": "model/FeedbackReceipt.java",
     "HealthResponse": "model/HealthStatus.java",
     "ReadinessResponse": "model/Readiness.java",
+    # The lookup plane.
+    "LookupRequest": "model/LookupRequest.java",
+    "LookupEntryView": "model/LookupEntry.java",
+    "LookupResponseView": "model/LookupResponse.java",
+    # GET /api/v1/status. The Java names drop the `View` suffix, which is a server-side
+    # naming convention rather than part of the contract, and `StatusResponseView` becomes
+    # `ServiceStatus` because `Status` alone collides with half of every Java codebase.
+    "StatusResponseView": "model/ServiceStatus.java",
+    "StatusWarningView": "model/StatusWarning.java",
+    "DictionaryStatusView": "model/DictionaryStatus.java",
+    "EncoderStatusView": "model/EncoderStatus.java",
+    "ThresholdsView": "model/Thresholds.java",
+    "ServiceLimitsView": "model/ServiceLimits.java",
+    # POST /api/v1/diag/retrieval.
+    "RetrievalDiagnosticRequest": "model/RetrievalDiagnosticRequest.java",
+    "RetrievalDiagnosticView": "model/RetrievalDiagnostic.java",
+    "RetrievalChannelView": "model/RetrievalChannel.java",
+    "RetrievalCandidateView": "model/RetrievalCandidate.java",
+    "ExpectedPlacementView": "model/ExpectedPlacement.java",
 }
 
 # The error envelope is NOT a record on the Java side -- it is decoded straight into the
@@ -118,6 +139,44 @@ _NOT_RESTATED_AS_A_RECORD = {
     "ErrorDetail": "carried by the NexusMatcherException hierarchy, not a record",
     "ErrorResponse": "carried by the NexusMatcherException hierarchy, not a record",
     "MatchDecision": "an enum; see test_every_match_decision_value_exists_in_the_java_enum",
+    "FieldDecision": "an enum; see test_every_match_decision_value_exists_in_the_java_enum",
+}
+
+
+# =============================================================================
+# THE PUBLISHED ENUMS
+# =============================================================================
+
+# Published enum schema -> (Java file, Java enum name). Every enum the service publishes has
+# to appear here; `test_every_match_decision_value_exists_in_the_java_enum` fails on one that
+# does not, because a closed Java enum bound to a vocabulary nobody is watching is the exact
+# shape of the deserialisation break this file exists to prevent.
+_SCHEMA_TO_JAVA_ENUM = {
+    "MatchDecision": ("model/MatchDecision.java", "MatchDecision"),
+    "FieldDecision": ("model/FieldDecision.java", "FieldDecision"),
+}
+
+# Constants the Java enum declares that the service does NOT publish, with the reason.
+#
+# There is exactly one, and it carries the client's answer to the question this whole seam
+# exists for: what happens when a newer server sends a value an older client has never heard
+# of. `MatchDecision` answers "refuse the response", which is right for a vocabulary the
+# service has committed to freezing -- putting NO_MATCH on a NEW enum rather than widening
+# that one IS that commitment. `FieldDecision` answers "degrade to UNKNOWN, keep the raw
+# string, grant nothing", which is right for the vocabulary that was born by widening and is
+# where the next verdict will land.
+#
+# The membership test below is the sharp half. If the service ever publishes a FieldDecision
+# value literally spelled UNKNOWN, this gate goes red -- because at that moment the client's
+# sentinel would silently start absorbing a real server verdict, and "this client could not
+# read your answer" would become indistinguishable from the answer itself.
+_CLIENT_SIDE_ENUM_SENTINELS = {
+    "FieldDecision": {
+        "UNKNOWN": (
+            "the client-side sentinel for a verdict this build does not know. Never on the "
+            "wire; FieldVerdict.wireValue() carries what the server actually sent."
+        )
+    },
 }
 
 
@@ -164,13 +223,26 @@ def _wire_names(source: str) -> set[str]:
 
 
 def _enum_constants(source: str, enum_name: str) -> set[str]:
-    """The constants declared by `enum <enum_name>`, up to the first `;` or `}`."""
-    match = re.search(rf"enum\s+{enum_name}\s*\{{(.*?)(?:;|\}})", source, re.DOTALL)
+    """
+    The constants declared by `enum <enum_name>`, up to the first `;` or `}`.
+
+    Comments are stripped BEFORE the body is located rather than after it, and the difference
+    is not cosmetic. A javadoc on a constant routinely contains `{@link Foo#bar()}` or
+    `{@code x}`, so a scan that hunts for the enum's closing brace in the raw source stops at
+    the first brace inside a comment and reads only the constants above it.
+
+    That under-read is loud in one direction -- a published value then looks undeclared and
+    the gate goes red -- and SILENT in the other: the check for Java-side constants the
+    service does not publish is a difference against `declared`, so an under-read makes it
+    pass over every constant it never saw. `FieldDecision` has both long javadocs and a
+    documented client-side sentinel, so it is the case that found this.
+    """
+    stripped = re.sub(r"/\*.*?\*/", " ", source, flags=re.DOTALL)
+    stripped = re.sub(r"//[^\n]*", " ", stripped)
+    match = re.search(rf"enum\s+{enum_name}\s*\{{(.*?)(?:;|\}})", stripped, re.DOTALL)
     if match is None:
         return set()
-    body = re.sub(r"/\*.*?\*/", " ", match.group(1), flags=re.DOTALL)
-    body = re.sub(r"//[^\n]*", " ", body)
-    return set(re.findall(r"\b([A-Z][A-Z0-9_]{2,})\b", body))
+    return set(re.findall(r"\b([A-Z][A-Z0-9_]{2,})\b", match.group(1)))
 
 
 def _mapped_statuses(source: str) -> set[int]:
@@ -305,20 +377,76 @@ def test_the_error_envelope_is_carried_by_the_exception_type():
 @pytest.mark.skipif(_CLIENT_ABSENT, reason=_ABSENT_REASON)
 def test_every_match_decision_value_exists_in_the_java_enum():
     """
-    `MatchDecision` is the ONE closed vocabulary in this client -- it is the library's own,
-    not a caller's taxonomy -- so it is the one place a Java enum is correct, and the one
-    place a new server value would throw on decode rather than degrade.
+    Every published enum, against the Java enum that binds it.
+
+    The library's own vocabularies -- `MatchDecision` and `FieldDecision` -- are the only
+    closed sets in this client, and they are closed because they are ITS words rather than a
+    caller's taxonomy. Everything that comes out of somebody's controlled vocabulary
+    (`GovernanceView.code`, `classification`, `EncoderStatusView.tier`,
+    `ScoringContractView.absoluteScoreMetric`, `StatusWarningView.code`) is an open string on
+    both sides and must stay one.
+
+    A value the Java enum does not declare is the failure this file exists for: a Java enum
+    refuses an unknown constant on decode, so ONE new value costs the whole response rather
+    than one field.
+
+    The name still says `match_decision` and now the body walks every published enum. Kept
+    deliberately: `tests/packaging/conftest.py` declares this directory's opt-in skips by
+    NODEID, so renaming the function here would silently un-declare its skip in a checkout
+    without `clients/java/` -- a rename that switches a gate off is exactly the vacuity this
+    file is written against. Renaming it is a two-file change and belongs with whoever owns
+    the conftest.
     """
-    published = set(_openapi()["components"]["schemas"]["MatchDecision"]["enum"])
-    assert published, "MatchDecision publishes no values; this comparison proves nothing"
+    schemas = _openapi()["components"]["schemas"]
+    published_enums = {
+        name: set(schema["enum"]) for name, schema in schemas.items() if "enum" in schema
+    }
+    assert published_enums, "no enums are published; this comparison proves nothing"
 
-    declared = _enum_constants(_java("model/MatchDecision.java"), "MatchDecision")
-    missing = published - declared
+    unwatched = set(published_enums) - set(_SCHEMA_TO_JAVA_ENUM)
+    assert not unwatched, (
+        f"these published enums are bound by no entry in _SCHEMA_TO_JAVA_ENUM, so nothing "
+        f"checks whether the Java client can decode their values: {sorted(unwatched)}"
+    )
 
-    assert not missing, (
-        f"the service publishes MatchDecision values the Java enum does not declare: "
-        f"{sorted(missing)} (Java declares {sorted(declared)}). A response carrying one of "
-        f"these fails to decode, so the whole match is lost rather than one field."
+    findings: list[str] = []
+    for schema_name, published in sorted(published_enums.items()):
+        java_file, enum_name = _SCHEMA_TO_JAVA_ENUM[schema_name]
+        declared = _enum_constants(_java(java_file), enum_name)
+
+        missing = published - declared
+        if missing:
+            findings.append(
+                f"{schema_name} -> {java_file}: the service publishes {sorted(missing)} and "
+                f"the Java enum does not declare them (it declares {sorted(declared)}). A "
+                f"response carrying one fails to decode."
+            )
+
+        # Extra constants are allowed only where this file has written down what they are
+        # for. An undeclared extra is a client-side value somebody added without saying what
+        # it means, which is how a sentinel quietly becomes a guess.
+        sentinels = _CLIENT_SIDE_ENUM_SENTINELS.get(schema_name, {})
+        undeclared_extras = declared - published - set(sentinels)
+        if undeclared_extras:
+            findings.append(
+                f"{schema_name} -> {java_file}: the Java enum declares "
+                f"{sorted(undeclared_extras)}, which the service does not publish and "
+                f"_CLIENT_SIDE_ENUM_SENTINELS does not explain."
+            )
+
+        # And the sharp one: a sentinel that the server has started publishing is no longer
+        # a sentinel, it is a real verdict wearing the client's "I could not read that" hat.
+        collided = set(sentinels) & published
+        if collided:
+            findings.append(
+                f"{schema_name}: {sorted(collided)} is declared as a CLIENT-SIDE sentinel in "
+                f"{java_file} and the service now publishes it as a real value. The Java "
+                f"client would read a genuine server verdict as 'this build did not "
+                f"understand you'. Rename the sentinel."
+            )
+
+    assert not findings, "the published enums and the Java enums disagree:\n  " + "\n  ".join(
+        findings
     )
 
 
@@ -403,6 +531,14 @@ def test_the_java_source_parsers_are_not_vacuous():
         f"the enum scan no longer reads MatchDecision.java; it found {sorted(decisions)}"
     )
 
+    # The second published enum, and the sentinel that is the client's answer to an unknown
+    # value. Asserted here as well as in the gate above, because the gate's sentinel check is
+    # a SUBSET test and a parser that stopped seeing UNKNOWN would satisfy it vacuously.
+    field_decisions = _enum_constants(_java("model/FieldDecision.java"), "FieldDecision")
+    assert {"AUTO_APPROVE", "REVIEW", "REJECT", "NO_MATCH", "UNKNOWN"} <= field_decisions, (
+        f"the enum scan no longer reads FieldDecision.java; it found {sorted(field_decisions)}"
+    )
+
     statuses = _mapped_statuses(_java("error/NexusMatcherException.java"))
     assert {413, 422, 500, 503, 504} <= statuses, (
         f"the switch scan no longer reads NexusMatcherException.java; it found {sorted(statuses)}"
@@ -417,6 +553,15 @@ def test_the_java_source_parsers_are_not_vacuous():
         "AUTO_APPROVE",
         "REVIEW",
     }
+    assert _enum_constants("enum FieldDecision { AUTO_APPROVE }", "FieldDecision") == {
+        "AUTO_APPROVE"
+    }, "the enum scan must be able to see a FieldDecision that is missing NO_MATCH"
+    assert _enum_constants(
+        "enum E { /** {@link Foo#bar()} */ FIRST, /* {@code x} */ SECOND }", "E"
+    ) == {"FIRST", "SECOND"}, (
+        "a brace inside a javadoc must not end the enum body: reading only FIRST here would "
+        "make the client-side-sentinel check pass over every constant it failed to see"
+    )
     assert _mapped_statuses("case 400, 422 -> a; case 413 -> b; default -> c;") == {400, 422, 413}
     assert _mapped_statuses("default -> c;") == set(), (
         "the default arm must not count as a mapped status, or this gate passes for a "
