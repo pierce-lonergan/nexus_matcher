@@ -29,6 +29,7 @@ from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import numpy as np
@@ -53,7 +54,10 @@ from nexus_matcher.domain.ports import (
 from nexus_matcher.domain.ports.dictionary_loader import ColumnMapping, LoadStatistics
 from nexus_matcher.domain.ports.retrieval import RerankCandidate, SparseDocument
 from nexus_matcher.domain.ports.vector_store import SearchResult, VectorDocument, VectorStoreConfig
-from nexus_matcher.domain.services.abbreviation import AbbreviationExpander
+from nexus_matcher.domain.services.abbreviation import (
+    AbbreviationDictionary,
+    AbbreviationExpander,
+)
 from nexus_matcher.domain.services.alias_generation import expand_dictionary
 from nexus_matcher.domain.services.context_enricher import (
     HIERARCHY_SEPARATOR,
@@ -630,6 +634,237 @@ def field_result_key(field: SchemaField) -> str:
 
 
 # =============================================================================
+# QUERY-SIDE SIGNAL CHANNEL
+# =============================================================================
+
+# The canonical name of each signal THIS library interprets. Everything else a caller
+# sends through the channel is carried and ignored -- see `QuerySignals.from_mapping`.
+#
+# Published as constants rather than spelled out at each use, because the presentation
+# layer documents these names on the wire and a divergence between "what the schema says
+# we read" and "what we read" is one of the failures this channel exists to remove.
+QUERY_SIGNAL_ABBREVIATIONS = "abbreviations"
+QUERY_SIGNAL_ENTITY = "entity"
+QUERY_SIGNAL_DOMAIN = "domain"
+
+# Where a single field's own signals live, when they differ from the request's.
+#
+# NAMESPACED ON PURPOSE. `SchemaField.source_metadata` is a shared bag -- it already holds
+# `flattened_name`, and `_calculate_domain_score` has always read a bare `domain` key out
+# of it. Reading signals from bare keys would silently reinterpret data an existing caller
+# already puts there, which is precisely the class of change that cannot be shown to be
+# behaviour-preserving. One nested key can be.
+QUERY_SIGNALS_METADATA_KEY = "query_signals"
+
+# Every name the three signals answer to, canonical first, in the order a lookup tries
+# them. Aliases exist because the channel's purpose is to let a deployment supply context
+# it already has under the name it already calls it; refusing a request over a synonym
+# would be the same 422 this design exists to remove, one level down. Precedence is
+# declared rather than incidental: a caller who sends both `domain` and `namespace` meant
+# the more specific one.
+QUERY_SIGNAL_ALIASES: dict[str, tuple[str, ...]] = {
+    QUERY_SIGNAL_ABBREVIATIONS: ("abbreviations", "abbreviation_overlay"),
+    QUERY_SIGNAL_ENTITY: ("entity", "parent_record"),
+    QUERY_SIGNAL_DOMAIN: ("domain", "domain_prior", "namespace"),
+}
+
+# Flattened for a caller (or a test) that wants to know what is read and what is merely
+# carried, without walking the table above.
+INTERPRETED_SIGNAL_NAMES: frozenset[str] = frozenset(
+    name for names in QUERY_SIGNAL_ALIASES.values() for name in names
+)
+
+
+@dataclass(frozen=True)
+class QuerySignals:
+    """
+    Caller-supplied, per-request context about the QUERY side of a match. AR-6.
+
+    ## What this is
+
+    A declared extension point, not three fields. Every retrieval signal this library has
+    is derived from what the caller sent -- the field name, the path, the doc. This
+    channel is for what the caller KNOWS and the library cannot derive: which live
+    abbreviation catalog is authoritative today, which record a flattened column came out
+    of, which business domain the schema belongs to. A deployment may put anything else in
+    it; this library carries those keys and reads none of them.
+
+    ## Three rules, and the reason for each
+
+    1. **Every signal is optional, and absence is the shipped behaviour.** `EMPTY` is not
+       a special case handled somewhere -- it is the object every existing call site gets,
+       and `is_empty` short-circuits every code path this channel adds. A caller who sends
+       nothing must get results identical to a caller on the previous release.
+
+    2. **An unrecognised key is carried, never refused.** `extra="forbid"` on a request
+       model is right for a field a typo can silently drop; it is wrong for an extension
+       point, where it turns "this deployment knows something the library does not" into a
+       422. Ignored keys are kept in `carried`, so a deployment that extends the matcher
+       can read them and a diagnostic can say what was sent but not acted on.
+
+    3. **A malformed value is ignored, not raised on.** These arrive from a live
+       reference-data service. A feed that returns `null` for the overlay one morning must
+       cost that request its overlay, not its answer.
+
+    ## Where each signal is applied
+
+    `abbreviations` is REQUEST-scoped: it is a catalog, and merging it per field would
+    copy it once per column. `entity` and `domain` are per-FIELD facts with a per-request
+    default -- one schema usually has one namespace, but a flattened export can carry
+    columns from several parent records. A field overrides the request by putting the same
+    key in its own `SchemaField.source_metadata`.
+
+    ## What supplying nothing costs
+
+    Nothing, and that is measured rather than asserted. The matcher at HEAD and this one,
+    both with no signals, over the full committed corpus: 688 of 688 rank-1 entries
+    identical, P@1 0.5814 on both -- and the same for `signals={}`, for an overlay of `{}`,
+    and for a map of keys this library does not recognise. The reference side is a
+    different BUILD of the code rather than a recorded expectation, so the comparison
+    cannot pass by both sides drifting together.
+
+    The per-signal measurements live beside the code that applies each one --
+    `_request_expander`, `_with_entity_context`, `_calculate_domain_score` -- because a
+    number kept away from the decision it justifies is a number nobody re-checks.
+    """
+
+    # A READ-ONLY empty mapping by default, not a fresh dict. `EMPTY_QUERY_SIGNALS` below
+    # is a module-level singleton every no-signal call receives, and a mutable default on
+    # a shared object is one stray `.update()` away from giving every request in the
+    # process an overlay nobody sent. Per-request instances carry an ordinary dict.
+    abbreviations: Mapping[str, str] = dataclasses.field(
+        default_factory=lambda: MappingProxyType({})
+    )
+    entity: str = ""
+    domain: str = ""
+    # Keys the caller sent that this library did not interpret. Sorted, so two equal
+    # signal sets compare equal and render identically.
+    carried: tuple[str, ...] = ()
+
+    @property
+    def is_empty(self) -> bool:
+        """
+        True when this channel asks the matcher to do nothing differently.
+
+        `carried` deliberately does NOT count: a key the library ignores cannot change an
+        answer, so a request carrying only those must still take the untouched path.
+        """
+        return not self.abbreviations and not self.entity and not self.domain
+
+    @classmethod
+    def coerce(cls, source: QuerySignals | Mapping[str, Any] | None) -> QuerySignals:
+        """Accept an already-built object, a raw mapping, or nothing."""
+        if source is None:
+            return EMPTY_QUERY_SIGNALS
+        if isinstance(source, QuerySignals):
+            return source
+        return cls.from_mapping(source)
+
+    @classmethod
+    def from_mapping(cls, raw: Mapping[str, Any]) -> QuerySignals:
+        """
+        Parse a caller's signal map. NEVER RAISES -- see rule 3 in the class docstring.
+
+        A value of the wrong shape is dropped and its key recorded in `carried`, which is
+        the honest report: the library did not interpret it. That is deliberately the same
+        outcome as a key the library has never heard of, because from the caller's side
+        the two are one fact -- "this did not take effect".
+        """
+        if not raw:
+            return EMPTY_QUERY_SIGNALS
+
+        supplied: dict[str, Any] = {}
+        consumed: set[str] = set()
+        for canonical, names in QUERY_SIGNAL_ALIASES.items():
+            for name in names:
+                if name in raw:
+                    consumed.add(name)
+                    if canonical not in supplied:
+                        supplied[canonical] = raw[name]
+
+        abbreviations = _coerce_overlay(supplied.get(QUERY_SIGNAL_ABBREVIATIONS))
+        entity = _coerce_signal_text(supplied.get(QUERY_SIGNAL_ENTITY))
+        domain = _coerce_signal_text(supplied.get(QUERY_SIGNAL_DOMAIN))
+
+        carried = {name for name in raw if name not in consumed}
+        # A key whose value could not be used is reported as carried rather than as
+        # interpreted. `carried` answers "what did this server not act on?", and a
+        # malformed overlay belongs in that answer.
+        for canonical, value in (
+            (QUERY_SIGNAL_ABBREVIATIONS, abbreviations),
+            (QUERY_SIGNAL_ENTITY, entity),
+            (QUERY_SIGNAL_DOMAIN, domain),
+        ):
+            if not value:
+                carried |= {n for n in QUERY_SIGNAL_ALIASES[canonical] if n in raw}
+
+        if not abbreviations and not entity and not domain and not carried:
+            return EMPTY_QUERY_SIGNALS
+
+        return cls(
+            abbreviations=abbreviations,
+            entity=entity,
+            domain=domain,
+            carried=tuple(sorted(carried)),
+        )
+
+    def merged_over(self, base: QuerySignals) -> QuerySignals:
+        """
+        These signals layered on top of `base`, field-level winning KEY BY KEY.
+
+        Key by key, not object by object: a field that names its own `entity` must not
+        also have to restate the request's domain. `abbreviations` is request-scoped, so
+        it comes from `base` unless this object supplies its own.
+        """
+        if self.is_empty and not self.carried:
+            return base
+        if base.is_empty and not base.carried:
+            return self
+        return QuerySignals(
+            abbreviations=self.abbreviations or base.abbreviations,
+            entity=self.entity or base.entity,
+            domain=self.domain or base.domain,
+            carried=tuple(sorted(set(self.carried) | set(base.carried))),
+        )
+
+
+# The one object every caller who supplies nothing gets. Shared rather than rebuilt, so
+# `is_empty` on the hot path is an attribute read and so identity comparison is available
+# to a test that wants to prove the no-signal path built nothing.
+EMPTY_QUERY_SIGNALS = QuerySignals()
+
+
+def _coerce_signal_text(value: Any) -> str:
+    """A scalar signal as text, or "" when it is not usable as one."""
+    if isinstance(value, str):
+        return value.strip()
+    # An integer is a plausible thing for a feed to send as a namespace id and str() of it
+    # is unambiguous. Everything else -- list, dict, bool, None -- is not text, and is
+    # dropped rather than stringified into something like "['a', 'b']".
+    if isinstance(value, int) and not isinstance(value, bool):
+        return str(value)
+    return ""
+
+
+def _coerce_overlay(value: Any) -> Mapping[str, str]:
+    """
+    A `{short -> long}` overlay, filtered to the rows that are usable.
+
+    Row-level filtering rather than all-or-nothing: a live feed that returns one null
+    expansion among 7,839 good rows should cost that row, not the catalog. The expander
+    filters again on admission (`AbbreviationDictionary.merged_with`); this pass exists so
+    `is_empty` is honest about whether anything will actually be merged.
+    """
+    if not isinstance(value, Mapping):
+        return {}
+    return {
+        short: long
+        for short, long in value.items()
+        if isinstance(short, str) and isinstance(long, str) and short.strip() and long.strip()
+    }
+
+
+# =============================================================================
 # NEXUS MATCHER - Main class
 # =============================================================================
 
@@ -1165,6 +1400,7 @@ class NexusMatcher:
         self,
         schema_source: str | Path | dict[str, Any],
         schema_format: str | None = None,
+        signals: QuerySignals | Mapping[str, Any] | None = None,
     ) -> dict[str, tuple[MatchResult, ...]]:
         """
         Match a schema against the loaded dictionary.
@@ -1172,6 +1408,9 @@ class NexusMatcher:
         Args:
             schema_source: Schema file path or content
             schema_format: Force specific parser (auto-detect if None)
+            signals: Per-request query-side context (AR-6). Optional in every sense: None
+                is the shipped behaviour, and every recognised signal is individually
+                optional within it. See `QuerySignals`.
 
         Returns:
             One entry per parsed field, in schema order, keyed by the name the caller
@@ -1184,11 +1423,92 @@ class NexusMatcher:
         # Parse schema
         schema = self._parse_schema(schema_source, schema_format)
 
-        return self._match_fields(schema.fields)
+        return self._match_fields(schema.fields, signals=signals)
+
+    def _request_expander(self, signals: QuerySignals) -> tuple[AbbreviationExpander, bool]:
+        """
+        The expander and the on/off decision for ONE request. Never mutates the matcher.
+
+        Three cases, and the middle one is the one worth reading:
+
+        * **No overlay.** The configured expander and the configured flag, unchanged. This
+          is the path every existing caller takes and it allocates nothing.
+        * **Overlay, `expand_query_abbreviations` OFF.** Expansion runs for this request
+          with the OVERLAY ALONE. Sending a live approved-abbreviation catalog is an
+          unambiguous request to expand with it; ignoring it because a start-up flag is
+          off would make the channel unreachable on the exact deployment it exists for
+          (`from_config()` builds the matcher and takes no expander, so its catalog is
+          always the bundled generic list). And the flag being off is the deployment
+          saying it does NOT vouch for the configured catalog as a query-side source.
+
+          That is not a stylistic reading of the flag. Measured paired on the full
+          committed corpus (688/688, exact McNemar), with contracted field names and a
+          caller's catalog supplied through this channel: overlay alone 0.5785 P@1,
+          overlay merged with the bundled generic list 0.5625 -- **-1.60 points, 13
+          gained, 24 lost, p = 0.0989**. Inconclusive on its own, point estimate
+          negative, and it reproduces the independently recorded -1.60 / p = 0.099 for
+          that list. So merging a catalog the operator declined to trust into one they
+          just vouched for would import a measured wrong-rate into every overlay request,
+          for nothing the caller asked for. (On FHIR the same comparison is -0.13 points,
+          2 discordant -- the bundled list contains almost none of those tokens, which is
+          the same reason its damage is invisible on the committed benchmarks and shows up
+          the moment a caller's own catalog is in play.)
+        * **Overlay, flag ON.** Configured catalog merged with the overlay, overlay
+          winning row by row. The operator has vouched for both, so both are used.
+
+        WHAT THE OVERLAY IS WORTH, and what that number does not say. On the same
+        measurement, contracting every field name through a generated naming standard
+        costs 48.3 points of P@1 on combined (0.5814 -> 0.0988) and 23.4 on FHIR (0.2461
+        -> 0.0122); a FULL catalog recovers 99.4% and 99.5% of that. Those two recovery
+        figures are an upper bound established BY CONSTRUCTION -- the catalog was
+        generated from those field names, so expanding a contracted name reconstructs the
+        original string. They measure this plumbing, not the idea, and the giveaway is
+        that they do not move.
+
+        The informative arms are the degraded ones, and they agree across both corpora
+        (combined / FHIR, mean of 3 and 2 seeds):
+
+            coverage 75%   72.7% / 65.1% of the gap recovered
+            coverage 50%   47.0% / 36.8%
+            coverage 25%   23.5% / 16.6%
+            wrong  5%      92.9% / 90.8%
+            wrong 25%      62.8% / 58.4%
+            wrong 75%       4.8% /  4.0%   (p = 0.70 / 0.22 -- break-even)
+            wrong 100%    -14.9% / -4.7%   (WORSE than sending no overlay)
+
+        Recovery tracks coverage roughly linearly and tolerates staleness well; a catalog
+        that is mostly wrong is worse than none. So the thing a deployment must measure
+        before turning this on is its catalog's WRONG-RATE against its own field names,
+        not its size.
+
+        Returns:
+            `(expander, expand)`. `expander` is `self._abbreviation_expander` itself in
+            the no-overlay case -- identity, not a copy.
+        """
+        if not signals.abbreviations:
+            return self._abbreviation_expander, self._config.expand_query_abbreviations
+        if self._config.expand_query_abbreviations:
+            return self._abbreviation_expander.with_overlay(signals.abbreviations), True
+        return AbbreviationExpander(AbbreviationDictionary.from_dict(signals.abbreviations)), True
+
+    @staticmethod
+    def _field_signals(field: SchemaField, request: QuerySignals) -> QuerySignals:
+        """
+        The effective signals for one field: its own, layered over the request's.
+
+        A flattened export can carry columns from several parent records in one request,
+        so `entity` cannot be request-scoped only. Returns `request` itself when the field
+        adds nothing, so the common case costs one dict lookup.
+        """
+        raw = field.source_metadata.get(QUERY_SIGNALS_METADATA_KEY)
+        if not isinstance(raw, Mapping) or not raw:
+            return request
+        return QuerySignals.from_mapping(raw).merged_over(request)
 
     def _match_fields(
         self,
         fields: Sequence[SchemaField],
+        signals: QuerySignals | Mapping[str, Any] | None = None,
     ) -> dict[str, tuple[MatchResult, ...]]:
         """
         Match a batch of fields, encoding all queries in a single call.
@@ -1200,11 +1520,24 @@ class NexusMatcher:
 
         Returns exactly one entry per field, in input order. That count is the contract:
         see `_unique_result_key` for what used to happen when it did not hold.
+
+        `signals` is the per-request query-side channel (AR-6). It is resolved ONCE here
+        and passed down, so the abbreviation overlay is merged once per request rather
+        than once per field, and so nothing on `self` is touched: the matcher is shared
+        across concurrent requests, and a per-request mutation would let one caller's
+        catalog decide another caller's query text.
         """
         if not fields:
             return {}
 
-        query_texts = [self._build_query_text(f) for f in fields]
+        request_signals = QuerySignals.coerce(signals)
+        expander, expand = self._request_expander(request_signals)
+        per_field = [self._field_signals(f, request_signals) for f in fields]
+
+        query_texts = [
+            self._build_query_text(f, expander=expander, expand=expand, entity=s.entity)
+            for f, s in zip(fields, per_field, strict=True)
+        ]
 
         embeddings: list[np.ndarray] | None = None
         embed_result = self._embedding_provider.embed(query_texts)
@@ -1221,6 +1554,7 @@ class NexusMatcher:
                 query_text=query_texts[i],
                 query_embedding=embeddings[i] if embeddings is not None else None,
                 dense_candidates=dense_per_field[i] if dense_per_field is not None else None,
+                signals=per_field[i],
             )
             results[self._unique_result_key(field, results)] = tuple(field_results)
 
@@ -1295,6 +1629,7 @@ class NexusMatcher:
         self,
         schema_source: str | Path | dict[str, Any],
         schema_format: str | None = None,
+        signals: QuerySignals | Mapping[str, Any] | None = None,
     ) -> MatchingSession:
         """
         Match schema and return full session with metadata.
@@ -1302,6 +1637,7 @@ class NexusMatcher:
         Args:
             schema_source: Schema file path or content
             schema_format: Force specific parser
+            signals: Per-request query-side context (AR-6); see `QuerySignals`.
 
         Returns:
             Complete MatchingSession with all results and metrics
@@ -1315,7 +1651,7 @@ class NexusMatcher:
         # re-parsed the same source a second time, doubling parse cost and risking a
         # mismatch between the returned schema and the results computed from it.
         schema = self._parse_schema(schema_source, schema_format)
-        results = self._match_fields(schema.fields)
+        results = self._match_fields(schema.fields, signals=signals)
 
         duration_ms = (time.time() - start_time) * 1000
 
@@ -1408,9 +1744,76 @@ class NexusMatcher:
 
         return result.unwrap()
 
-    def _build_query_text(self, field: SchemaField) -> str:
+    @staticmethod
+    def _with_entity_context(field: SchemaField, entity: str) -> SchemaField:
+        """
+        A copy of `field` whose path is prefixed with the caller-supplied parent record.
+
+        Injected into the PATH rather than pasted onto the enriched string, so the entity
+        goes through exactly the same treatment every other parent level gets: the same
+        humanisation, the same namespace-part skipping, the same depth limit, the same
+        `HIERARCHY_SEPARATOR` that per-level abbreviation expansion splits on. A separate
+        formatting path here would be a second, quietly different definition of "parent
+        context" in a pipeline where parent context is the largest measured factor.
+
+        Skipped when the path already leads with this entity, so a caller who sends both
+        `parent.field` and `entity=parent` gets "parent field" and not "parent, parent
+        field". Compared on token sets, because the caller's spelling of the record
+        ("BookingPassenger") need not match the path's ("booking_passenger").
+
+        Measured, paired, on both full corpora, by stripping the parent out of every path
+        and handing that same parent back through this signal:
+
+            combined (688)  path 0.5814  stripped 0.3953  signal 0.5814   0 discordant
+            fhir    (1556)  path 0.2461  stripped 0.2500  signal 0.2461   0 discordant
+
+        Read those for what they are. The zero-discordant column is a check on THIS design
+        choice, not evidence that an entity is worth anything: the query text is
+        reconstructed, so an exact match is what a correct injection should produce. What
+        it establishes is that the signal enters at the level the parent-context effect
+        lives at -- an implementation that pasted the entity onto the end of the enriched
+        string, or joined it with a different separator, would not reproduce it.
+
+        The stripped column is the honest half, and it does NOT say the same thing on both
+        corpora. Removing the parent costs 18.6 points on combined (24 gained, 152 lost,
+        p = 6.0e-24) and NOTHING measurable on FHIR (+0.4 points, 34 gained, 28 lost,
+        p = 0.53), where a resource-name parent apparently adds no signal the leaf did not
+        already carry. So what this signal is worth is a property of the caller's paths,
+        not of the mechanism, and a deployment quoting the 18.6 without measuring its own
+        corpus is quoting somebody else's schema.
+
+        The copy is local to query building. Scoring still sees the caller's own field --
+        `parent_path` feeds domain inference, and rewriting it here would make a supplied
+        entity change a signal the caller did not ask it to change.
+        """
+        first, _, rest = field.full_path.partition(".")
+        # `rest` guards the check, and the guard is load-bearing. Without it a path with no
+        # parent at all compares the entity against the FIELD NAME, so `entity="Account"`
+        # on a bare column called `account` would be silently dropped -- the caller's
+        # parent context discarded because the leaf happened to repeat it. That is a
+        # narrow re-entry of the level-wise dedup `EnrichmentConfig` documents as MEASURED
+        # AND REMOVED: it improved ranking and cost auto-approve precision, and this
+        # method is not the place to reopen that decision. Measured: it fires on 3 of 1556
+        # FHIR queries, all of them leaves whose name repeats their resource.
+        if rest and _tokenize_identifier(first) == _tokenize_identifier(entity):
+            return field
+        return dataclasses.replace(field, full_path=f"{entity}.{field.full_path}")
+
+    def _build_query_text(
+        self,
+        field: SchemaField,
+        *,
+        expander: AbbreviationExpander | None = None,
+        expand: bool | None = None,
+        entity: str = "",
+    ) -> str:
         """
         Build the retrieval query text for a field.
+
+        `expander`, `expand` and `entity` are the per-request query-signal channel's three
+        entry points into query building (AR-6). All three default to the matcher's own
+        configuration, so `_build_query_text(field)` -- which is how `/diag/retrieval` and
+        the property tests call it -- is exactly what it was.
 
         Hierarchical context is injected first (GAP-006): a bare field name like
         `sname` carries almost no signal, while `satscores sname` is unambiguous. On the
@@ -1438,17 +1841,48 @@ class NexusMatcher:
         see them, but that is a property of the current encoder, not of this contract,
         and swapping the encoder should not silently change the query text.
         """
+        if entity:
+            field = self._with_entity_context(field, entity)
+
         enriched_query = self._context_enricher.enrich(field)
 
-        if not self._config.expand_query_abbreviations:
+        if expand is None:
+            expand = self._config.expand_query_abbreviations
+        if not expand:
             return enriched_query
 
+        if expander is None:
+            expander = self._abbreviation_expander
+
         levels = enriched_query.split(HIERARCHY_SEPARATOR)
-        expanded = [
-            self._abbreviation_expander.expand(level).expanded if level else level
-            for level in levels
-        ]
+        expanded = [expander.expand(level).expanded if level else level for level in levels]
         return HIERARCHY_SEPARATOR.join(expanded).lower()
+
+    def _resolve_query(
+        self,
+        field: SchemaField,
+        query_text: str | None,
+        signals: QuerySignals | Mapping[str, Any] | None,
+    ) -> tuple[QuerySignals, str]:
+        """
+        This field's effective signals, and the query text they produce.
+
+        The merge happens here as well as in `_match_fields` because `_match_field` is also
+        a single-field entry point (`/diag/retrieval`, the property tests, three museum
+        entries): a field carrying its own signals must behave the same whichever door it
+        came in by. `merged_over` is idempotent, so repeating it on the batch path costs one
+        dict lookup and cannot change an answer.
+
+        `query_text` is returned unchanged when the caller already built it, which is the
+        batch path -- the batch built it from the same signals a moment earlier.
+        """
+        field_signals = self._field_signals(field, QuerySignals.coerce(signals))
+        if query_text is not None:
+            return field_signals, query_text
+        expander, expand = self._request_expander(field_signals)
+        return field_signals, self._build_query_text(
+            field, expander=expander, expand=expand, entity=field_signals.entity
+        )
 
     def _match_field(
         self,
@@ -1456,6 +1890,7 @@ class NexusMatcher:
         query_text: str | None = None,
         query_embedding: np.ndarray | None = None,
         dense_candidates: list[SearchResult] | None = None,
+        signals: QuerySignals | Mapping[str, Any] | None = None,
     ) -> list[MatchResult]:
         """
         Match a single field against the dictionary.
@@ -1463,11 +1898,14 @@ class NexusMatcher:
         `query_text` and `query_embedding` may be supplied by the caller so that a whole
         schema's embeddings can be produced in one batched encoder call; encoding fields
         one at a time costs roughly 13x throughput on CPU.
+
+        `signals` are this field's EFFECTIVE query signals -- the request's, already
+        merged with the field's own by `_match_fields`. Passing a raw mapping here is
+        supported for the single-field path, which has no batch to merge against.
         """
         start_time = time.time()
 
-        if query_text is None:
-            query_text = self._build_query_text(field)
+        field_signals, query_text = self._resolve_query(field, query_text, signals)
 
         if query_embedding is None:
             embed_result = self._embedding_provider.embed_single(query_text)
@@ -1590,7 +2028,9 @@ class NexusMatcher:
             # If a >=95% auto-approve guarantee matters more than ranking quality, set
             # dictionary_alias_count = 0: that restores 0.953 precision at 12.4% coverage
             # at the cost of ~2 points of P@1 (~4 on abbreviation-heavy schemas).
-            signals = self._score_signals(field, entry, retrieval_score)
+            signals = self._score_signals(
+                field, entry, retrieval_score, domain_prior=field_signals.domain
+            )
             scored.append(
                 (
                     _weighted_confidence(signals, weights),
@@ -1692,6 +2132,7 @@ class NexusMatcher:
         field: SchemaField,
         entry: DictionaryEntry,
         retrieval_score: float,
+        domain_prior: str = "",
     ) -> Signals:
         """
         The five raw signals for one (field, entry) pair, in `Signals` order.
@@ -1738,7 +2179,7 @@ class NexusMatcher:
         type_score = entry.matches_type(field.data_type)
 
         # Domain score using domain matcher
-        domain_score = self._calculate_domain_score(field, entry)
+        domain_score = self._calculate_domain_score(field, entry, domain_prior=domain_prior)
 
         return (
             fused_retrieval_score,
@@ -1754,21 +2195,74 @@ class NexusMatcher:
         entry: DictionaryEntry,
         query_embedding: np.ndarray,
         retrieval_score: float,
+        domain_prior: str = "",
     ) -> ScoreBreakdown:
         """Calculate detailed score breakdown."""
-        return _breakdown(self._score_signals(field, entry, retrieval_score))
+        return _breakdown(self._score_signals(field, entry, retrieval_score, domain_prior))
 
     def _calculate_domain_score(
         self,
         field: SchemaField,
         entry: DictionaryEntry,
+        domain_prior: str = "",
     ) -> float:
         """
         Calculate domain compatibility score.
 
         Uses domain hierarchy matching when domain info is available,
         falls back to neutral score otherwise.
+
+        ## The caller-supplied prior
+
+        `domain_prior` is the request-level signal (AR-6): the namespace or domain hint
+        the caller knows and this library cannot derive. When present it REPLACES the
+        inferred field domain, because inference from a path or a name is a guess and the
+        prior is a statement.
+
+        It also gets one rule the inference path does not have, and the reason is
+        specific. `DomainMatcher` scores through a shipped hierarchy: two domains it has
+        never heard of are `UNRELATED` and score `unknown_score` -- even when they are the
+        SAME STRING. That is correct for two guesses, and useless for a prior, because an
+        enterprise's own domain names are exactly the ones the shipped hierarchy does not
+        contain. So a prior that CONTAINS the entry's declared domain scores 1.0 outright,
+        and everything else falls through to the hierarchy as before.
+
+        Containment rather than equality, on token sets, so that a schema namespace does
+        the job a caller expects: `com.example.bookings` contains `Bookings`. It is
+        one-directional on purpose -- an entry whose domain is "Customer Account" is NOT
+        matched by a prior of "customer", because half a domain name is not the domain.
+
+        The effect is a pure BOOST: a matching entry moves from the neutral 0.5 to 1.0,
+        which at the shipped `domain_weight = 0.15` is +0.075 of pre-squash confidence.
+        That is also the tie-break the signal is asked for -- it is several times the
+        sub-0.02 margin that separates a near-tied top-1 and top-2 -- and it is one
+        mechanism rather than two, so a domain hit cannot be counted twice.
+
+        Nothing here fires when `domain_prior` is empty, which is the shipped path.
+
+        MEASURED, AND THE MEASUREMENT'S OWN LIMIT. Paired on both full corpora, supplying
+        each schema's own database or resource name as the prior:
+
+            combined (688)   0.5814 -> 0.5930    8 gained, 0 lost, p = 0.0078
+            fhir    (1556)   0.2461 -> 0.2738   43 gained, 0 lost, p = 2.3e-13
+
+        ZERO LOSSES on both is the part that transfers: a prior that matches promotes, and
+        one that does not leaves the ranking where the retriever put it. The MAGNITUDE does
+        not transfer at all. Those corpora declare 47 domains over 688 entries and 158 over
+        4,598 -- a median of 12 and 22 entries each -- and every query's gold entry sits in
+        the domain its own schema names, so the prior there nearly PARTITIONS the answer
+        key. A real glossary's namespaces do not. Read these as "the mechanism works and
+        does not hurt", never as a number to expect.
         """
+        if domain_prior:
+            entry_domain = entry.domain
+            if entry_domain:
+                entry_tokens = _tokenize_identifier(entry_domain)
+                if entry_tokens and entry_tokens <= _tokenize_identifier(domain_prior):
+                    return 1.0
+                return self._domain_matcher.score(domain_prior, entry_domain)
+            return 0.5
+
         # Get entry domain (from dictionary)
         entry_domain = entry.domain
 

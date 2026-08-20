@@ -190,7 +190,7 @@ is also created for `uvicorn nexus_matcher.presentation.api.app:app`.
 | POST | `/api/v1/feedback` | **201** and `FeedbackResponseView` — the stored record echoed back, server `receivedAt` included. Appended to `NEXUS_API_FEEDBACK_PATH`; **503** when that is unset, **422** on a malformed record, **500** when the append itself fails. |
 | POST | `/api/v1/lookup` | `LookupResponseView` — `results` maps every id you sent, once and in the order sent, to an entry or an explicit `null`; `missing` names exactly the nulls; `vocabulary` is the same block `/match` carries. No score, no rank, no decision. Id cap `NEXUS_API_MAX_BATCH_FIELDS`; **413** over it, **422** on a duplicate, blank or oversized id, **503** with no dictionary. |
 | GET | `/api/v1/lookup/{governance_id:path}` | The single-id form, answering the identical `LookupResponseView` under one key. A miss is **200** with `null` — 404 on this service means no such route. The `:path` converter is what keeps an id containing `/` addressable; OpenAPI publishes the path as `/api/v1/lookup/{governance_id}`. |
-| GET | `/api/v1/status` | `StatusResponseView` — `ready`, `degraded`, `warnings[]`, `dictionary`, `encoder`, `thresholds`, `limits`. Always **200**, including with no dictionary loaded, because a pre-run degradation check that refused when the condition holds is unusable exactly when it is needed. Every threshold is nullable: `null` means this matcher does not expose it, never `0.0`. |
+| GET | `/api/v1/status` | `StatusResponseView` — `ready`, `degraded`, `warnings[]`, `dictionary`, `encoder`, `thresholds`, `limits`, `calibration`. Always **200**, including with no dictionary loaded, because a pre-run degradation check that refused when the condition holds is unusable exactly when it is needed. Every threshold is nullable: `null` means this matcher does not expose it, never `0.0` — except `absoluteScoreFloor`, where `null` means no floor is configured. `calibration` says which profile is in force and what the shipped one was fitted on. |
 | POST | `/api/v1/diag/retrieval` | `RetrievalDiagnosticView` — `queryText`, the `dense`/`sparse`/`fused` channels with their own raw scores and full result counts, `rerankerWired`, and, when `expected_governance_id` is given, that entry's rank per channel plus `inDictionary`. Retrieval only: it does not reproduce scoring, the decision, or reranking. Scores are each channel's own number and are **not** comparable across channels. |
 | GET | `/` | `{"service": "nexus-matcher", "version": …, "docs": "/docs"}`. `version` is the installed package's `__version__`, resolved at startup — this document used to print a literal here, and a literal is a second copy that drifts. |
 | GET | `/health` | `HealthResponse` — `status`, `timestamp`, `version`, `checks.uptime_seconds`. `status` is `healthy` unless a registered component is unhealthy, then `degraded`. |
@@ -215,6 +215,49 @@ The two levels have deliberately different strictness, and the difference is the
   silently degrade a match the way a field typo does.
 
 A misspelled `fields` is still an error — it is `missing`, not `extra`.
+
+#### Every `path` in one request must be distinct
+
+**This is a client obligation and the failure is a 422 for the whole batch.** The response
+is a map keyed by your `path`, and a map cannot hold two entries for one key — collapsing
+them silently would hand one of your columns another column's governance and hand you a
+shorter map with nothing saying which answer was dropped.
+
+So a repeated `path` is refused, and the refusal **names the offenders**: they are in
+`error.details.duplicate_paths` as a sorted list for a program, and in `error.message` for
+whoever is reading the log. That matters most in exactly the case that produces it — a
+200-field chunk out of a flattening step, where leaf names repeat across records, and where
+a 422 that said only "duplicate path" would read as an inexplicable rejection of the whole
+batch.
+
+If your source is flattened nested data, uniqueness is yours to guarantee before you send:
+the leaf name alone is not unique, and the flattened path is.
+
+The same rule and the same shape apply to `ids` on `POST /api/v1/lookup`, under
+`error.details.duplicate_ids`.
+
+#### Which route takes a 200-field chunk
+
+`/api/v1/match/batch`. `/api/v1/match` caps at `NEXUS_API_MAX_FIELDS` (default **100**),
+`/api/v1/match/batch` at `NEXUS_API_MAX_BATCH_FIELDS` (default **250**) — so a 200-field
+chunk goes to the batch route and only to the batch route. Both are the same contract and
+the same implementation; the cap is the only difference.
+
+Over the cap is a **413**, and it carries the number to retry with: `error.details.limit` is
+the server's cap and `error.details.fields` is what you sent, with both repeated in
+`message`. The Java client surfaces the first as
+`PayloadTooLargeException.suggestedChunkSize()`. The raw-body 413 is a different path and
+has no such number — nothing counted your fields, because the body was refused before it was
+parsed — so it carries `limit_bytes` instead and the honest response is to halve and retry.
+
+**The per-field ceiling has been measured against real data, not assumed.** Over 4,598 HL7
+FHIR R5 element definitions and 1,556 real flattened element paths, the largest single field
+is **1,267 characters** (a 1,099-character definition, a 65-character path, a 71-character
+leaf name) against a ceiling of 10,880 — 8.6x headroom. A 200-field chunk with *every* field
+at those maxima serialises to **263,241 bytes** against the derived body cap of 10,897,024 —
+41.4x. A realistic glossary-grade `doc` is nowhere near either bound;
+`tests/unit/presentation/api/test_payload_headroom.py` holds that measurement against the
+shipped caps, so lowering a cap under real data fails there.
 
 | Key | Required | Meaning |
 |---|---|---|
@@ -658,11 +701,16 @@ The single most important row: **`confidence` is `WITHIN_FIELD` and `absoluteSco
 excellent or absurd, so thresholding it across a schema compares nothing. That is why a
 floor exists on the absolute number and not on the confidence.
 
-`absoluteScoreFloor` is **not** published on `GET /api/v1/status` — that route's
-`thresholds` block carries `autoApprove`, `review`, `minConfidenceGap`, `resultsPerField`,
-`fusionAlpha`, `minimumAchievableConfidence` and `reviewThresholdBelowFloor`, and no floor.
-To read a deployment's floor without matching anything, send a one-field match and read
-this block.
+`absoluteScoreFloor` is **also** published on `GET /api/v1/status`, in that route's
+`thresholds` block, alongside `absoluteScoreMetric`. It is the same number read off the
+same property, so the two surfaces cannot disagree about which floor governs a verdict.
+Read it there when you want a deployment's floor without matching anything; read it here
+when you want it travelling with the verdicts it produced.
+
+> This paragraph previously stated that the status route carried no floor, and that sending
+> a one-field match was the only way to read one. That was true and is no longer: an
+> operator who could not see the active floor could not tell an emitted `NO_MATCH` from a
+> field the matcher simply had nothing for.
 
 ### The status response
 
@@ -693,14 +741,40 @@ this block.
     "resultsPerField": 5,
     "fusionAlpha": 0.9,
     "minimumAchievableConfidence": 0.63,
-    "reviewThresholdBelowFloor": true
+    "reviewThresholdBelowFloor": true,
+    "absoluteScoreFloor": null,
+    "absoluteScoreMetric": "cosine"
   },
   "limits": {
     "maxFields": 100,
     "maxBatchFields": 250,
-    "bodyByteCap": 9873024,
+    "bodyByteCap": 10897024,
     "deadlineSeconds": 25.0,
     "capacity": 36
+  },
+  "calibration": {
+    "defaultsInForce": true,
+    "overrides": {},
+    "dictionarySizeRatio": 0.043605,
+    "warnAboveSizeRatio": 10.0,
+    "corpus": {
+      "name": "bird+omop combined",
+      "fields": 688,
+      "dictionaryEntries": 688,
+      "splits": {"bird": 361, "omop": 327},
+      "domains": [
+        "public relational database schemas (BIRD-SQL dev set)",
+        "clinical common data model (OMOP CDM v5.4 field specification)"
+      ],
+      "fieldNaming": "ordinary SQL and CDM column identifiers. The bird split is heavily abbreviated and the omop split is not; neither is a flattened nested path, and neither was contracted by a governed abbreviation standard.",
+      "ambiguity": "one gold entry per field, drawn from two unrelated domains, so a query competes against 687 distractors that are mostly from a different subject area.",
+      "measuredBy": "benchmarks/exp_calibration.py",
+      "artifact": "benchmarks/results/exp_calibration_combined.json",
+      "autoApproveThreshold": 0.87,
+      "autoApprovePrecision": 0.952941,
+      "autoApproveCoverage": 0.123547,
+      "precisionAtRank1": 0.581395
+    }
   }
 }
 ```
@@ -713,7 +787,7 @@ needed.
 |---|---|---|
 | `ready` | `bool` | A dictionary is loaded and the match routes will answer. |
 | `degraded` | `bool` | Something is answerable but not as configured — read `warnings` for what. |
-| `warnings` | `object[]` | Zero or more `{code, message}` records. Empty list, never `null`. **Branch on `code`, never on `message`**: the codes are `NO_DICTIONARY`, `EMPTY_DICTIONARY` and `FALLBACK_ENCODER`; the message is human-readable and not part of the contract. |
+| `warnings` | `object[]` | Zero or more `{code, message}` records. Empty list, never `null`. **Branch on `code`, never on `message`**: the codes are `NO_DICTIONARY`, `EMPTY_DICTIONARY`, `FALLBACK_ENCODER` and `UNCALIBRATED_SIZE`; the message is human-readable and not part of the contract. |
 | `dictionary.entryCount` | `int` or `null` | Entries indexed. `null` — not `0` — when no dictionary is loaded, so "loaded and empty" stays distinguishable from "not loaded". |
 | `dictionary.source` | `string` or `null` | What `NEXUS_API_DICTIONARY` named, stamped at startup — the provenance of the numbers this server is producing. `null` when the matcher was handed over already indexed, in which case this server did not load it and cannot name a source. |
 | `dictionary.indexedAt` | `string` or `null` | UTC ISO-8601 instant the index was built. |
@@ -726,6 +800,13 @@ needed.
 | `thresholds.*` | `float`/`int`/`bool` or `null` | The live matcher's numbers, not the shipped defaults. **Every threshold is nullable, and `null` means "this matcher does not expose it" — never `0.0`.** |
 | `thresholds.minimumAchievableConfidence` | `float` or `null` | The structural floor of rank-1 `confidence`, `semantic_weight × fusion_alpha`. |
 | `thresholds.reviewThresholdBelowFloor` | `bool` or `null` | `true` says `review_threshold` sits *under* that floor, so no rank-1 match can be `REJECT` on score alone. It is `true` at the shipped numbers, and it is the condition `absolute_score_floor` exists to answer. |
+| `thresholds.absoluteScoreFloor` | `float` or `null` | The active floor beneath which a field is reported `NO_MATCH`. **`null` here means no floor is configured** — the shipped default — not "unreadable", which is what `null` means for every other member of this block. With no floor this deployment **cannot emit `NO_MATCH` at all**, whatever the scores. Same number as `scoring.absoluteScoreFloor` on a match response. |
+| `thresholds.absoluteScoreMetric` | `string` or `null` | What that floor is compared against: the distance metric the wired vector store declares. `cosine` under the shipped wiring; `unknown` means the store declares none, and a floor chosen against an unknown metric is a guess. |
+| `calibration.defaultsInForce` | `bool` or `null` | `true` when all three decision thresholds (`auto_approve_threshold`, `review_threshold`, `min_confidence_gap`) are still the shipped numbers. |
+| `calibration.overrides` | `object` or `null` | Every matching setting whose live value differs from the shipped default, mapped to the **live** value. Keys are **snake_case** — the names you put in a `NEXUS_API_MATCHING_CONFIG` file, so the key you read is the key you set. `{}` means a stock profile. Derived from the config dataclass's own fields, so a setting this table has never heard of still appears the day a deployment changes it. |
+| `calibration.dictionarySizeRatio` | `float` or `null` | `dictionary.entryCount / calibration.corpus.dictionaryEntries`. |
+| `calibration.warnAboveSizeRatio` | `float` | The ratio above which running on shipped defaults raises `UNCALIBRATED_SIZE`. Published so the rule is arithmetic you can check rather than a judgement inside the server. |
+| `calibration.corpus.*` | mixed | **The corpus the shipped defaults were fitted on**, and the answer to "were these numbers measured on anything like my data?". Size (`fields`, `dictionaryEntries`, `splits`), shape (`domains`, `fieldNaming`, `ambiguity`), provenance (`measuredBy`, `artifact`) and the operating point (`autoApproveThreshold`, `autoApprovePrecision`, `autoApproveCoverage`, `precisionAtRank1`). Present even with no dictionary loaded — it describes the build, not the deployment. |
 | `limits.maxFields` | `int` | Cap on `/api/v1/match`. |
 | `limits.maxBatchFields` | `int` | Cap on `/api/v1/match/batch`. |
 | `limits.bodyByteCap` | `int` | Request bytes accepted before a **413**, derived from the field caps rather than typed as a literal. |
@@ -736,6 +817,46 @@ needed.
 above and no floor; the active floor is published per response at
 `scoring.absoluteScoreFloor`. To read a deployment's floor without matching anything, send a
 one-field match and read `scoring`.
+
+#### Reading `calibration`, and the one warning it raises
+
+A threshold is a statement about a **score distribution**. The distribution is a property of
+your dictionary and your field names, so the same number means something different on a
+different corpus. `calibration` exists so you can tell, from the wire, whether the numbers
+this server is auto-approving with were fitted on anything resembling your data.
+
+Two questions, two members:
+
+* **"Which calibration is in force?"** — `overrides`. Empty means this server is running the
+  numbers this library shipped. Non-empty names every setting that differs and its live
+  value, in the spelling you would use in a config file.
+* **"What were the shipped numbers fitted on?"** — `corpus`. 688 labelled fields against a
+  688-entry pooled dictionary, half public SQL schemas and half a clinical data model, in
+  ordinary column identifiers. At the shipped `auto_approve_threshold` of 0.87 that measured
+  0.952941 auto-approve precision at 0.123547 coverage, over a corpus where rank-1 accuracy
+  is 0.581395. Every one of those numbers is checked against
+  `benchmarks/results/exp_calibration_combined.json` by a packaging gate, so this block
+  cannot drift away from the measurement it summarises.
+
+**`UNCALIBRATED_SIZE`** is raised when both hold: the three decision thresholds are still the
+shipped ones, **and** your dictionary is more than `warnAboveSizeRatio` times the calibration
+corpus. It fires in one direction only, on one dimension only, and both limits are
+deliberate:
+
+* **Size, and not domain or naming style.** Comparing those would need a similarity metric
+  this library has never validated, and a warning computed from an invented metric is wrong
+  in a direction nobody can audit. They are *described* on `corpus.domains`,
+  `corpus.fieldNaming` and `corpus.ambiguity` instead, for you to compare by eye.
+* **Larger only, and only by an order of magnitude.** Ten is the smallest ratio this
+  repository can point at a measurement across: in `exp_alias_scale.json` a retrieval
+  setting is worth **+1.9** points of P@1 on a corpus the size of the calibration one, and
+  **-13.7** on a corpus ten times it. The sign inverts. Below that ratio there is no
+  evidence, and a `degraded: true` on every small deployment would teach operators to
+  ignore the field.
+
+The warning is not a defect report. It says the shipped auto-approve precision is a fact
+about somebody else's corpus and not about yours. The fix is to fit your own —
+[Calibration profiles](guides/calibration_profiles.md).
 
 ### The retrieval diagnostic response
 

@@ -12,6 +12,11 @@ abstractions, not on concrete implementations.
 - SchemaParser: Parse schemas from various formats (Avro, JSON Schema, SQL DDL)
 - DictionaryLoader: Load data dictionaries from various sources (Excel, CSV, DB)
 
+### Resolution Ports
+- EntryLookup: Resolve a dictionary entry by an id the caller already holds. Exact or
+  absent -- no scoring, no ranking, no confidence. Architecturally distinct from
+  retrieval, which answers a different question about the same dictionary.
+
 ### ML/AI Ports
 - EmbeddingProvider: Generate vector embeddings from text
 
@@ -29,6 +34,7 @@ abstractions, not on concrete implementations.
 from nexus_matcher.domain.ports import (
     SchemaParser,
     DictionaryLoader,
+    EntryLookup,
     EmbeddingProvider,
     VectorStore,
     SparseRetriever,
@@ -71,6 +77,11 @@ from nexus_matcher.domain.ports.embedding_provider import (
     EmbeddingProviderRegistry,
     EmbeddingResult,
 )
+from nexus_matcher.domain.ports.entry_lookup import (
+    BaseEntryLookup,
+    EntryLookup,
+    MappingEntryLookup,
+)
 from nexus_matcher.domain.ports.retrieval import (
     BaseReranker,
     BaseSparseRetriever,
@@ -102,6 +113,7 @@ __all__ = [
     "BaseCache",
     "BaseDictionaryLoader",
     "BaseEmbeddingProvider",
+    "BaseEntryLookup",
     "BaseReranker",
     "BaseSchemaParser",
     "BaseSparseRetriever",
@@ -121,9 +133,12 @@ __all__ = [
     "EmbeddingProvider",
     "EmbeddingProviderRegistry",
     "EmbeddingResult",
+    # Entry Lookup
+    "EntryLookup",
     "HierarchicalCache",
     "HierarchicalCacheStats",
     "LoadStatistics",
+    "MappingEntryLookup",
     "RerankCandidate",
     "RerankResult",
     # Reranker

@@ -1,0 +1,169 @@
+{
+  "answers_broken": 14,
+  "answers_changed": 232,
+  "broken_confidence": {
+    "at_or_above_auto_approve_threshold": 8,
+    "max": 0.875,
+    "min": 0.73,
+    "n": 14
+  },
+  "conservation_law_holds": true,
+  "contested_fields": 254,
+  "delta": -0.007627118644067801,
+  "delta_contested": -0.03543307086614173,
+  "distinct_leaf_names": 945,
+  "distinct_query_texts_for_widest_leaf": 56,
+  "experiment": "exp_repeated_leaf (E7)",
+  "fields": 1180,
+  "max_leaf_repetition": 56,
+  "p_at_1_keyed_on_field": 0.1228813559322034,
+  "p_at_1_keyed_on_field_contested": 0.07086614173228346,
+  "p_at_1_keyed_on_leaf_name": 0.1152542372881356,
+  "p_at_1_keyed_on_leaf_name_contested": 0.03543307086614173,
+  "pack": {
+    "abbreviations": {
+      "ambiguous_shorts": 139,
+      "delta_entries": 200,
+      "delta_version": 2,
+      "entries": 992,
+      "multi_word_rules": 240,
+      "never_expand": 24,
+      "not_contracted": 7,
+      "stopword_collisions": 12
+    },
+    "feedback": {
+      "approved": 66,
+      "chose_an_unproposed_term": 12,
+      "events": 100,
+      "manual_override": 12,
+      "overrides_indistinguishable_from_reranks": 12,
+      "rejected": 22
+    },
+    "glossary": {
+      "approved": 8849,
+      "clusters": 349,
+      "definition_echoes_name_share": 0.1992,
+      "distinct_class_words": 23,
+      "distinct_domains": 30,
+      "in_near_duplicate_cluster_share": 0.15,
+      "name_tokens_max": 9,
+      "name_tokens_median": 4,
+      "non_approved_share": 0.1151,
+      "rows": 10000,
+      "widest_cluster": 30
+    },
+    "notice": "SYNTHETIC DATA. Every subject word, domain and abbreviation in this pack was manufactured by a seeded syllable grammar in benchmarks/synthetic/pools.py. Nothing here was sampled from any glossary, and this pack is not a template for one.",
+    "schemas": {
+      "flat-contracted": {
+        "distinct_leaf_names": 200,
+        "fields": 200,
+        "max_leaf_repetition": 1,
+        "max_path_depth": 8,
+        "with_doc": 0
+      },
+      "flat-english": {
+        "distinct_leaf_names": 200,
+        "fields": 200,
+        "max_leaf_repetition": 1,
+        "max_path_depth": 8,
+        "with_doc": 200
+      },
+      "mixed-production": {
+        "distinct_leaf_names": 1762,
+        "fields": 1795,
+        "max_leaf_repetition": 3,
+        "max_path_depth": 21,
+        "with_doc": 513
+      },
+      "nested-deep": {
+        "distinct_leaf_names": 790,
+        "fields": 800,
+        "max_leaf_repetition": 4,
+        "max_path_depth": 21,
+        "with_doc": 314
+      },
+      "nested-repeated": {
+        "distinct_leaf_names": 945,
+        "fields": 1180,
+        "max_leaf_repetition": 56,
+        "max_path_depth": 13,
+        "with_doc": 358
+      },
+      "no-doc": {
+        "distinct_leaf_names": 396,
+        "fields": 399,
+        "max_leaf_repetition": 2,
+        "max_path_depth": 11,
+        "with_doc": 0
+      }
+    },
+    "spec": {
+      "difficulty": 1.0,
+      "feedback_events": 100,
+      "paraphrase_strength": 0.6,
+      "repeats_per_domain": 2,
+      "rows": 10000,
+      "schema_scale": 1.0,
+      "seed": 20260819
+    },
+    "truth": {
+      "AMBIGUOUS": 867,
+      "EXACT": 2835,
+      "NO_MATCH": 654,
+      "TRAP": 218
+    }
+  },
+  "paired": {
+    "ci_high": -0.0008474576271186307,
+    "ci_low": -0.015254237288135589,
+    "delta": -0.007627118644067801,
+    "n_discordant": 19,
+    "n_pairs": 1180,
+    "p_value": 0.063568115234375,
+    "test": "exact McNemar (paired binary, 5 gained / 14 lost)"
+  },
+  "paired_contested": {
+    "ci_high": -0.003937007874015748,
+    "ci_low": -0.07086614173228346,
+    "delta": -0.03543307086614173,
+    "n_discordant": 19,
+    "n_pairs": 254,
+    "p_value": 0.063568115234375,
+    "test": "exact McNemar (paired binary, 5 gained / 14 lost)"
+  },
+  "provenance": {
+    "config": {
+      "absolute_score_floor": null,
+      "auto_approve_threshold": 0.87,
+      "colbert_top_k": 50,
+      "cross_encoder_top_k": 20,
+      "dense_top_k": 100,
+      "dictionary_alias_count": 0,
+      "domain_weight": 0.15,
+      "edit_distance_weight": 0.05,
+      "expand_query_abbreviations": false,
+      "fusion_alpha": 0.9,
+      "lexical_weight": 0.05,
+      "min_confidence_gap": 0.1,
+      "results_per_field": 5,
+      "review_threshold": 0.5,
+      "semantic_weight": 0.7,
+      "sparse_top_k": 100,
+      "type_weight": 0.05
+    },
+    "cpu_busy_percent_at_start": 100.0,
+    "cpu_count": 32,
+    "git_branch": "develop",
+    "git_dirty": true,
+    "git_sha": "11223a66ea57cf86d24caa6ca93e18e97b804318",
+    "ledger_format_version": 1,
+    "machine": "AMD64",
+    "numpy_version": "2.3.5",
+    "platform": "Windows-11-10.0.26200-SP0",
+    "processor": "AMD64 Family 26 Model 68 Stepping 0, AuthenticAMD",
+    "python_implementation": "CPython",
+    "python_version": "3.13.4",
+    "seed": 20260819
+  },
+  "schema": "nested-repeated"
+}

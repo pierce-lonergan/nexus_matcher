@@ -3,6 +3,7 @@ nexus_matcher.presentation.api.lookup | Layer: PRESENTATION
 GET /api/v1/lookup/{id} and POST /api/v1/lookup -- resolving ids the caller already knows.
 
 ## Relationships
+# DEPENDS_ON → domain/ports/entry_lookup :: EntryLookup, the port this plane is written to
 # DEPENDS_ON → presentation/api/matching :: the candidate renderer and the response class,
 #              reused rather than restated so the two enrichment surfaces cannot drift
 # DEPENDS_ON → presentation/api/errors :: every failure mode
@@ -92,7 +93,27 @@ this module has, so no shim is needed on that side.
 `_governance_payload` reads a `.governance` attribute, so it is handed `_ResolvedClass` --
 the class this entry's code resolves to through the live vocabulary, resolved exactly as
 `NexusMatcher._match_field` resolves it. That is a shim, and it is the honest price of
-sharing the renderer with a module this lane does not own.
+sharing the renderer with a module this lane does not own. `_vocabulary_payload` reads
+`_governance` off a MATCHER, so it is handed `_VocabularySource`, which is the same shim
+one level up and is built with the imported attribute-name constant rather than a literal,
+so a rename in `matching.py` moves both ends together.
+
+## The port this plane is written to
+
+The routes below depend on `domain.ports.entry_lookup.EntryLookup` and on nothing else
+that can resolve an id. That is the point of NM-V2-01 AR-5: lookup is architecturally
+distinct from matching, so it gets a port in the domain rather than a private reach into
+the application layer's entry map from an HTTP handler.
+
+`LookupService` therefore never sees a matcher. It is driven end to end in
+`test_lookup_endpoint` by `MappingEntryLookup` -- a domain object built from a plain dict,
+with no `NexusMatcher` anywhere in the process -- which is the evidence that the
+dependency is on the port and not on an object that happens to satisfy it.
+
+`DictionaryLookup` below is the ADAPTER: the one place that knows a `NexusMatcher` is what
+this server happens to be serving out of, and the one place left that reads a private
+name. It prefers the port when the application layer offers it, so the day `NexusMatcher`
+implements `EntryLookup` the private read stops executing without an edit here.
 """
 
 from __future__ import annotations
@@ -103,6 +124,8 @@ from typing import TYPE_CHECKING, Any
 from fastapi import APIRouter, status
 from pydantic import BaseModel, ConfigDict, Field
 
+from nexus_matcher.domain.governance import GovernanceVocabulary
+from nexus_matcher.domain.ports.entry_lookup import EntryLookup
 from nexus_matcher.presentation.api.errors import (
     MalformedRequestError,
     RequestTooLargeError,
@@ -123,6 +146,8 @@ from nexus_matcher.presentation.api.schemas import (
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from nexus_matcher.domain.models.entities import DictionaryEntry
     from nexus_matcher.presentation.api.limits import MatchServiceLimits
     from nexus_matcher.presentation.api.matching import MatcherHandle
@@ -131,11 +156,15 @@ if TYPE_CHECKING:
 # CONSTANTS
 # =============================================================================
 
-# The private application-layer name this module reads, as a named constant for the same
-# reason `matching.py` names its three: the coupling is greppable from one place for
-# whichever lane makes it public. A `NexusMatcher.entry(id)` accessor -- or, better, the
-# lookup PORT this plane deserves in `domain/ports/` -- would remove it; both files belong
-# to other lanes, so the seam is held here in `DictionaryLookup` instead.
+# The private application-layer name the ADAPTER falls back to, as a named constant for
+# the same reason `matching.py` names its three: the coupling is greppable from one place
+# for whichever lane makes it public.
+#
+# It is now a fallback rather than the path. `DictionaryLookup.lookup_many` asks the
+# matcher for `EntryLookup` first, so a `NexusMatcher` that implements the port is served
+# through the port and this name is never read. Until it does, this is the seam, and it is
+# confined to one class in one module -- the routes and `LookupService` below cannot see
+# it at all.
 _DICTIONARY_ENTRIES_ATTR = "_dictionary_entries"
 
 # The longest dictionary id this service will accept, in characters. Public because it is
@@ -145,6 +174,12 @@ _DICTIONARY_ENTRIES_ATTR = "_dictionary_entries"
 # `FeedbackRequest` puts on `chosenGovernanceId`, which is the same identifier arriving
 # from the other direction.
 MAX_DICTIONARY_ID_CHARS = 512
+
+# The vocabulary reported when the server is answering out of an object that exposes none.
+# Built once because it is immutable and carries no classes: `empty()` resolves every code
+# to None and every classification to the open sentinel, which is the answer "nothing is
+# configured here" rather than a guess at a tier.
+_EMPTY_VOCABULARY = GovernanceVocabulary.empty()
 
 
 # =============================================================================
@@ -266,7 +301,7 @@ class LookupResponseView(BaseModel):
 
 
 # =============================================================================
-# THE LOOKUP PORT, AT THE BOUNDARY
+# THE PORT'S ADAPTER, AND THE TWO SHIMS THE SHARED RENDERERS NEED
 # =============================================================================
 
 
@@ -283,22 +318,59 @@ class _ResolvedClass:
     governance: object | None
 
 
+class _VocabularySource:
+    """
+    A carrier holding one attribute, so `matching._vocabulary_payload` can be called with a
+    vocabulary this plane got from its PORT rather than from a matcher.
+
+    `_vocabulary_payload` takes a matcher and reads `_governance` off it. That is right for
+    the module that owns it and wrong for this one, which has no matcher after AR-5 -- so
+    the vocabulary is wrapped in the shape that function expects instead of the payload
+    being restated here. A copy of the renderer would be a second definition of the block
+    that makes a `governance` of null readable, and the two would drift on the first edit.
+
+    The attribute is set through the imported constant, never through a literal, so the
+    rename that moves `_vocabulary_payload`'s reader moves this writer with it.
+    """
+
+    __slots__ = (_MATCHER_GOVERNANCE_ATTR,)
+
+    def __init__(self, vocabulary: GovernanceVocabulary) -> None:
+        setattr(self, _MATCHER_GOVERNANCE_ATTR, vocabulary)
+
+
 class DictionaryLookup:
     """
-    Resolve ids against the loaded dictionary. The seam a real lookup port will replace.
+    The `EntryLookup` adapter over whatever matcher this server was started with.
 
-    The application layer exposes no way to fetch an entry by id, so this reads
-    `NexusMatcher._dictionary_entries` -- the same private-attribute coupling, with the same
+    This is the ONLY object in the lookup plane that knows a matcher exists. `LookupService`
+    and both routes are written against `domain.ports.entry_lookup.EntryLookup`, so the
+    application layer is reachable from here and from nowhere else on this plane.
+
+    ## Two paths, and which one runs
+
+    `lookup_many` asks the live matcher for the port first. A matcher that implements
+    `EntryLookup` is served THROUGH the port, and the private name below is never read --
+    which is what makes the fallback a fallback rather than the design. `NexusMatcher` does
+    not implement it today, so the fallback is what runs today: it reads
+    `NexusMatcher._dictionary_entries`, the same private-attribute coupling, with the same
     named constant and the same loud `drift()` on absence, that `matching.py` documents for
-    `_match_fields`. Holding it in one class rather than in the handler means the day
-    `domain/ports/` grows the lookup port AR-5 asks for, this class is the only thing that
-    changes.
+    `_match_fields`. When another lane makes that map public -- a `NexusMatcher.lookup(id)`,
+    or the whole port -- nothing in this file changes and the private read stops executing.
 
-    ALIAS IDS ARE NOT RESOLVABLE, and that is deliberate. With
-    `dictionary_alias_count > 0` the index also carries fabricated technical spellings of
-    each entry under synthetic ids; those exist to be RETRIEVED against, not to be named.
+    `isinstance` against a `runtime_checkable` Protocol checks that the members are PRESENT,
+    not that they behave; that is exactly the strength wanted here. An object claiming the
+    port keeps its promise or fails loudly in its own code, and this adapter is not the
+    place to re-litigate whether somebody else's implementation is honest.
+
+    ## Alias ids are not resolvable, and that is deliberate
+
+    With `dictionary_alias_count > 0` the index also carries fabricated technical spellings
+    of each entry under synthetic ids; those exist to be RETRIEVED against, not to be named.
     Resolving one would hand a caller an id that is not in their glossary and that changes
-    meaning when the alias generator does.
+    meaning when the alias generator does. Neither path resolves them: the port's
+    implementer answers for its own ids, and the fallback reads the ENTRY map, which the
+    alias documents are deliberately not in.
     """
 
     def __init__(self, handle: MatcherHandle) -> None:
@@ -308,14 +380,40 @@ class DictionaryLookup:
         """The live matcher, or the 503 that names why there is not one."""
         return self._handle.require()
 
-    def resolve(self, matcher: object, ids: list[str]) -> list[DictionaryEntry | None]:
+    @property
+    def vocabulary(self) -> GovernanceVocabulary:
         """
-        One answer per id, positionally aligned to `ids`.
+        The vocabulary the codes on these entries are spelled in.
+
+        Read from the port when the matcher offers one, else off the matcher's own
+        `_governance`. `empty()` when it exposes neither -- the same posture
+        `matching._vocabulary_payload` takes, and for the same reason: a vocabulary that
+        cannot be read must report itself as UNCONFIGURED rather than invent a tier, and
+        `empty()` resolves every code to None and every classification to the open
+        sentinel.
+        """
+        matcher = self.matcher()
+        if isinstance(matcher, EntryLookup):
+            return matcher.vocabulary
+        vocabulary = getattr(matcher, _MATCHER_GOVERNANCE_ATTR, None)
+        return vocabulary if isinstance(vocabulary, GovernanceVocabulary) else _EMPTY_VOCABULARY
+
+    def lookup(self, entry_id: str) -> DictionaryEntry | None:
+        """The entry with this id, or None. Absence is an answer, never an exception."""
+        return self.lookup_many([entry_id])[0]
+
+    def lookup_many(self, entry_ids: Sequence[str]) -> list[DictionaryEntry | None]:
+        """
+        One answer per id, positionally aligned to `entry_ids`.
 
         A list rather than a map, so the caller's map is built from the caller's own list
         and `zip(..., strict=True)` is a real oracle over the count instead of a check on a
         dict this method also built.
         """
+        matcher = self.matcher()
+        if isinstance(matcher, EntryLookup):
+            return list(matcher.lookup_many(entry_ids))
+
         entries = getattr(matcher, _DICTIONARY_ENTRIES_ATTR, None)
         if entries is None:
             raise drift(
@@ -323,7 +421,7 @@ class DictionaryLookup:
                 _DICTIONARY_ENTRIES_ATTR,
                 "there is no way to resolve an id and this endpoint cannot serve anything at all.",
             )
-        return [entries.get(entry_id) for entry_id in ids]
+        return [entries.get(entry_id) for entry_id in entry_ids]
 
 
 # =============================================================================
@@ -366,9 +464,17 @@ def _entry_payload(entry: DictionaryEntry, vocabulary: object) -> dict[str, Any]
 
 
 class LookupService:
-    """Everything both lookup routes share; they differ only in how the ids arrive."""
+    """
+    Everything both lookup routes share; they differ only in how the ids arrive.
 
-    def __init__(self, lookup: DictionaryLookup, limits: MatchServiceLimits) -> None:
+    Depends on the PORT, not on a matcher and not on `DictionaryLookup`. Anything that can
+    resolve an id -- the adapter above, a `MappingEntryLookup` built from a dict, an
+    application object that grows the port later -- drives these routes unchanged, which is
+    the property AR-5 asks for and the property `test_lookup_endpoint` drives end to end
+    with no `NexusMatcher` in the process at all.
+    """
+
+    def __init__(self, lookup: EntryLookup, limits: MatchServiceLimits) -> None:
         self._lookup = lookup
         self._limits = limits
 
@@ -429,9 +535,12 @@ class LookupService:
                 details={"duplicate_ids": sorted(repeated)},
             )
 
-        matcher = self._lookup.matcher()
-        vocabulary = getattr(matcher, _MATCHER_GOVERNANCE_ATTR, None)
-        entries = self._lookup.resolve(matcher, ids)
+        # Resolution AFTER validation, in this order, because a request that is malformed
+        # is malformed whether or not a dictionary is loaded: a caller who sent a duplicate
+        # id must read the 422 that names it rather than a 503 that sends them to check
+        # their server.
+        vocabulary = self._lookup.vocabulary
+        entries = self._lookup.lookup_many(ids)
 
         results: dict[str, dict[str, Any] | None] = {}
         # `strict=True` is the count oracle: a resolver that returned a different number of
@@ -445,7 +554,7 @@ class LookupService:
             # Derived from the map that was just built, in one pass over it, so "missing"
             # and "null" are two readings of one fact rather than two facts that can drift.
             "missing": [entry_id for entry_id, payload in results.items() if payload is None],
-            "vocabulary": _vocabulary_payload(matcher),
+            "vocabulary": _vocabulary_payload(_VocabularySource(vocabulary)),
         }
 
 

@@ -5,6 +5,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -33,7 +34,12 @@ public record MatchRequest(
 
         /** Ask for the score components and weights behind each confidence. Null takes the
          *  server's default (false). */
-        @JsonProperty("explain") Boolean explain) {
+        @JsonProperty("explain") Boolean explain,
+
+        /** Request-level query signals, same vocabulary as {@link FieldSpec#signals()}.
+         *  A field-level signal of the same key wins; the two merge KEY BY KEY, so a
+         *  request-level overlay and a field-level entity coexist. Null sends nothing. */
+        @JsonProperty("signals") Map<String, Object> signals) {
 
     public MatchRequest {
         Objects.requireNonNull(fields, "fields");
@@ -46,26 +52,26 @@ public record MatchRequest(
 
     /** Fields only, taking the server's defaults for {@code top_k} and {@code explain}. */
     public static MatchRequest of(List<FieldSpec> fields) {
-        return new MatchRequest(fields, null, null);
+        return new MatchRequest(fields, null, null, null);
     }
 
     /** Fields and a candidate count. */
     public static MatchRequest of(List<FieldSpec> fields, int topK) {
-        return new MatchRequest(fields, topK, null);
+        return new MatchRequest(fields, topK, null, null);
     }
 
     /** This request asking for {@code topK} candidates per field. */
     public MatchRequest withTopK(int newTopK) {
-        return new MatchRequest(fields, newTopK, explain);
+        return new MatchRequest(fields, newTopK, explain, null);
     }
 
     /** This request asking the server to explain each confidence. */
     public MatchRequest withExplain(boolean newExplain) {
-        return new MatchRequest(fields, topK, newExplain);
+        return new MatchRequest(fields, topK, newExplain, null);
     }
 
     /** This request over a different field list, keeping the knobs. Used when re-chunking a 413. */
     public MatchRequest withFields(List<FieldSpec> newFields) {
-        return new MatchRequest(newFields, topK, explain);
+        return new MatchRequest(newFields, topK, explain, null);
     }
 }

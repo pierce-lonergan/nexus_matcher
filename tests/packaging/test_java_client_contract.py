@@ -144,6 +144,64 @@ _NOT_RESTATED_AS_A_RECORD = {
 
 
 # =============================================================================
+# WHAT THE JAVA CLIENT DOES NOT CARRY YET -- a debt record, not an exemption
+# =============================================================================
+
+# The wire grows in this repository and the Java client is hand-written in another part of
+# it, so a change can land on one side while the other is untouched. Silence about that is
+# what this whole file exists to prevent; so is a table of excuses that nobody prunes.
+#
+# These two tables are the middle path. An entry RECORDS that a published member or schema
+# is not on the Java side yet, names the file and the component that closes it, and is then
+# policed in both directions by `test_the_java_debt_record_is_current`: an entry whose
+# member stopped being published, or whose Java component has since been added, fails. The
+# table can therefore only shrink by the client catching up, never rot into decoration.
+#
+# It is NOT a licence to ship an unreadable response. Every Java record is
+# `@JsonIgnoreProperties(ignoreUnknown = true)` -- verified by
+# `test_the_java_records_ignore_members_they_do_not_carry` below -- so an unbound member
+# is invisible to a Java caller rather than fatal to one. That is the property that makes
+# recording the debt honest instead of reckless, and it is asserted rather than assumed.
+
+# (published schema, published member) -> why it is not bound yet, and what closes it.
+_UNBOUND_ON_THE_JAVA_SIDE: dict[tuple[str, str], str] = {
+    ("ThresholdsView", "absoluteScoreFloor"): (
+        "NM-V2-01 AR-4 / NM-V2-03 SC-6: the active absolute-score floor is now on the "
+        "status surface, where an operator can see which calibration is in force. Closes "
+        'with `@JsonProperty("absoluteScoreFloor") Double absoluteScoreFloor` on '
+        "model/Thresholds.java -- Double and not double, because null there means NO "
+        "FLOOR IS CONFIGURED and a primitive would render that as 0.0, which is a "
+        "configured floor at zero and a different deployment."
+    ),
+    ("ThresholdsView", "absoluteScoreMetric"): (
+        "The metric that floor is compared against. Closes with "
+        '`@JsonProperty("absoluteScoreMetric") String absoluteScoreMetric` on '
+        "model/Thresholds.java. An open string, not an enum: `unknown` is a real value and "
+        "a caller's own vector store may declare a metric this library has never seen."
+    ),
+    ("StatusResponseView", "calibration"): (
+        "NM-V2-03 SC-7: the corpus the shipped defaults were fitted on, plus every setting "
+        "this deployment has overridden. Closes with "
+        '`@JsonProperty("calibration") Calibration calibration` on model/ServiceStatus.java '
+        "and the two records named in _NOT_ON_THE_JAVA_SIDE_YET."
+    ),
+}
+
+# Published schema -> why the Java client has no record for it yet. Separate from
+# `_NOT_RESTATED_AS_A_RECORD`, which is for schemas that are carried by something OTHER
+# than a record and are therefore finished; these are unfinished.
+_NOT_ON_THE_JAVA_SIDE_YET: dict[str, str] = {
+    "CalibrationView": (
+        "reachable only through StatusResponseView.calibration, which is recorded in "
+        "_UNBOUND_ON_THE_JAVA_SIDE. Closes as model/Calibration.java."
+    ),
+    "CalibrationCorpusView": (
+        "reachable only through CalibrationView.corpus. Closes as model/CalibrationCorpus.java."
+    ),
+}
+
+
+# =============================================================================
 # THE PUBLISHED ENUMS
 # =============================================================================
 
@@ -260,6 +318,47 @@ def _mapped_statuses(source: str) -> set[int]:
     return statuses
 
 
+def _refs(node: object) -> set[str]:
+    """Every `#/components/schemas/X` name reachable anywhere inside a JSON fragment."""
+    found: set[str] = set()
+    if isinstance(node, dict):
+        target = node.get("$ref")
+        if isinstance(target, str) and target.startswith("#/components/schemas/"):
+            found.add(target.rsplit("/", 1)[-1])
+        for value in node.values():
+            found |= _refs(value)
+    elif isinstance(node, list):
+        for value in node:
+            found |= _refs(value)
+    return found
+
+
+def _response_schema_names(spec: dict) -> set[str]:
+    """
+    Every schema a client DECODES, closed over nested references.
+
+    Request bodies are deliberately excluded. A record the client only ever serialises is
+    never handed a member it does not declare, so `ignoreUnknown` says nothing about it --
+    and asserting it there would be a rule with no failure mode, which is the decoration
+    this file is written to avoid.
+    """
+    reachable: set[str] = set()
+    for operations in spec["paths"].values():
+        for operation in operations.values():
+            if isinstance(operation, dict):
+                reachable |= _refs(operation.get("responses", {}))
+
+    schemas = spec["components"]["schemas"]
+    frontier = set(reachable)
+    while frontier:
+        nested = set()
+        for name in frontier:
+            nested |= _refs(schemas.get(name, {}))
+        frontier = nested - reachable
+        reachable |= nested
+    return reachable
+
+
 def _published_failure_statuses(spec: dict) -> set[int]:
     """Every >=400 status any published operation declares it can answer."""
     statuses: set[int] = set()
@@ -294,7 +393,8 @@ def test_every_published_schema_property_has_a_java_record_component():
             f"It was renamed or removed and _SCHEMA_TO_JAVA is stale."
         )
         bound = _wire_names(_java(java_file))
-        missing = published - bound
+        recorded = {member for schema, member in _UNBOUND_ON_THE_JAVA_SIDE if schema == schema_name}
+        missing = published - bound - recorded
         if missing:
             findings.append(
                 f"{schema_name} -> {java_file}: no Java component binds "
@@ -307,7 +407,10 @@ def test_every_published_schema_property_has_a_java_record_component():
         + "\n  ".join(findings)
         + "\nAdd the component with its @JsonProperty to the record named above. If the "
         "member is deliberately not carried, say so in _SCHEMA_TO_JAVA's neighbourhood "
-        "rather than deleting the entry."
+        "rather than deleting the entry. If it is not carried YET -- the wire moved in "
+        "one part of this repository and the hand-written client has not caught up -- "
+        "record it in _UNBOUND_ON_THE_JAVA_SIDE with the component that closes it, which "
+        "test_the_java_debt_record_is_current then holds to."
     )
 
 
@@ -321,12 +424,14 @@ def test_every_published_schema_is_either_restated_or_deliberately_not():
     vacuity this directory was built to catch, one level up.
     """
     published = set(_openapi()["components"]["schemas"])
-    accounted = set(_SCHEMA_TO_JAVA) | set(_NOT_RESTATED_AS_A_RECORD)
+    accounted = (
+        set(_SCHEMA_TO_JAVA) | set(_NOT_RESTATED_AS_A_RECORD) | set(_NOT_ON_THE_JAVA_SIDE_YET)
+    )
     unaccounted = published - accounted
     assert not unaccounted, (
-        f"these published schemas are in neither _SCHEMA_TO_JAVA nor "
-        f"_NOT_RESTATED_AS_A_RECORD, so nothing checks whether the Java client covers "
-        f"them: {sorted(unaccounted)}"
+        f"these published schemas are in neither _SCHEMA_TO_JAVA, "
+        f"_NOT_RESTATED_AS_A_RECORD nor _NOT_ON_THE_JAVA_SIDE_YET, so nothing checks "
+        f"whether the Java client covers them: {sorted(unaccounted)}"
     )
 
     stale = accounted - published
@@ -339,6 +444,99 @@ def test_every_published_schema_is_either_restated_or_deliberately_not():
     # quietly drop them and leave the gate technically passing.
     for required in ("MatchCandidateView", "GovernanceView"):
         assert required in _SCHEMA_TO_JAVA, f"{required} must stay covered by this gate"
+
+    overlap = sorted(set(_NOT_ON_THE_JAVA_SIDE_YET) & set(_SCHEMA_TO_JAVA))
+    assert not overlap, (
+        f"these schemas are recorded as not-on-the-Java-side-yet AND mapped to a Java "
+        f"record, so the debt record is claiming a gap the mapping says is closed: "
+        f"{overlap}"
+    )
+
+
+@pytest.mark.skipif(_CLIENT_ABSENT, reason=_ABSENT_REASON)
+def test_the_java_debt_record_is_current():
+    """
+    Every recorded gap is still a gap, in both directions.
+
+    A debt record that outlives its debt is worse than no record: it reads as a live
+    exception, so the next reader believes a member is deliberately unbound when the Java
+    side has carried it for months -- and the gate above is silently no longer checking it.
+    That is the same rot `test_no_allowlist_entry_has_gone_stale` guards in
+    `test_architecture.py`, and the same rot the `.ci-exceptions.yaml` check exists for.
+
+    So an entry fails when the member stopped being published (the wire moved on and the
+    note is describing nothing), and it fails when the Java component HAS been added (the
+    debt is paid; delete the line). The only way an entry survives is by still being true.
+    """
+    schemas = _openapi()["components"]["schemas"]
+
+    gone: list[str] = []
+    paid: list[str] = []
+    for (schema_name, member), reason in sorted(_UNBOUND_ON_THE_JAVA_SIDE.items()):
+        assert reason.strip(), f"{schema_name}.{member} is recorded with no reason"
+        if member not in schemas.get(schema_name, {}).get("properties", {}):
+            gone.append(f"{schema_name}.{member}")
+            continue
+        java_file = _SCHEMA_TO_JAVA.get(schema_name)
+        assert java_file is not None, (
+            f"{schema_name} is recorded as having an unbound member but is not in "
+            f"_SCHEMA_TO_JAVA, so nothing was ever checking it"
+        )
+        if member in _wire_names(_java(java_file)):
+            paid.append(f"{schema_name}.{member} -> {java_file}")
+
+    assert not gone, (
+        "these members are recorded as unbound on the Java side but are no longer "
+        "published at all, so the record describes nothing; delete the entries:\n  "
+        + "\n  ".join(gone)
+    )
+    assert not paid, (
+        "the Java client now binds these members, so the debt is paid and the record is "
+        "suppressing a check that would otherwise be live; delete the entries:\n  "
+        + "\n  ".join(paid)
+    )
+
+    restated = sorted(name for name in _NOT_ON_THE_JAVA_SIDE_YET if name in _SCHEMA_TO_JAVA)
+    assert not restated, (
+        f"these schemas are recorded as having no Java record while _SCHEMA_TO_JAVA names "
+        f"one for them: {restated}"
+    )
+
+
+@pytest.mark.skipif(_CLIENT_ABSENT, reason=_ABSENT_REASON)
+def test_the_java_records_ignore_members_they_do_not_carry():
+    """
+    The property that makes recording a gap honest rather than reckless.
+
+    An unbound member is only survivable for a Java caller because Jackson is told to
+    ignore what the record does not declare. If a record ever loses that annotation, an
+    unbound member stops being invisible and becomes an exception on a response that was
+    perfectly valid -- and `_UNBOUND_ON_THE_JAVA_SIDE` would then be a table of ways to
+    break the client rather than a table of things it cannot yet read.
+
+    Asserted over every RESPONSE record the contract table names, not only the ones with
+    recorded gaps: the next gap can land on any of them. Request records are out of scope
+    and `_response_schema_names` says why.
+    """
+    spec = _openapi()
+    decoded = _response_schema_names(spec)
+    assert decoded, "no response schemas were resolved -- this check would prove nothing"
+    covered = sorted(name for name in _SCHEMA_TO_JAVA if name in decoded)
+    assert len(covered) > 5, (
+        f"only {len(covered)} decoded records are being checked; the reference walk is "
+        f"broken and this assertion is close to vacuous"
+    )
+
+    naked = [
+        _SCHEMA_TO_JAVA[name]
+        for name in covered
+        if "@JsonIgnoreProperties(ignoreUnknown = true)" not in _java(_SCHEMA_TO_JAVA[name])
+    ]
+    assert not naked, (
+        "these Java records do not tell Jackson to ignore members they do not declare, so "
+        "a member added to the wire would throw in the client instead of being invisible "
+        "to it:\n  " + "\n  ".join(naked)
+    )
 
 
 @pytest.mark.skipif(_CLIENT_ABSENT, reason=_ABSENT_REASON)

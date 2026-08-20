@@ -26,19 +26,26 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import ClassVar
 
 import httpx
 import pytest
 from fastapi.testclient import TestClient
 
 from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+from nexus_matcher.domain.governance import OPEN_CLASSIFICATION
 from nexus_matcher.domain.models.entities import DictionaryEntry
+from nexus_matcher.domain.ports.entry_lookup import EntryLookup, MappingEntryLookup
 from nexus_matcher.presentation.api.app import create_app
+from nexus_matcher.presentation.api.errors import MalformedRequestError
 from nexus_matcher.presentation.api.limits import MatchServiceLimits, worst_case_body_bytes
 from nexus_matcher.presentation.api.lookup import (
     MAX_DICTIONARY_ID_CHARS,
+    DictionaryLookup,
     LookupResponseView,
+    LookupService,
 )
+from nexus_matcher.presentation.api.matching import MatcherHandle
 from nexus_matcher.shared.types.base import DataType, ProtectionLevel
 from tests.unit.presentation.api._support import (
     GLOSSARY,
@@ -401,6 +408,132 @@ class TestRefusals:
 
         assert response.status_code == 500, response.text
         assert response.json()["error"]["details"]["attribute"] == "_dictionary_entries"
+
+
+# =============================================================================
+# THE PORT
+# =============================================================================
+
+
+class TestThePlaneDependsOnThePortAndNotOnAMatcher:
+    """
+    NM-V2-01 AR-5: lookup is architecturally distinct from matching and deserves its own
+    port. Before this, `lookup.py` reached into `NexusMatcher._dictionary_entries` from the
+    handler and the whole plane was welded to one application object.
+
+    The evidence is not that a port exists -- a protocol nobody depends on is documentation.
+    It is that `LookupService` serves a complete, schema-valid response when driven by a
+    domain object built from a plain dict, with no `NexusMatcher`, no `MatcherHandle` and no
+    private attribute anywhere in the call.
+    """
+
+    def _service(self, lookup: EntryLookup) -> LookupService:
+        return LookupService(lookup, MatchServiceLimits())
+
+    def test_a_dict_backed_port_serves_the_whole_response(self):
+        lookup = MappingEntryLookup.from_entries(GLOSSARY, governance_vocabulary())
+        body = self._service(lookup).resolve(["LWP-0003", "NOT-A-TERM"])
+
+        # The full contract, from an object the application layer has never heard of.
+        LookupResponseView.model_validate(body)
+        assert tuple(body) == RESPONSE_KEYS
+        assert body["results"]["LWP-0003"]["businessName"] == "Monthly Usage Litres"
+        assert body["results"]["NOT-A-TERM"] is None
+        assert body["missing"] == ["NOT-A-TERM"]
+
+    def test_the_class_comes_from_the_ports_own_vocabulary(self):
+        """
+        The enrichment surface, resolved through the vocabulary the PORT carries. A plane
+        that had to reach past its port for the vocabulary would still be coupled to
+        whatever holds it.
+        """
+        lookup = MappingEntryLookup.from_entries(GLOSSARY, governance_vocabulary())
+        body = self._service(lookup).resolve(["LWP-0001"])
+
+        assert body["results"]["LWP-0001"]["governance"]["classification"] is not None
+        assert body["vocabulary"]["openClassification"] == TIER_OPEN
+
+    def test_a_port_with_no_vocabulary_answers_null_rather_than_inventing_a_tier(self):
+        """
+        `GovernanceVocabulary.empty()` is the honest answer for an unconfigured deployment:
+        every entry's class is null and `vocabulary.openClassification` is the sentinel that
+        makes those nulls readable. This library ships no taxonomy, so a guess here would be
+        one.
+        """
+        lookup = MappingEntryLookup.from_entries(GLOSSARY)
+        body = self._service(lookup).resolve(["LWP-0001"])
+
+        assert body["results"]["LWP-0001"]["governance"] is None
+        assert body["vocabulary"]["openClassification"] == OPEN_CLASSIFICATION
+        assert body["vocabulary"]["tiersMostOpenFirst"] == []
+
+    def test_the_refusals_are_the_ports_too(self):
+        """
+        Validation happens before resolution and does not need a matcher either, so the
+        duplicate-id 422 that names the offenders is reachable through any implementation.
+        """
+        service = self._service(MappingEntryLookup.from_entries(GLOSSARY))
+
+        with pytest.raises(MalformedRequestError) as refused:
+            service.resolve(["LWP-0001", "LWP-0001"])
+
+        assert refused.value.details["duplicate_ids"] == ["LWP-0001"]
+
+    def test_the_shipped_adapter_satisfies_the_port(self):
+        """
+        `DictionaryLookup` is what `create_app` actually wires in, so a change that broke
+        its conformance would take the live server with it while every port-driven test
+        above stayed green.
+        """
+        assert isinstance(DictionaryLookup(MatcherHandle()), EntryLookup)
+
+    def test_the_adapter_prefers_the_port_over_the_private_attribute(self):
+        """
+        The private read is a FALLBACK. A matcher that implements `EntryLookup` is served
+        through it, which is what makes the day another lane publishes an accessor a no-op
+        in this file rather than an edit.
+
+        The stub carries a `_dictionary_entries` that would answer DIFFERENTLY, so a
+        response matching the port's answer cannot have come from the fallback.
+        """
+
+        class PortMatcher:
+            # The WRONG entry, on purpose: the fallback path must not be able to produce
+            # the answer this test asserts. `ClassVar` because ruff is right that a mutable
+            # class attribute is a footgun, and wrong that this one is shared state -- one
+            # instance is constructed and nothing writes to it.
+            _dictionary_entries: ClassVar[dict[str, DictionaryEntry]] = {"LWP-0001": GLOSSARY[1]}
+
+            @property
+            def vocabulary(self):
+                return governance_vocabulary()
+
+            def lookup(self, entry_id):
+                return self.lookup_many([entry_id])[0]
+
+            def lookup_many(self, entry_ids):
+                by_id = {entry.id: entry for entry in GLOSSARY}
+                return [by_id.get(entry_id) for entry_id in entry_ids]
+
+        matcher = PortMatcher()
+        assert isinstance(matcher, EntryLookup)
+        assert matcher._dictionary_entries["LWP-0001"] is not GLOSSARY[0]
+
+        handle = MatcherHandle()
+        handle.bind(matcher)
+        body = self._service(DictionaryLookup(handle)).resolve(["LWP-0001"])
+
+        assert body["results"]["LWP-0001"]["governanceId"] == GLOSSARY[0].id
+        assert body["results"]["LWP-0001"]["businessName"] == GLOSSARY[0].business_name
+
+    def test_the_port_refuses_a_glossary_with_two_entries_under_one_id(self):
+        """
+        Last-one-wins would make an entry unreachable through this port forever, and which
+        one depends on iteration order -- a term that "does not exist" while sitting in the
+        file.
+        """
+        with pytest.raises(ValueError, match="duplicate dictionary id"):
+            MappingEntryLookup.from_entries((*GLOSSARY, GLOSSARY[0]))
 
 
 class TestAdmissionControl:

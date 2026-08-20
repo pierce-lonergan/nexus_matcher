@@ -61,7 +61,9 @@ exposes no public equivalent:
   * `NexusMatcher._match_fields` -- the only way to match a LIST OF FIELDS. The public
     `match_schema` takes a schema source and runs a parser; this endpoint's caller has
     already parsed their schema and is sending fields. `tests/properties/test_conservation`
-    and three museum entries reach the same method for the same reason.
+    and three museum entries reach the same method for the same reason. Its optional
+    `signals` keyword carries the query-signal channel (AR-6), and is passed ONLY when the
+    caller sent signals -- see `_invoke_matcher` for why that conditional is deliberate.
   * `NexusMatcher._config` -- the weights `explain` reports, read off the LIVE matcher so
     a tuned deployment gets a response that reproduces ITS numbers, not the shipped ones.
     Same pattern, and same justification, as the CLI's `_MATCHER_CONFIG_ATTR`.
@@ -438,8 +440,24 @@ def _to_schema_field(spec: FieldSpec) -> SchemaField:
     `flattened_name` is set to the caller's own path so the matcher's result keys ARE the
     caller's keys. `_project_results` checks that independently of the order-based mapping,
     which gives two oracles for the conservation law instead of one that agrees with itself.
+
+    Per-FIELD query signals (AR-6) travel under `QUERY_SIGNALS_METADATA_KEY`, nested
+    rather than spread across `source_metadata`'s top level. `source_metadata` is a shared
+    bag that already holds `flattened_name` and that the domain scorer already reads a bare
+    `domain` key out of, so spreading signals over it would silently reinterpret data an
+    existing caller may already put there. The key is absent entirely when the caller sent
+    no signals, so a field built from a signal-free spec is the object it always was.
     """
+    # Deferred for the same reason `MatchingConfig` is deferred below: the module that
+    # owns this name pulls numpy and the whole matching stack, and importing it at module
+    # scope would put that on the OpenAPI generation path. Imported rather than restated
+    # because a hand-copied key is how the two halves of one contract drift apart.
+    from nexus_matcher.application.use_cases.match_schema import QUERY_SIGNALS_METADATA_KEY
+
     parent, _, _leaf = spec.path.rpartition(".")
+    source_metadata: dict[str, Any] = {"flattened_name": spec.path}
+    if spec.signals:
+        source_metadata[QUERY_SIGNALS_METADATA_KEY] = spec.signals
     return SchemaField(
         name=spec.name,
         # from_string never raises: an unrecognised type normalises to UNKNOWN, which
@@ -449,7 +467,7 @@ def _to_schema_field(spec: FieldSpec) -> SchemaField:
         full_path=spec.path,
         parent_path=parent,
         description=spec.doc,
-        source_metadata={"flattened_name": spec.path},
+        source_metadata=source_metadata,
     )
 
 
@@ -979,7 +997,7 @@ class MatchService:
         fields = [_to_schema_field(spec) for spec in specs]
         matched = await run_bounded(
             self._pool,
-            lambda: _invoke_matcher(matcher, fields),
+            lambda: _invoke_matcher(matcher, fields, request.signals),
             self._limits.deadline_seconds,
         )
 
@@ -1003,7 +1021,9 @@ class MatchService:
 
 
 def _invoke_matcher(
-    matcher: object, fields: list[SchemaField]
+    matcher: object,
+    fields: list[SchemaField],
+    signals: dict[str, Any] | None = None,
 ) -> dict[str, tuple[MatchResult, ...]]:
     """
     Call the matcher on the worker thread, converting any failure into a named 5xx.
@@ -1011,6 +1031,14 @@ def _invoke_matcher(
     Letting the raw exception escape also produces a 500, but an anonymous one, by a path
     that depends on middleware ordering. The adopter's fallback keys on the status code
     and their operator keys on the message; both deserve to be deterministic.
+
+    THE CALL IS UNCHANGED WHEN NO SIGNALS ARE SENT, and that is deliberate rather than
+    tidy. `matcher` is duck-typed -- this module reaches it through `_MATCH_FIELDS_ATTR`
+    and raises `ContractDriftError` when the attribute is missing, precisely because it is
+    not this layer's object. Passing a new keyword to it unconditionally would break every
+    collaborator that implements today's signature, for requests that had nothing to say.
+    So the extended call happens only when a caller has actually opted in, which is also
+    the guarantee the channel is required to keep.
     """
     match_fields = getattr(matcher, _MATCH_FIELDS_ATTR, None)
     if match_fields is None:
@@ -1024,6 +1052,8 @@ def _invoke_matcher(
     from nexus_matcher.shared.exceptions import NexusMatcherError
 
     try:
+        if signals:
+            return match_fields(fields, signals=signals)
         return match_fields(fields)
     except NexusMatcherError:
         # Already carries its own code and status; re-wrapping would hide a 503 behind a

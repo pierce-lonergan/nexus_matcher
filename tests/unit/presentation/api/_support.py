@@ -441,11 +441,23 @@ class FakeMatcher:
         self._mangle_keys = mangle_keys
         self._serve_wrong_field = serve_wrong_field
         self.calls = 0
+        # One entry per call: the `signals` keyword as it arrived, or None when the
+        # endpoint used the unextended call.
+        self.signals_seen: list[dict[str, object] | None] = []
         self.started = threading.Event()
         self.release = threading.Event()
         self.release.set()
 
-    def _match_fields(self, fields: list[SchemaField]) -> dict[str, tuple[MatchResult, ...]]:
+    def _match_fields(
+        self,
+        fields: list[SchemaField],
+        signals: dict[str, object] | None = None,
+    ) -> dict[str, tuple[MatchResult, ...]]:
+        # `signals` is recorded, never acted on. The endpoint's contract is that it hands
+        # the channel over intact and passes it ONLY when the caller sent one, so a test
+        # needs to see both the value and whether the keyword arrived at all; a stub that
+        # merely accepted it could not tell those apart.
+        self.signals_seen.append(signals)
         self.calls += 1
         self.started.set()
         if self._delay_seconds:

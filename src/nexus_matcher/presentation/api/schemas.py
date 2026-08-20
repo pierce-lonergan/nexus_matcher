@@ -52,6 +52,22 @@ _MAX_PATH = 1024
 _MAX_DOC = 8192
 _MAX_TYPE = 128
 
+# Bounds on the query-signal channel (see `FieldSpec.signals` and `MatchRequest.signals`).
+#
+# A resource limit, NOT an opinion about content. The channel exists so a deployment can
+# send context this library has no vocabulary for, so nothing here inspects a key or a
+# value -- only how much of it there is, and how deeply it nests. That is the same
+# standard `_MAX_DOC` applies to a column comment: refuse an out-of-memory, never refuse
+# a meaning.
+_MAX_FIELD_SIGNAL_CHARS = 1024
+_MAX_SIGNAL_DEPTH = 6
+
+# The request-level budget is much larger because the abbreviation overlay lives here and
+# a real approved-abbreviation catalog is thousands of rows. 512 KiB of characters holds
+# roughly 11,000 `{short: long}` rows at realistic lengths, with room to spare over the
+# largest catalogs this channel was designed for.
+MAX_REQUEST_SIGNAL_CHARS = 524_288
+
 # The largest one `FieldSpec` may be, in CHARACTERS, with every string at its bound.
 #
 # Exported because `limits.py` derives the raw-body byte cap from it rather than typing a
@@ -59,18 +75,113 @@ _MAX_TYPE = 128
 # a body `FieldSpec` itself accepts, so the caller reads two documents from this service
 # and they contradict each other -- and a byte cap that stayed put while `_MAX_DOC` grew
 # would do exactly that, silently, on the next edit to this block.
-MAX_FIELD_SPEC_CHARS = _MAX_NAME + _MAX_PATH + _MAX_DOC + _MAX_TYPE
+#
+# `_MAX_FIELD_SIGNAL_CHARS` is in the sum for exactly that reason: `signals` is per-field
+# payload, so it grows the per-field worst case and must grow the derived cap with it.
+#
+# WHAT THIS CONSTANT STILL DOES NOT COVER, said out loud. `MAX_REQUEST_SIGNAL_CHARS` is
+# ENVELOPE-level, and `worst_case_body_bytes` has no envelope term to put it in -- its
+# `_FRAMING_BYTES` covers `{"fields":[...],"top_k":5}` and nothing larger. It cannot be
+# folded in here either: this number is multiplied by `max_batch_fields`, so an envelope
+# allowance added to it would be counted up to 250 times and would raise the byte cap by
+# hundreds of megabytes. The consequence is one narrow corner -- a maximal 250-field body
+# in which every character is four UTF-8 bytes, carrying a maximal overlay, is inside
+# every declared model bound and over the derived byte cap. It is the same shape as the
+# `\\uXXXX` corner `worst_case_body_bytes` already documents, with the same escape hatch
+# (`NEXUS_API_MAX_BODY_BYTES`), and the same fix: an envelope term in that function, whose
+# module owns it. `MAX_REQUEST_SIGNAL_CHARS` is exported so that fix is a one-line change
+# there rather than a second literal.
+MAX_FIELD_SPEC_CHARS = _MAX_NAME + _MAX_PATH + _MAX_DOC + _MAX_TYPE + _MAX_FIELD_SIGNAL_CHARS
+
+
+def _signal_map_chars(value: Any, depth: int = 0) -> int:
+    """
+    How many characters a signal map spends, and how deep it goes.
+
+    Returns the character count, or -1 when the structure nests deeper than
+    `_MAX_SIGNAL_DEPTH`. Depth is bounded rather than trusted because the channel accepts
+    arbitrary JSON, and a body that is small on the wire can still be a nesting bomb after
+    parsing -- and because the alternative, recursing until Python's own limit, turns a
+    caller's mistake into a 500.
+    """
+    if depth > _MAX_SIGNAL_DEPTH:
+        return -1
+    if isinstance(value, dict):
+        total = 0
+        for key, item in value.items():
+            inner = _signal_map_chars(item, depth + 1)
+            if inner < 0:
+                return -1
+            total += len(str(key)) + inner
+        return total
+    if isinstance(value, (list, tuple)):
+        total = 0
+        for item in value:
+            inner = _signal_map_chars(item, depth + 1)
+            if inner < 0:
+                return -1
+            total += inner
+        return total
+    return len(str(value))
+
+
+def _check_signal_budget(signals: dict[str, Any], budget: int, where: str) -> None:
+    """Refuse a signal map that is over budget or over-nested, naming which."""
+    if not signals:
+        return
+    size = _signal_map_chars(signals)
+    if size < 0:
+        raise ValueError(
+            f"`{where}` nests deeper than {_MAX_SIGNAL_DEPTH} levels. The query-signal "
+            f"channel accepts any keys this server does not recognise, but it is bounded: "
+            f"send a flatter structure."
+        )
+    if size > budget:
+        raise ValueError(
+            f"`{where}` spends {size} characters, over this server's budget of {budget}. "
+            f"The query-signal channel is bounded so that an unrecognised key cannot "
+            f"exhaust the server's memory; send a smaller map."
+        )
+
+
+_SIGNALS_DESCRIPTION = (
+    "Query-side context this server does not derive: caller-supplied signals about the "
+    "REQUEST rather than about the dictionary. Open by design -- keys this server does "
+    "not recognise are carried and ignored, never refused, so a deployment can send "
+    "signals this library has no opinion about. Recognised here: `abbreviations` (alias "
+    "`abbreviation_overlay`), a `{short: long}` map merged into the query-side "
+    "abbreviation expander FOR THIS REQUEST ONLY; `entity` (alias `parent_record`), the "
+    "parent record a field came from, used as parent context when the path does not carry "
+    "it; `domain` (aliases `domain_prior`, `namespace`), a domain hint that boosts "
+    "dictionary terms declaring that domain. Every one is optional and omitting all of "
+    "them is the shipped behaviour."
+)
 
 
 class FieldSpec(BaseModel):
     """
     One schema field a caller wants governance for.
 
-    `extra="forbid"` on purpose. A misspelled `documentation` silently ignored would drop
-    the column comment, and the column comment is real retrieval signal -- the caller
-    would get measurably worse matches and no indication why. This is the same standard
-    `_load_matching_config` applies to a mistyped `auto_approve_treshold`: a quietly
-    discarded input is worse than a loud failure.
+    `extra="forbid"` on purpose, AND `signals` is an open map. Those two are not in
+    tension -- they are the resolution of one, and it is worth stating which problem each
+    solves.
+
+    `forbid` exists because a misspelled `documentation` silently ignored would drop the
+    column comment, and the column comment is real retrieval signal: the caller would get
+    measurably worse matches with nothing in the response to show for it. That is the same
+    standard `_load_matching_config` applies to a mistyped `auto_approve_treshold`.
+
+    But `forbid` on this model also forecloses the extension the library most needs
+    (AR-6): a deployment that knows something about the query -- its live abbreviation
+    catalog, its parent record, its namespace -- had no way to say so, and got a 422 for
+    trying. Relaxing to `extra="allow"` would buy that at the price of the typo gate,
+    which is the wrong trade: a typo and an extension are different events and deserve
+    different answers.
+
+    So the extension point is DECLARED rather than implied. `signals` is a named field
+    whose VALUE is open. A misspelled `doc` is still a 422; a signal this server has never
+    heard of is carried and ignored; and the set of signals this server does interpret is
+    published in the schema instead of living in the library's source.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -94,6 +205,14 @@ class FieldSpec(BaseModel):
         max_length=_MAX_TYPE,
         description="Source type name, normalised server-side. Unknown types are accepted.",
     )
+    signals: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Per-FIELD query signals, overriding the request-level `signals` key by key. "
+            "A flattened export can carry columns from several parent records, so `entity` "
+            "cannot be request-scoped only. " + _SIGNALS_DESCRIPTION
+        ),
+    )
 
     @model_validator(mode="after")
     def _default_path_to_name(self) -> FieldSpec:
@@ -101,9 +220,13 @@ class FieldSpec(BaseModel):
         An omitted `path` falls back to `name`, so a caller with flat columns need not
         invent one. Done here rather than in the handler so the value the response is
         keyed by is fixed at parse time and there is exactly one place it comes from.
+
+        The signal budget is checked in the same pass, so an over-large map is a 422
+        naming the bound rather than a body the server buffers and then chokes on.
         """
         if not self.path:
             self.path = self.name
+        _check_signal_budget(self.signals, _MAX_FIELD_SIGNAL_CHARS, "signals")
         return self
 
 
@@ -163,6 +286,21 @@ class MatchRequest(BaseModel):
             "so the number can be recomputed from the response itself."
         ),
     )
+    signals: dict[str, Any] = Field(
+        default_factory=dict,
+        description=(
+            "Request-level query signals, applied to every field unless that field "
+            "overrides the same key. The abbreviation overlay belongs here rather than on "
+            "a field: it is a catalog, and it is scoped to this one request -- nothing "
+            "about it survives into the next. " + _SIGNALS_DESCRIPTION
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _bound_request_signals(self) -> MatchRequest:
+        """Refuse an over-large or over-nested request-level signal map at parse time."""
+        _check_signal_budget(self.signals, MAX_REQUEST_SIGNAL_CHARS, "signals")
+        return self
 
 
 class FeedbackRequest(BaseModel):

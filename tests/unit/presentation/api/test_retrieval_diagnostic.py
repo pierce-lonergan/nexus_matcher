@@ -344,7 +344,11 @@ class TestRefusals:
             response = client.post("/api/v1/diag/retrieval", json={"field": RESIDENT_FIELD})
 
         assert response.status_code == 500, response.text
-        assert response.json()["error"]["details"]["attribute"] == "_build_query_text"
+        # `_resolve_query`, not `_build_query_text`: this route reports the query the
+        # MATCH route would have built, and only the resolver applies the caller's
+        # signals. Naming the bare builder here would let a matcher that resolves no
+        # signals pass a check whose whole purpose is that the two doors agree.
+        assert response.json()["error"]["details"]["attribute"] == "_resolve_query"
 
     def test_an_unknown_request_key_is_refused(self, real_client):
         response = real_client.post(
@@ -366,13 +370,13 @@ class TestRefusals:
         assertion is being smuggled in here.
         """
         matcher = build_api_matcher()
-        slow = matcher._build_query_text
+        slow = matcher._resolve_query
 
-        def _crawl(field):
+        def _crawl(field, query_text, signals):
             time.sleep(2.0)
-            return slow(field)
+            return slow(field, query_text, signals)
 
-        matcher._build_query_text = _crawl
+        matcher._resolve_query = _crawl
         limits = MatchServiceLimits(deadline_seconds=0.05, max_workers=2, max_queued=4)
         with client_for(matcher, limits=limits) as client:
             response = client.post("/api/v1/diag/retrieval", json={"field": RESIDENT_FIELD})

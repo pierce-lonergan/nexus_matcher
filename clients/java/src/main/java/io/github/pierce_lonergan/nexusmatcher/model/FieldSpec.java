@@ -6,6 +6,7 @@ import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 /**
@@ -40,7 +41,20 @@ public record FieldSpec(
         @JsonProperty("doc") String doc,
 
         /** Source type name, normalised server-side. Unknown types are accepted. */
-        @JsonProperty("type") String type) {
+        @JsonProperty("type") String type,
+
+        /** Per-field query signals: the declared extension point for context this library
+         *  has no opinion about. Known keys are {@code abbreviations} (a short-to-long map
+         *  merged for THIS REQUEST ONLY -- the point being that a live catalog changes
+         *  between calls, so a startup-time file cannot substitute), {@code entity} (the
+         *  parent record name) and {@code domain} (a namespace or domain hint). A key the
+         *  server does not know is CARRIED, not rejected.
+         *
+         *  Deliberately untyped: the values are the caller's vocabulary and closing over
+         *  them here would make this artifact refuse signals a newer deployment understands.
+         *  Note the asymmetry -- an unknown key beside {@code doc} is still a 422, because a
+         *  typo and an extension are different events. Null sends nothing. */
+        @JsonProperty("signals") Map<String, Object> signals) {
 
     public FieldSpec {
         // `name` only. The server's own length caps and field-count caps are deliberately NOT
@@ -56,27 +70,27 @@ public record FieldSpec(
 
     /** A field identified by name alone; the server keys the response by {@code name}. */
     public static FieldSpec of(String name) {
-        return new FieldSpec(name, null, null, null);
+        return new FieldSpec(name, null, null, null, null);
     }
 
     /** A field with the dotted path the response will be keyed by. */
     public static FieldSpec of(String name, String path) {
-        return new FieldSpec(name, path, null, null);
+        return new FieldSpec(name, path, null, null, null);
     }
 
     /** The shape worth sending: a dotted path, the column comment, and the source type. */
     public static FieldSpec of(String name, String path, String doc, String type) {
-        return new FieldSpec(name, path, doc, type);
+        return new FieldSpec(name, path, doc, type, null);
     }
 
     /** This field with a different {@code doc}. */
     public FieldSpec withDoc(String newDoc) {
-        return new FieldSpec(name, path, newDoc, type);
+        return new FieldSpec(name, path, newDoc, type, null);
     }
 
     /** This field with a different {@code type}. */
     public FieldSpec withType(String newType) {
-        return new FieldSpec(name, path, doc, newType);
+        return new FieldSpec(name, path, doc, newType, null);
     }
 
     /**

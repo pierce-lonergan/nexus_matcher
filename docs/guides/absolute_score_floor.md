@@ -309,12 +309,23 @@ right answers lost: 0
 `scoring.absoluteScoreFloor`, `null` when none is configured. That is the value a consumer
 should quote when it explains a `NO_MATCH`.
 
-It is **not** on `GET /api/v1/status`. That route's `thresholds` block publishes
-`autoApprove`, `review`, `minConfidenceGap`, `resultsPerField`, `fusionAlpha`,
-`minimumAchievableConfidence` and `reviewThresholdBelowFloor`, and no floor. Verified
-against a live service on 2026-08-19 with a floor configured: the response was identical to
-the one without. If you need to check what a deployment has set without matching anything,
-send a one-field match and read `scoring`.
+It is **also** on `GET /api/v1/status`, as `thresholds.absoluteScoreFloor`, beside
+`thresholds.absoluteScoreMetric` which names what the floor is compared against. Both are
+read off the same properties the match response reads, so the two surfaces cannot report
+different floors for one server. That is the route to use when you want to check what a
+deployment has set **without matching anything** — which is also the only way to see it on a
+server whose dictionary has not loaded.
+
+> Until 2026-08-20 the status route carried no floor, and this section said so: the only way
+> to read one was to send a one-field match. An operator who cannot see the active floor
+> cannot tell an emitted `NO_MATCH` from a field the matcher simply had nothing for, so it is
+> published there now. `null` on that route means *no floor is configured*, which is the
+> opposite convention from the rest of that block, where `null` means "this matcher does not
+> expose it".
+
+Which numbers a deployment has moved away from the shipped defaults, and what the shipped
+ones were fitted on, is the neighbouring `calibration` block —
+[Calibration profiles](calibration_profiles.md).
 
 ---
 

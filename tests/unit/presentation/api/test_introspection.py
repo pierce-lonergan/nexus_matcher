@@ -44,7 +44,11 @@ from nexus_matcher.presentation.api.introspect import (
 )
 from nexus_matcher.presentation.api.limits import BoundedWorkPool, MatchServiceLimits
 from nexus_matcher.presentation.api.matching import MatcherHandle
-from tests.unit.presentation.api._support import FakeMatcher, build_api_matcher
+from tests.unit.presentation.api._support import (
+    FakeMatcher,
+    build_api_matcher,
+    request_fields,
+)
 
 STATUS_KEYS = (
     "ready",
@@ -54,7 +58,30 @@ STATUS_KEYS = (
     "encoder",
     "thresholds",
     "limits",
+    # APPENDED. `calibration` answers NM-V2-03 SC-7 -- which corpus the shipped defaults
+    # were fitted on -- and NM-V2-01 AR-4's "expose the active profile"; a caller reading
+    # keys positionally must find the seven above unmoved.
+    "calibration",
 )
+
+# The `thresholds` block, in order. A literal rather than a read-back, so a member silently
+# dropped from the payload fails here instead of being confirmed by itself.
+THRESHOLD_KEYS = (
+    "autoApprove",
+    "review",
+    "minConfidenceGap",
+    "resultsPerField",
+    "fusionAlpha",
+    "minimumAchievableConfidence",
+    "reviewThresholdBelowFloor",
+    "absoluteScoreFloor",
+    "absoluteScoreMetric",
+)
+
+# How many entries a dictionary needs before the shipped defaults stop being a statement
+# about anything resembling it: ten times the 688-entry calibration corpus. Written out
+# rather than imported, so a change to either number has to be made twice on purpose.
+UNCALIBRATED_ENTRY_COUNT = 6881
 
 
 def client_for(matcher: object, **kwargs: object) -> TestClient:
@@ -259,6 +286,267 @@ class TestThresholds:
 
         assert body["thresholds"]["minimumAchievableConfidence"] == 0.63
         assert body["thresholds"]["reviewThresholdBelowFloor"] is False
+
+
+# =============================================================================
+# THE ABSOLUTE FLOOR -- the one threshold this surface used to send you elsewhere for
+# =============================================================================
+
+
+class TestTheAbsoluteScoreFloorIsVisible:
+    """
+    NM-V2-01 AR-4 / NM-V2-03 SC-6: an operator must be able to see which calibration is in
+    force. `absolute_score_floor` is the threshold a deployment is most likely to have set,
+    and the only one that produces a verdict -- NO_MATCH -- that nothing else on this body
+    explains. It used to be readable only by sending a match and reading `scoring`.
+    """
+
+    def test_the_block_publishes_every_threshold_in_order(self, real_client):
+        assert tuple(status_of(real_client)["thresholds"]) == THRESHOLD_KEYS
+
+    def test_a_configured_floor_is_reported_with_the_metric_it_is_compared_against(self):
+        tuned = MatchingConfig(absolute_score_floor=0.42)
+        with client_for(build_api_matcher(config=tuned)) as client:
+            reported = status_of(client)["thresholds"]
+
+        assert reported["absoluteScoreFloor"] == 0.42
+        # A floor is a number in whatever space the wired store measures. Publishing the
+        # floor without the metric would let a caller compare it against a cosine on a
+        # server whose store returns dot products.
+        assert reported["absoluteScoreMetric"] == "cosine"
+
+    def test_no_floor_configured_is_null_and_that_is_the_shipped_default(self, real_client):
+        """
+        Null here means NO FLOOR, not "unreadable" -- the opposite convention from the rest
+        of this block, and the reason it is pinned: with no floor this deployment cannot
+        emit NO_MATCH at all, which is a fact about its verdicts and not a missing field.
+        """
+        assert status_of(real_client)["thresholds"]["absoluteScoreFloor"] is None
+
+    def test_the_status_floor_is_the_same_number_a_match_response_publishes(self):
+        """
+        Two surfaces, one server, one floor. A status body and a `scoring` block that
+        disagreed would leave an operator unable to say which one governs the verdicts they
+        are looking at.
+        """
+        tuned = MatchingConfig(absolute_score_floor=0.31)
+        with client_for(build_api_matcher(config=tuned)) as client:
+            from_status = status_of(client)["thresholds"]["absoluteScoreFloor"]
+            matched = client.post("/api/v1/match", json={"fields": request_fields()[:1]})
+
+        assert matched.status_code == 200, matched.text
+        assert from_status == matched.json()["scoring"]["absoluteScoreFloor"] == 0.31
+
+
+# =============================================================================
+# CALIBRATION -- which profile is in force, and what the shipped one was fitted on
+# =============================================================================
+
+
+class TestTheCalibrationBlock:
+    """
+    NM-V2-03 SC-7. A threshold is a statement about a score distribution, so a number
+    fitted on one corpus means something else on another. Until this block existed the
+    corpus behind the shipped numbers reached no machine-readable interface at all -- it
+    was a comment in `MatchingConfig`, which an HTTP consumer never sees.
+    """
+
+    def test_the_shipped_defaults_name_the_corpus_they_were_measured_on(self, real_client):
+        corpus = status_of(real_client)["calibration"]["corpus"]
+
+        # Size, so a caller can compare it against their own dictionary; the splits and
+        # domains, so they can judge whether it is anything like their data; the artifact,
+        # so they can go and read the measurement rather than trust this block.
+        assert corpus["fields"] == 688
+        assert corpus["dictionaryEntries"] == 688
+        assert corpus["splits"] == {"bird": 361, "omop": 327}
+        assert corpus["artifact"] == "benchmarks/results/exp_calibration_combined.json"
+        assert corpus["autoApproveThreshold"] == 0.87
+        assert corpus["autoApprovePrecision"] == 0.952941
+        assert len(corpus["domains"]) == 2
+
+    def test_the_published_threshold_is_the_one_the_corpus_block_was_measured_at(self, real_client):
+        """
+        The pairing is the whole point. A corpus block quoting a precision measured at a
+        threshold this server does not run would be a fact about nothing.
+        """
+        body = status_of(real_client)
+
+        assert (
+            body["thresholds"]["autoApprove"]
+            == body["calibration"]["corpus"]["autoApproveThreshold"]
+        )
+        assert body["calibration"]["defaultsInForce"] is True
+
+    def test_a_stock_deployment_reports_no_overrides(self, real_client):
+        assert status_of(real_client)["calibration"]["overrides"] == {}
+
+    def test_every_changed_setting_is_named_with_its_live_value(self):
+        """
+        The answer to "which calibration is in force". Derived from the config dataclass's
+        own fields, so a setting nobody thought to publish -- the way
+        `absolute_score_floor` itself went unpublished -- still shows up the day a
+        deployment changes it.
+        """
+        tuned = MatchingConfig(
+            auto_approve_threshold=0.8,
+            absolute_score_floor=0.25,
+            dictionary_alias_count=6,
+            expand_query_abbreviations=True,
+            dense_top_k=50,
+        )
+        with client_for(build_api_matcher(config=tuned)) as client:
+            response = client.get("/api/v1/status")
+            calibration = response.json()["calibration"]
+
+        # A populated block, against the PUBLISHED schema: a flag rendered as `1.0` or a
+        # count widened to a float would validate against a loose model and mislead an
+        # operator reading it back.
+        StatusResponseView.model_validate(response.json())
+        assert response.content.decode("ascii") == response.text
+        assert calibration["overrides"] == {
+            "dense_top_k": 50,
+            "auto_approve_threshold": 0.8,
+            "absolute_score_floor": 0.25,
+            "expand_query_abbreviations": True,
+            "dictionary_alias_count": 6,
+        }
+        assert calibration["overrides"]["expand_query_abbreviations"] is True
+        # A deployment that moved a decision threshold has calibrated deliberately.
+        assert calibration["defaultsInForce"] is False
+
+    def test_the_override_keys_are_the_names_an_operator_actually_sets(self):
+        """
+        snake_case, not the camelCase of the rest of the wire, and deliberately: these keys
+        are what goes into a `NEXUS_API_MATCHING_CONFIG` file, and a key an operator has to
+        transliterate before using is a key they will get wrong.
+        """
+        with client_for(build_api_matcher(config=MatchingConfig(review_threshold=0.6))) as client:
+            overrides = status_of(client)["calibration"]["overrides"]
+
+        assert list(overrides) == ["review_threshold"]
+
+    def test_a_setting_left_at_its_shipped_value_is_not_reported_as_an_override(self):
+        """A profile that restates the defaults has changed nothing, and must not read as
+        though it had."""
+        restated = MatchingConfig(auto_approve_threshold=0.87, review_threshold=0.5)
+        with client_for(build_api_matcher(config=restated)) as client:
+            assert status_of(client)["calibration"]["overrides"] == {}
+
+    def test_the_corpus_is_published_even_with_nothing_loaded(self):
+        """
+        It describes this BUILD, not this deployment -- so a consumer deciding whether to
+        adopt the library at all can read what the shipped numbers were fitted on before
+        pointing it at a dictionary. The three live members go null with `thresholds`.
+        """
+        with client_for(None) as client:
+            calibration = status_of(client)["calibration"]
+
+        assert calibration["corpus"]["fields"] == 688
+        assert calibration["defaultsInForce"] is None
+        assert calibration["overrides"] is None
+        assert calibration["dictionarySizeRatio"] is None
+
+    def test_the_size_ratio_is_this_dictionary_against_that_corpus(self, real_client):
+        body = status_of(real_client)
+
+        assert body["dictionary"]["entryCount"] == 5
+        assert body["calibration"]["dictionarySizeRatio"] == round(5 / 688, 6)
+        assert body["calibration"]["warnAboveSizeRatio"] == 10.0
+
+
+class TestTheUncalibratedSizeWarning:
+    """
+    AR-4's fourth clause: warn loudly when a deployment runs on defaults against a
+    dictionary that does not resemble the calibration corpus.
+
+    Only SIZE is warned on, and only upward. Domain and naming style are described on
+    `calibration.corpus` for a human to compare, because measuring them would need a
+    similarity metric this library has never validated -- and a warning computed from an
+    invented metric is wrong in a direction nobody can audit.
+    """
+
+    def _status_for(self, entry_count: int, config: MatchingConfig | None = None) -> dict:
+        """
+        A status body for a dictionary of a stated size, without indexing that many entries.
+
+        `dictionary_size` is the public accessor the payload reads, so a stub that reports a
+        number is the whole of what this rule consumes. Indexing 6,881 real entries to
+        assert an arithmetic comparison would buy nothing and cost a minute per test.
+        """
+
+        class SizedMatcher:
+            _config = config or MatchingConfig()
+            dictionary_size = entry_count
+            minimum_achievable_confidence = 0.63
+            absolute_score_floor = None
+            absolute_score_metric = "cosine"
+
+        handle = MatcherHandle()
+        handle.bind(SizedMatcher())
+        pool = BoundedWorkPool(max_workers=1, max_queued=0)
+        try:
+            return IntrospectionService(
+                handle, MatchServiceLimits(), pool, ProvenanceRecorder()
+            ).status()
+        finally:
+            pool.shutdown()
+
+    def test_shipped_defaults_against_an_order_of_magnitude_more_entries_is_a_warning(self):
+        body = self._status_for(UNCALIBRATED_ENTRY_COUNT)
+
+        assert body["degraded"] is True
+        assert [warning["code"] for warning in body["warnings"]] == ["UNCALIBRATED_SIZE"]
+        message = body["warnings"][0]["message"]
+        # The message has to carry the arithmetic, not just the verdict: an operator who
+        # cannot see both numbers cannot tell whether the rule applies to them.
+        assert "688" in message and str(UNCALIBRATED_ENTRY_COUNT) in message
+        assert "NEXUS_API_MATCHING_CONFIG" in message
+
+    def test_exactly_the_ratio_is_not_yet_a_warning(self):
+        """
+        The rule is `>`, not `>=`. Pinned because an off-by-one here would fire on a
+        dictionary at exactly the documented boundary, and the boundary is published on the
+        wire as `warnAboveSizeRatio` -- a rule that disagreed with its own published number
+        is worse than an unpublished one.
+        """
+        body = self._status_for(6880)
+
+        assert body["calibration"]["dictionarySizeRatio"] == 10.0
+        assert body["warnings"] == []
+
+    def test_a_deployment_that_calibrated_its_own_thresholds_is_not_warned(self):
+        """
+        They have made the decision this warning exists to prompt. Telling them their
+        numbers are uncalibrated because their dictionary is large would be false.
+        """
+        tuned = MatchingConfig(auto_approve_threshold=0.8)
+        body = self._status_for(UNCALIBRATED_ENTRY_COUNT, config=tuned)
+
+        assert body["calibration"]["defaultsInForce"] is False
+        assert body["warnings"] == []
+        assert body["degraded"] is False
+
+    def test_a_dictionary_smaller_than_the_corpus_is_never_warned_about(self):
+        """
+        One direction only. Nothing here has measured the small direction, and a surface
+        that reported `degraded` on every demo and every test fixture would teach operators
+        to ignore the field this whole body exists for.
+        """
+        assert self._status_for(30)["warnings"] == []
+        assert self._status_for(1)["warnings"] == []
+
+    def test_a_setting_that_is_not_a_decision_threshold_does_not_suppress_the_warning(self):
+        """
+        Turning aliasing on is not calibrating a threshold. A deployment that changed a
+        retrieval knob is still auto-approving at a number fitted on somebody else's corpus.
+        """
+        body = self._status_for(
+            UNCALIBRATED_ENTRY_COUNT, config=MatchingConfig(dictionary_alias_count=6)
+        )
+
+        assert body["calibration"]["overrides"] == {"dictionary_alias_count": 6}
+        assert [warning["code"] for warning in body["warnings"]] == ["UNCALIBRATED_SIZE"]
 
 
 # =============================================================================

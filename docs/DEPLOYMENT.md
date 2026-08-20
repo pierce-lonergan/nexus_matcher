@@ -134,8 +134,10 @@ name it does not recognise.
 
 Leave it unset unless you have a reason. Unset, the cap is **derived** from
 `NEXUS_API_MAX_BATCH_FIELDS` and the per-field `max_length`s the request schema publishes:
-250 fields × (9,856 characters × 4 bytes for UTF-8 + 64 bytes of JSON framing) + 1,024 =
-**9,873,024 bytes, 9.42 MiB**. Deriving it is what keeps the two caps in step — raise the
+250 fields × (10,880 characters × 4 bytes for UTF-8 + 64 bytes of JSON framing) + 1,024 =
+**10,897,024 bytes, 10.39 MiB**. That arithmetic is what this build derives; the live number
+is always `limits.bodyByteCap` on `GET /api/v1/status`, and it moves when the request
+schema's own bounds move. Deriving it is what keeps the two caps in step — raise the
 field cap and the byte cap rises with it, so an operator cannot end up with a 413 that
 names a limit the schema says is fine.
 
@@ -147,7 +149,7 @@ refused at construction:
 $ NEXUS_API_MAX_BODY_BYTES=1048576 uvicorn nexus_matcher.presentation.api.app:app
 Traceback (most recent call last):
   ...
-ValueError: NEXUS_API_MAX_BODY_BYTES=1048576 is below the 9873024 bytes a
+ValueError: NEXUS_API_MAX_BODY_BYTES=1048576 is below the 10897024 bytes a
 max_batch_fields=250 request may legitimately carry, so this server would answer 413 to
 bodies every other limit it publishes accepts. Unset it to derive the cap, or lower
 NEXUS_API_MAX_BATCH_FIELDS to match.
@@ -159,7 +161,7 @@ failure: the alternative is a server that comes up healthy, passes every probe, 
 413 to batches its own `/openapi.json` declares valid — which the caller reads as a bug in
 their client, because their client was generated from that document. The refusal names both
 ways out, and the second one really does work: `NEXUS_API_MAX_BODY_BYTES=1048576` alongside
-`NEXUS_API_MAX_BATCH_FIELDS=20` starts, because 20 fields put the floor at 790,784 bytes.
+`NEXUS_API_MAX_BATCH_FIELDS=20` starts, because 20 fields put the floor at 872,704 bytes.
 
 One 413 the cap cannot avoid: a client that escapes every character as `\uXXXX` spends six
 bytes per character on the wire, so a body inside its declared field bounds can still cross
@@ -167,7 +169,7 @@ a derived cap. Raise this variable for that — the validation only refuses valu
 floor, never above it.
 
 **What a refusal costs you, which is not zero.** A refused body *within twice the cap* is
-read and discarded before the 413 is sent — up to **2 × the cap in read bandwidth** (19.7 MB
+read and discarded before the 413 is sent — up to **2 × the cap in read bandwidth** (21.8 MB
 at the default) and up to **2.0 seconds of connection time**, per refused request. Beyond
 twice the cap nothing is read and the refusal is immediate.
 
@@ -721,6 +723,58 @@ serves only health and introspection, say so:
 That exemption is opt-*out*, not opt-in, on purpose: a knob whose default is the unsafe
 value protects only the operators who remembered to set it, who are not the ones with a
 misconfigured rollout. Do not bake it into a base image or a shared ConfigMap.
+
+### The pre-run check a probe cannot make
+
+`/health/*` answers "is this process alive and started". Before a bulk run an operator is
+asking a different question — **is this server about to produce results nobody intended?** —
+and `GET /api/v1/status` is where that is answered. It is **always 200**, including with
+nothing loaded, because a diagnostic that fails when the condition it reports on holds is
+unusable exactly when it is needed.
+
+```bash
+curl -s localhost:8000/api/v1/status | jq '{degraded, warnings: [.warnings[].code]}'
+```
+
+`degraded` is `warnings != []`. Four codes, and each is a reason not to start yet:
+
+| Code | Means | Do |
+|---|---|---|
+| `NO_DICTIONARY` | nothing is loaded; every match answers 503 | set `NEXUS_API_DICTIONARY` |
+| `EMPTY_DICTIONARY` | a dictionary loaded and carries no rows | check the loader's row filter and the column mapping |
+| `FALLBACK_ENCODER` | retrieval fell through to a lower rung of the encoder ladder | **stop.** Accuracy is below every number this library publishes and nothing else reports it |
+| `UNCALIBRATED_SIZE` | shipped default thresholds, against a dictionary more than 10× the corpus they were fitted on | fit your own profile — [Calibration profiles](guides/calibration_profiles.md) |
+
+**Branch on `code`, never on `message`.** The message is human-readable and is not part of
+the contract; the codes are.
+
+Alert on `degraded` rather than on any single code, then read `warnings[].code` for which.
+Two GETs against one process produce identical bytes, so `diff <(curl host-a/api/v1/status)
+<(curl host-b/api/v1/status)` shows only the differences that matter between two hosts —
+which is the fastest way to find the one pod in a fleet running a different encoder or a
+different threshold file.
+
+### Which calibration this deployment is running
+
+`NEXUS_API_MATCHING_CONFIG` loads a `MatchingConfig` per deployment, and the thing that goes
+wrong with it is silent: a file that is read but not applied looks exactly like a file that
+works. `status.calibration` is the confirmation.
+
+```bash
+curl -s localhost:8000/api/v1/status | jq '.calibration.overrides, .thresholds'
+```
+
+`overrides` names every setting whose live value differs from what this library ships, with
+the live value, keyed by the snake_case name you put in the file. An empty `{}` after
+pointing the variable at a file means the file was not read — or restates the defaults.
+
+`calibration.corpus` is the other half, and the reason the block exists: the shipped
+thresholds were fitted on **688 public benchmark fields against a 688-entry dictionary**,
+which is almost certainly nothing like your glossary. A threshold is a statement about a
+score distribution, so the shipped `0.87` and its measured 0.952941 auto-approve precision
+are facts about that corpus, not about yours. Everything you need to judge the resemblance —
+size, splits, domains, naming style, the artifact behind the numbers — is in that block,
+and [Calibration profiles](guides/calibration_profiles.md) is how to replace them.
 
 ### Service and Ingress
 

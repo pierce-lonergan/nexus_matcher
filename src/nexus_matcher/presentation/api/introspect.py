@@ -34,12 +34,14 @@ bulk run would produce results the operator did not intend:
   NO_DICTIONARY      nothing is loaded; every match answers 503
   EMPTY_DICTIONARY   a dictionary loaded and carries no entries; every field matches nothing
   FALLBACK_ENCODER   retrieval is running on an encoder the selection ladder fell through to
+  UNCALIBRATED_SIZE  shipped default thresholds, against a dictionary an order of magnitude
+                     larger than the corpus they were fitted on
 
 One boolean and one list rather than a boolean per condition, so a caller has a single
 thing to branch on and an operator has the sentence explaining it.
 
-What is deliberately NOT a warning is the shipped threshold configuration. The structural
-floor of a rank-1 confidence (0.63 with the shipped weights) sits ABOVE
+What is deliberately NOT a warning is the shipped threshold configuration ON ITS OWN. The
+structural floor of a rank-1 confidence (0.63 with the shipped weights) sits ABOVE
 `review_threshold = 0.50`, so a rank-1 candidate cannot fall below review on score alone --
 a real and important property, and the direct descendant of DX-001, where a
 `get_low_confidence_fields()` default of 0.6 sat below that floor and returned an empty list
@@ -47,6 +49,48 @@ on every call. But it is true of every default install, and a status surface tha
 `degraded` on a stock deployment teaches operators to ignore the field. It is published as
 arithmetic instead: `thresholds.minimumAchievableConfidence` and the derived
 `thresholds.reviewThresholdBelowFloor`, which is exactly `review < floor` and nothing more.
+
+## The calibration surface, and the one warning it is allowed to raise
+
+NM-V2-01 AR-4 asks for four things: ship the defaults labelled with the corpus they were
+measured on, load a profile per deployment, expose the ACTIVE profile so an operator can
+see which is in force, and warn loudly when a deployment runs on defaults against a
+dictionary that does not resemble that corpus.
+
+The first three are the `calibration` block and the `thresholds` block. `calibration.corpus`
+names the corpus, its size and its shape; `calibration.overrides` names every setting whose
+live value differs from the shipped default, WITH that value, derived from the config
+dataclass's own fields so a setting added later cannot go unreported; and `thresholds` now
+publishes `absoluteScoreFloor` and `absoluteScoreMetric` alongside the rest, because a floor
+an operator cannot see is a `NO_MATCH` they cannot explain.
+
+The fourth is where this file draws a line it will not cross. "Resembles" over DOMAIN and
+NAMING STYLE cannot be measured here without inventing a similarity metric this library has
+never validated, and a warning computed from an invented metric is worse than none: it is
+wrong in a direction nobody can audit. So domain and naming style are DESCRIBED on
+`calibration.corpus` and left for a human to compare, and exactly one dimension is warned
+on -- SIZE, because size is arithmetic and because the effect of size on this task is
+measured in this repository rather than assumed:
+
+  * `benchmarks/results/exp_alias_scale.json` -- a retrieval setting worth +1.9 P@1 at 688
+    entries is worth -13.7 at 10,000 and -18.8 at 30,000. The sign inverts between the
+    calibration corpus and ten times it.
+  * `benchmarks/results/exp_scale_combined.json` -- accuracy against corpus size, measured
+    out to 100,000 entries.
+
+An order of magnitude is therefore the smallest step at which this repository can point at
+a measurement showing the score distribution has moved, and `_UNCALIBRATED_SIZE_RATIO` is
+that number, published on the wire as `calibration.warnAboveSizeRatio` so the rule is
+inspectable arithmetic rather than a hidden judgement.
+
+The warning fires ONLY when the three decision thresholds are still the shipped ones. An
+operator who has set their own has calibrated deliberately, and telling them their numbers
+are uncalibrated because their dictionary is large would be telling them something false.
+It also fires in one direction only: a dictionary SMALLER than the calibration corpus is
+not warned about, because nothing here has measured that direction, and because a status
+surface that reported `degraded` on every demo and every test fixture would teach operators
+to ignore the field -- the same argument the paragraph above makes, applied to the same
+field.
 
 ### This response is byte-stable
 
@@ -124,7 +168,13 @@ _VECTOR_STORE_ATTR = "_vector_store"
 _SPARSE_RETRIEVER_ATTR = "_sparse_retriever"
 _RERANKER_ATTR = "_reranker"
 _ALIAS_OWNER_ATTR = "_alias_owner"
-_BUILD_QUERY_ATTR = "_build_query_text"
+# The SIGNAL-AWARE resolver, not the bare `_build_query_text`. This route's published
+# contract says the query it reports is the query `/match` would have built, and
+# `_build_query_text(field)` alone silently drops the caller's overlay, entity and
+# domain -- reporting a query nobody sent, on the one route whose entire purpose is
+# "why did this field not match?". `_resolve_query` is what `_match_field` calls, so
+# both doors now build the same string from the same signals.
+_RESOLVE_QUERY_ATTR = "_resolve_query"
 _FUSE_ATTR = "_fuse_results"
 _DICTIONARY_ENTRIES_ATTR = "_dictionary_entries"
 
@@ -161,6 +211,66 @@ _LADDER_FALLBACK_TIERS = frozenset({"transformer", "static"})
 _NO_DICTIONARY = "NO_DICTIONARY"
 _EMPTY_DICTIONARY = "EMPTY_DICTIONARY"
 _FALLBACK_ENCODER = "FALLBACK_ENCODER"
+_UNCALIBRATED_SIZE = "UNCALIBRATED_SIZE"
+
+
+# =============================================================================
+# CALIBRATION -- what the shipped defaults were fitted on
+# =============================================================================
+
+# The decision thresholds. "Running on defaults" means all three are untouched: these are
+# the numbers that decide which candidates ship as AUTO_APPROVE, and an operator who has
+# moved any of them has made a deliberate calibration decision.
+_DECISION_THRESHOLDS = ("auto_approve_threshold", "review_threshold", "min_confidence_gap")
+
+# How many times the calibration corpus a dictionary may be before the defaults stop being
+# a statement about anything resembling it. Published on the wire, so the rule an operator
+# is being judged by is arithmetic they can read rather than a number in this file.
+#
+# TEN, and not a tuned constant: it is the smallest ratio at which this repository has a
+# measurement showing the score distribution has moved (see the module docstring for the
+# two artifacts). A smaller ratio would be a guess dressed as a threshold, which is exactly
+# the mistake `absolute_score_floor` refuses to ship a default for.
+_UNCALIBRATED_SIZE_RATIO = 10.0
+
+# The corpus the shipped defaults were measured on, in machine-readable form.
+#
+# NM-V2-03 SC-7: a threshold is a statement about a score distribution, so a number fitted
+# on one corpus means something else on another, and a consumer must be able to tell
+# whether the shipped numbers were fitted on anything resembling their data. Until now that
+# fact lived only in comments in `MatchingConfig`, which reach no interface at all -- a
+# caller integrating over HTTP could not discover it without reading this library's source.
+#
+# Every number here is reproduced from a committed artifact by
+# `tests/packaging/test_calibration_provenance.py`, so this block cannot drift away from
+# the measurements it claims to summarise. The two prose members are descriptions rather
+# than measurements and are labelled as such: they exist so a human can judge DOMAIN and
+# NAMING-STYLE similarity, which is the part of AR-4 no arithmetic here can honestly do.
+_CALIBRATION_CORPUS: dict[str, Any] = {
+    "name": "bird+omop combined",
+    "fields": 688,
+    "dictionaryEntries": 688,
+    "splits": {"bird": 361, "omop": 327},
+    "domains": [
+        "public relational database schemas (BIRD-SQL dev set)",
+        "clinical common data model (OMOP CDM v5.4 field specification)",
+    ],
+    "fieldNaming": (
+        "ordinary SQL and CDM column identifiers. The bird split is heavily abbreviated "
+        "and the omop split is not; neither is a flattened nested path, and neither was "
+        "contracted by a governed abbreviation standard."
+    ),
+    "ambiguity": (
+        "one gold entry per field, drawn from two unrelated domains, so a query competes "
+        "against 687 distractors that are mostly from a different subject area."
+    ),
+    "measuredBy": "benchmarks/exp_calibration.py",
+    "artifact": "benchmarks/results/exp_calibration_combined.json",
+    "autoApproveThreshold": 0.87,
+    "autoApprovePrecision": 0.952941,
+    "autoApproveCoverage": 0.123547,
+    "precisionAtRank1": 0.581395,
+}
 
 
 # =============================================================================
@@ -326,6 +436,116 @@ class ThresholdsView(BaseModel):
             "field will ever be sent to review by score. Null when either side is null."
         )
     )
+    # APPENDED, and the two members this block used to send an operator to a match response
+    # to read. The floor is the threshold a deployment is most likely to have set and the
+    # only one that can produce a verdict -- NO_MATCH -- that no other number here explains,
+    # so a status surface without it could not answer "which calibration is in force".
+    absoluteScoreFloor: float | None = Field(
+        description=(
+            "The absolute-score floor beneath which a field is reported `NO_MATCH`. Null "
+            "here means NO FLOOR IS CONFIGURED, which is the shipped default and is a real "
+            "answer rather than an unreadable one: with no floor this deployment cannot "
+            "emit `NO_MATCH` at all, whatever the scores. This is the same number a match "
+            "response carries at `scoring.absoluteScoreFloor`, read off the same property."
+        )
+    )
+    absoluteScoreMetric: str | None = Field(
+        description=(
+            "What `absoluteScoreFloor` is compared against: the distance metric the wired "
+            "vector store declares, `cosine` under the shipped wiring. `unknown` means the "
+            "store declares none, and a floor chosen against an unknown metric is a guess. "
+            "Null only when no matcher is loaded."
+        )
+    )
+
+
+class CalibrationCorpusView(BaseModel):
+    """
+    The corpus the shipped default thresholds were fitted on.
+
+    NM-V2-03 SC-7. A threshold is a statement about a score distribution; change the corpus
+    and the same number means something else. This block is what lets a consumer decide
+    whether the shipped numbers were fitted on anything resembling their data, WITHOUT
+    reading this library's source -- which is where the answer used to live.
+
+    The numeric members are reproduced from committed benchmark artifacts by a packaging
+    gate. The two prose members are descriptions, not measurements, and are here because
+    domain and naming-style similarity is a judgement this library will not fake with an
+    invented metric.
+    """
+
+    name: str = Field(description="The benchmark this corpus is, as its builder names it.")
+    fields: int = Field(description="Labelled query fields the thresholds were fitted over.")
+    dictionaryEntries: int = Field(
+        description=(
+            "Entries each of those fields competed against. Compare this against "
+            "`dictionary.entryCount`: the ratio is what `warnAboveSizeRatio` is applied to."
+        )
+    )
+    splits: dict[str, int] = Field(description="Fields contributed by each source split.")
+    domains: list[str] = Field(description="The subject areas the corpus is drawn from.")
+    fieldNaming: str = Field(
+        description="PROSE. How the query-side identifiers are spelled. For human comparison."
+    )
+    ambiguity: str = Field(
+        description="PROSE. How confusable the distractors are. For human comparison."
+    )
+    measuredBy: str = Field(description="The script in this repository that produced the fit.")
+    artifact: str = Field(description="The committed JSON artifact holding the measurement.")
+    autoApproveThreshold: float = Field(description="The shipped `auto_approve_threshold`.")
+    autoApprovePrecision: float = Field(
+        description="Measured precision of AUTO_APPROVE at that threshold, on this corpus."
+    )
+    autoApproveCoverage: float = Field(
+        description="Fraction of fields that reached AUTO_APPROVE at that threshold."
+    )
+    precisionAtRank1: float = Field(
+        description="P@1 over the whole corpus -- the accuracy the coverage above sits inside."
+    )
+
+
+class CalibrationView(BaseModel):
+    """
+    Which calibration is in force, and what the shipped one was fitted on.
+
+    NM-V2-01 AR-4 and NM-V2-03 SC-6. `overrides` is the answer to "which profile is this
+    server running": it is derived from the config dataclass's own fields, so a setting
+    added to the library later appears here the day a deployment changes it, without anybody
+    remembering to publish it.
+    """
+
+    defaultsInForce: bool | None = Field(
+        description=(
+            "True when all three decision thresholds -- auto-approve, review and the "
+            "confidence gap -- are still the shipped numbers. False means this deployment "
+            "has calibrated at least one of them. Null when no matcher is loaded."
+        )
+    )
+    overrides: dict[str, float | int | bool] | None = Field(
+        description=(
+            "Every matching setting whose live value differs from the shipped default, "
+            "mapped to the LIVE value. Keys are the setting names exactly as a deployment "
+            "spells them in its `NEXUS_API_MATCHING_CONFIG` file, so the key you read is "
+            "the key you set. Empty object means a stock profile. Exhaustive by "
+            "construction: it is a comparison against the shipped defaults over every "
+            "field of the config, not a hand-maintained list."
+        )
+    )
+    dictionarySizeRatio: float | None = Field(
+        description=(
+            "`dictionary.entryCount / corpus.dictionaryEntries`. How many times the "
+            "calibration corpus this deployment's dictionary is. Null when nothing is "
+            "loaded."
+        )
+    )
+    warnAboveSizeRatio: float = Field(
+        description=(
+            "The ratio above which running on shipped defaults raises the "
+            "`UNCALIBRATED_SIZE` warning. Published so the rule is arithmetic a caller can "
+            "check rather than a judgement inside the server."
+        )
+    )
+    corpus: CalibrationCorpusView
 
 
 class ServiceLimitsView(BaseModel):
@@ -377,6 +597,11 @@ class StatusResponseView(BaseModel):
         )
     )
     limits: ServiceLimitsView
+    # APPENDED after `limits`, which was the last key. `calibration` is never null even
+    # with no matcher loaded, because `corpus` is a fact about this BUILD rather than about
+    # the running deployment -- a consumer evaluating whether to adopt this library at all
+    # can read what the shipped numbers were fitted on before pointing it at a dictionary.
+    calibration: CalibrationView
 
 
 # =============================================================================
@@ -630,7 +855,142 @@ def _thresholds_payload(matcher: object) -> dict[str, Any] | None:
         # a false answer, it is an unanswerable question, and `false` would read as "your
         # review threshold is safely above the floor".
         "reviewThresholdBelowFloor": None if floor is None or review is None else review < floor,
+        # Read through the PUBLIC property, exactly as `matching._absolute_score_floor`
+        # does, so this surface and a match response cannot report two different floors for
+        # one server. `_number` is not used: null here means "no floor configured", which
+        # is the shipped default and a real answer, and routing it through the reader whose
+        # null means "unreadable" would merge two different facts into one token.
+        "absoluteScoreFloor": _absolute_floor(matcher),
+        "absoluteScoreMetric": str(getattr(matcher, "absolute_score_metric", "unknown")),
     }
+
+
+def _absolute_floor(matcher: object) -> float | None:
+    """
+    The configured absolute-score floor, or None when there is none.
+
+    A matcher that does not expose the property reports None, which is the same answer as
+    "not configured" and is the documented default -- the same degradation
+    `matching._absolute_score_floor` chose, and chosen again here rather than shared,
+    because sharing it would import the matching module's private name into a surface that
+    must keep answering when matching cannot.
+    """
+    floor = getattr(matcher, "absolute_score_floor", None)
+    if isinstance(floor, bool) or not isinstance(floor, (int, float)):
+        return None
+    return round(float(floor), _PRECISION)
+
+
+def _shipped_defaults() -> object | None:
+    """
+    A `MatchingConfig` with nothing set, or None when the matching stack cannot be imported.
+
+    Deferred, for the reason `matching._scoring_weights` gives for the same import: this
+    pulls the whole matching stack, and importing it at module scope would make merely
+    importing this module pay for it. None rather than a raise, because a status surface
+    that fails to answer when it cannot describe the defaults is a diagnostic nobody can
+    use at the moment they need it.
+    """
+    try:
+        from nexus_matcher.application.use_cases.match_schema import MatchingConfig
+    except ImportError:  # pragma: no cover - the matching stack is a hard dependency
+        return None
+    return MatchingConfig()
+
+
+def _overrides(config: object, defaults: object) -> dict[str, float | int | bool]:
+    """
+    Every setting whose live value differs from the shipped default, with the live value.
+
+    Derived from the DEFAULTS object's own dataclass fields rather than from a list typed
+    here, which is what makes it exhaustive: a setting added to `MatchingConfig` next month
+    is compared the day it exists, and a deployment that changes it is reported without
+    anybody remembering to publish a key for it. A hand-maintained list is how
+    `absolute_score_floor` came to be invisible on this surface in the first place.
+
+    Non-numeric settings are skipped rather than stringified. Everything `MatchingConfig`
+    carries today is a number or a flag; a future member holding a path or a catalog is a
+    different kind of fact, and rendering it here would put a deployment's own file paths
+    into a response that gets pasted into tickets.
+    """
+    import dataclasses
+
+    if not dataclasses.is_dataclass(defaults):  # pragma: no cover - defensive
+        return {}
+
+    changed: dict[str, float | int | bool] = {}
+    for field_ in dataclasses.fields(defaults):
+        shipped = getattr(defaults, field_.name, None)
+        live = getattr(config, field_.name, shipped)
+        if live == shipped:
+            continue
+        # `bool` is a subclass of `int` and both travel unchanged, so one branch covers
+        # them. Only the float arm rounds, and it must NOT catch a flag: `True` rendered as
+        # `1.0` would tell an operator they had set a number where they set a switch.
+        if isinstance(live, (bool, int)):
+            changed[field_.name] = live
+        elif isinstance(live, float):
+            changed[field_.name] = round(live, _PRECISION)
+    return changed
+
+
+def _calibration_payload(matcher: object | None, entry_count: int | None) -> dict[str, Any]:
+    """
+    Which calibration is in force, and what the shipped one was fitted on.
+
+    `corpus` is present even with no matcher loaded, because it describes this BUILD. The
+    three live members are null in that case, for the same reason `thresholds` is: reporting
+    the shipped numbers as though they were in force would be a wrong answer rather than a
+    missing one.
+    """
+    corpus_entries = _CALIBRATION_CORPUS["dictionaryEntries"]
+    config = None if matcher is None else _config_of(matcher)
+    defaults = _shipped_defaults()
+
+    defaults_in_force: bool | None = None
+    overrides: dict[str, float | int | bool] | None = None
+    if config is not None and defaults is not None:
+        overrides = _overrides(config, defaults)
+        defaults_in_force = not any(name in overrides for name in _DECISION_THRESHOLDS)
+
+    return {
+        "defaultsInForce": defaults_in_force,
+        "overrides": overrides,
+        "dictionarySizeRatio": (
+            None if entry_count is None else round(entry_count / corpus_entries, _PRECISION)
+        ),
+        "warnAboveSizeRatio": _UNCALIBRATED_SIZE_RATIO,
+        "corpus": dict(_CALIBRATION_CORPUS),
+    }
+
+
+def _uncalibrated_size_warning(calibration: dict[str, Any], entry_count: int | None) -> str | None:
+    """
+    The sentence for a deployment running shipped defaults against a dictionary an order of
+    magnitude larger than the corpus they were fitted on, or None when that is not the case.
+
+    One direction and one dimension, both on purpose -- see the module docstring. Returning
+    the message rather than appending it keeps the rule readable in one place and testable
+    without a status body.
+    """
+    ratio = calibration["dictionarySizeRatio"]
+    if entry_count is None or ratio is None or calibration["defaultsInForce"] is not True:
+        return None
+    if ratio <= _UNCALIBRATED_SIZE_RATIO:
+        return None
+
+    corpus = _CALIBRATION_CORPUS
+    return (
+        f"This server is running on the shipped default thresholds, which were fitted on "
+        f"{corpus['fields']} fields against a {corpus['dictionaryEntries']}-entry "
+        f"dictionary ({corpus['name']}). This deployment's dictionary carries "
+        f"{entry_count} entries -- {ratio:g} times that corpus. A threshold is a statement "
+        f"about a score distribution, and the distribution moves with dictionary size, so "
+        f"auto-approve precision on this server is UNMEASURED: the "
+        f"{corpus['autoApprovePrecision']} measured at {corpus['autoApproveThreshold']} is "
+        f"a fact about {corpus['name']} and not about your glossary. Fit a profile on a "
+        f"labelled sample of your own fields and load it with NEXUS_API_MATCHING_CONFIG."
+    )
 
 
 def _entry_count(matcher: object) -> int | None:
@@ -734,6 +1094,11 @@ class IntrospectionService:
                         }
                     )
 
+        calibration = _calibration_payload(matcher, entry_count)
+        uncalibrated = _uncalibrated_size_warning(calibration, entry_count)
+        if uncalibrated is not None:
+            warnings.append({"code": _UNCALIBRATED_SIZE, "message": uncalibrated})
+
         return {
             "ready": self._handle.is_ready,
             "degraded": bool(warnings),
@@ -748,6 +1113,7 @@ class IntrospectionService:
             "encoder": encoder,
             "thresholds": None if matcher is None else _thresholds_payload(matcher),
             "limits": _limits_payload(self._limits, self._pool),
+            "calibration": calibration,
         }
 
     async def diagnose(self, request: RetrievalDiagnosticRequest) -> dict[str, Any]:
@@ -897,9 +1263,9 @@ def _trace_retrieval(
     Runs on a worker thread: this encodes a query and scans the corpus, which is the same
     CPU work matching does and belongs under the same admission control.
     """
-    build_query = _require(
+    resolve_query = _require(
         matcher,
-        _BUILD_QUERY_ATTR,
+        _RESOLVE_QUERY_ATTR,
         "the query text this field actually retrieved on cannot be reported, which is the "
         "first thing this diagnostic exists to say.",
     )
@@ -927,7 +1293,10 @@ def _trace_retrieval(
     dense_top_k = int(getattr(config, "dense_top_k", 100))
     sparse_top_k = int(getattr(config, "sparse_top_k", 100))
 
-    query_text = build_query(field)
+    # The signals ride on the field itself (`_to_schema_field` nests them under
+    # QUERY_SIGNALS_METADATA_KEY), so passing None here is not dropping them -- the
+    # resolver reads them off the field exactly as the batch path does.
+    _field_signals, query_text = resolve_query(field, None, None)
 
     dense_results, dense_detail = _dense_retrieval(
         provider, store, query_text, top_k=dense_top_k, alias_owner=alias_owner

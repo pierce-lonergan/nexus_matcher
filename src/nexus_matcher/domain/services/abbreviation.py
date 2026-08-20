@@ -21,6 +21,7 @@ Abbreviation expansion service for improving semantic matching quality.
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import ClassVar
 
@@ -143,6 +144,47 @@ class AbbreviationDictionary:
             The expansion, or None if not found
         """
         return self._mappings.get(abbreviation.lower())
+
+    def merged_with(self, overlay: Mapping[str, str]) -> AbbreviationDictionary:
+        """
+        A NEW dictionary holding this one's rows plus `overlay`'s, overlay winning.
+
+        THIS OBJECT IS NOT MODIFIED, and that is the whole contract. The caller of this
+        method is a per-request overlay merge (see `AbbreviationExpander.with_overlay`)
+        running against a dictionary that is shared by every concurrent request, so a
+        merge that mutated in place would let one request's approved-abbreviation list
+        leak into the next one's query text -- a defect no accuracy measurement can
+        attribute, because it moves a LATER request's answer.
+
+        Overlay rows go through `AbbreviationMapping`'s validation, so an empty key, an
+        empty expansion or a row whose short form equals its long form is SKIPPED rather
+        than raised on -- the same admission rule as `from_dict`. A live reference-data
+        feed is not a place to raise from: one malformed row must not cost the caller the
+        other several thousand. A caller who wants to suppress a row this dictionary
+        already holds supplies the correct long form for it; an identity row cannot do
+        that job because it is not a valid mapping.
+
+        Args:
+            overlay: `{short -> long}` rows to layer on top. Keys are normalised (lowered
+                and stripped) exactly as every other row's key is.
+
+        Returns:
+            A new AbbreviationDictionary. Never `self`.
+        """
+        merged = AbbreviationDictionary()
+        # The base rows were already validated when they were added, so they are copied
+        # rather than revalidated: re-running `AbbreviationMapping` over a 7,840-row
+        # catalog on every request is real time spent proving something already proven.
+        merged._mappings = dict(self._mappings)
+        for abbrev, expansion in overlay.items():
+            try:
+                mapping = AbbreviationMapping(abbrev, expansion)
+            except (ValueError, AttributeError):
+                # AttributeError covers a non-string row from a JSON feed; both mean
+                # "this row is not a mapping", and both are skipped.
+                continue
+            merged.add(mapping)
+        return merged
 
     def __contains__(self, abbreviation: str) -> bool:
         """Check if abbreviation exists in dictionary."""
@@ -321,6 +363,41 @@ class AbbreviationExpander:
     def reset_default(cls) -> None:
         """Reset the default singleton (for testing)."""
         cls._default_instance = None
+
+    def with_overlay(self, overlay: Mapping[str, str] | None) -> AbbreviationExpander:
+        """
+        A new expander carrying this one's catalog PLUS `overlay`, for one request.
+
+        WHY THIS IS NOT A CONFIGURATION FILE. An approved-abbreviation catalog is live
+        reference data: a term abbreviated one way this quarter may be abbreviated
+        differently the next, and the authoritative copy lives in a service, not in the
+        deployment's image. An expander fixed at start-up is therefore not a slower
+        version of this -- it is a silently stale one, and staleness in this direction
+        asserts the WRONG long form, which costs more than asserting none (a token absent
+        from the catalog passes through untouched; a wrong row corrupts the one query
+        vector the field gets).
+
+        WHY IT RETURNS A NEW OBJECT. One `AbbreviationExpander` is shared by every
+        concurrent request through the matcher that holds it. Merging in place would let
+        request A's catalog decide request B's query text, non-deterministically, with no
+        symptom in A's own response. So this never mutates `self`, and an empty overlay
+        returns `self` unchanged rather than an equal copy -- the no-signal path pays
+        nothing and cannot diverge from the shipped expander.
+
+        Args:
+            overlay: `{short -> long}` rows for this request, or None. Rows here outrank
+                rows already in the catalog; invalid rows are skipped (see
+                `AbbreviationDictionary.merged_with`).
+
+        Returns:
+            `self` when `overlay` is empty or None; otherwise a new expander.
+
+        Example:
+            per_request = matcher_expander.with_overlay({"psgr": "passenger"})
+        """
+        if not overlay:
+            return self
+        return AbbreviationExpander(self._dictionary.merged_with(overlay))
 
     def expand(self, text: str) -> ExpandedText:
         """
