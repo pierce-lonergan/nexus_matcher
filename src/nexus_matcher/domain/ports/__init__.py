@@ -12,6 +12,17 @@ abstractions, not on concrete implementations.
 - SchemaParser: Parse schemas from various formats (Avro, JSON Schema, SQL DDL)
 - DictionaryLoader: Load data dictionaries from various sources (Excel, CSV, DB)
 
+### Resolution Ports
+- EntryLookup: Resolve a dictionary entry by an id the caller already holds. Exact or
+  absent -- no scoring, no ranking, no confidence. Architecturally distinct from
+  retrieval, which answers a different question about the same dictionary.
+
+### Feedback Ports
+- FeedbackConsumer: Read reviewer verdicts and, optionally, answer for a field before
+  retrieval runs. The shipped default attaches none, and `NullFeedbackConsumer` is the
+  reference implementation of consuming nothing -- the seam exists so that an append-only
+  audit trail is a LAYER a deployment may build on rather than the whole story.
+
 ### ML/AI Ports
 - EmbeddingProvider: Generate vector embeddings from text
 
@@ -29,6 +40,7 @@ abstractions, not on concrete implementations.
 from nexus_matcher.domain.ports import (
     SchemaParser,
     DictionaryLoader,
+    EntryLookup,
     EmbeddingProvider,
     VectorStore,
     SparseRetriever,
@@ -71,6 +83,11 @@ from nexus_matcher.domain.ports.embedding_provider import (
     EmbeddingProviderRegistry,
     EmbeddingResult,
 )
+from nexus_matcher.domain.ports.entry_lookup import (
+    BaseEntryLookup,
+    EntryLookup,
+    MappingEntryLookup,
+)
 from nexus_matcher.domain.ports.retrieval import (
     BaseReranker,
     BaseSparseRetriever,
@@ -82,6 +99,15 @@ from nexus_matcher.domain.ports.retrieval import (
     SparseRetriever,
     SparseRetrieverRegistry,
     SparseSearchResult,
+)
+from nexus_matcher.domain.ports.review_feedback import (
+    ApprovedPair,
+    BaseFeedbackConsumer,
+    FeedbackConsumer,
+    NullFeedbackConsumer,
+    ReviewedVerdict,
+    ReviewVerdict,
+    approval_binding,
 )
 from nexus_matcher.domain.ports.schema_parser import (
     BaseSchemaParser,
@@ -99,9 +125,13 @@ from nexus_matcher.domain.ports.vector_store import (
 )
 
 __all__ = [
+    # Feedback
+    "ApprovedPair",
     "BaseCache",
     "BaseDictionaryLoader",
     "BaseEmbeddingProvider",
+    "BaseEntryLookup",
+    "BaseFeedbackConsumer",
     "BaseReranker",
     "BaseSchemaParser",
     "BaseSparseRetriever",
@@ -121,14 +151,21 @@ __all__ = [
     "EmbeddingProvider",
     "EmbeddingProviderRegistry",
     "EmbeddingResult",
+    # Entry Lookup
+    "EntryLookup",
+    "FeedbackConsumer",
     "HierarchicalCache",
     "HierarchicalCacheStats",
     "LoadStatistics",
+    "MappingEntryLookup",
+    "NullFeedbackConsumer",
     "RerankCandidate",
     "RerankResult",
     # Reranker
     "Reranker",
     "RerankerRegistry",
+    "ReviewVerdict",
+    "ReviewedVerdict",
     # Schema Parser
     "SchemaParser",
     "SchemaParserRegistry",
@@ -145,4 +182,5 @@ __all__ = [
     "VectorStore",
     "VectorStoreConfig",
     "VectorStoreRegistry",
+    "approval_binding",
 ]

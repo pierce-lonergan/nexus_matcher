@@ -142,12 +142,17 @@ class RequestFailureIT {
                 "the whole point of carrying the limit is that the next attempt works");
     }
 
+    /** JSON framing per field: the four keys, quotes, colons, commas and the short
+     *  name/path values. Deliberately an UNDER-estimate, so the derived count errs over
+     *  the cap rather than under it. */
+    private static final int FIELD_OVERHEAD_BYTES = 60;
+
     @Test
     @DisplayName("a body over the byte cap comes back as a readable 413, not a socket reset")
     void byteCapIsRefusedReadably() {
-        // This body is 1.06x the cap, which is INSIDE the server's drain budget, so the 413 is
-        // reliable here: measured 120/120 on a pooled connection after the server-side fix,
-        // against 34/40 before it.
+        // This body is sized just over the cap and well inside the server's drain budget, so
+        // the 413 is reliable here: measured 120/120 on a pooled connection after the
+        // server-side fix, against 34/40 before it.
         //
         // The history matters, because the failure mode comes back for a big enough body.
         // Refusing a body the client is still writing closes the socket with bytes unread, and
@@ -167,8 +172,19 @@ class RequestFailureIT {
         // measured at 654 s against a 30 s request timeout that never fired. See the note at the
         // send site in NexusMatcherClient#attempt.
         List<FieldSpec> huge = new ArrayList<>();
+        // DERIVED from the live cap, never hard-coded. A fixed field count silently stopped
+        // testing this: the per-field character budget grew, the derived body cap grew with it
+        // from 9,873,024 to 10,897,024 bytes, and the old 1,300-field payload went from 1.06x
+        // OVER the cap to 0.96x under it. The 413 kept arriving -- from the FIELD cap instead --
+        // so the assertion below flipped while the test still looked like it was passing, and
+        // the drain path it exists to protect stopped being exercised at all.
+        long cap = client.status().limits().bodyByteCap();
         String longDoc = "x".repeat(8000);
-        for (int i = 0; i < 1300; i++) {
+        int perField = FIELD_OVERHEAD_BYTES + longDoc.length();
+        // 1.07x the cap: comfortably over, and far inside the server's 2x drain budget, which is
+        // what keeps the 413 readable rather than lost to an RST.
+        int fieldCount = (int) Math.ceil((cap * 1.07) / perField);
+        for (int i = 0; i < fieldCount; i++) {
             huge.add(FieldSpec.of("c" + i, "t.c" + i, longDoc, "string"));
         }
 

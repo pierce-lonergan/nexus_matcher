@@ -206,3 +206,109 @@ class TestFieldResultKey:
             source_metadata={"flattened_name": ""},
         )
         assert field_result_key(field) == "value"
+
+
+class TestThereIsOnlyOneDefinitionOfTheFieldsIdentity:
+    """
+    Two functions implemented the same rule and agreed only by coincidence.
+
+    `match_schema.field_result_key` keys the result map, the bypass and the audit trail;
+    `domain.services.review_evidence.result_key` keys the consistency grouping. Nothing
+    gated them equal, and a divergence would not raise: a bypass and a consistency finding
+    would simply be discussing different columns, silently, which is the exact hazard the
+    bypass key decision is ABOUT.
+
+    A test comparing their OUTPUTS over a hand-written fixture would be the same mistake
+    one level down -- it would prove they agree on the fields somebody thought to write,
+    not that they cannot disagree. So the rule is gated STRUCTURALLY (the application-layer
+    function may not restate it) and the forwarding is checked over the ENTIRE input space
+    in which the two could differ, rather than over examples.
+
+    WHY NOT `field_result_key = result_key`, which would make disagreement impossible by
+    construction: `tests/museum/NM-0006/replay.py` reintroduces the original defect by
+    anchoring on the `def field_result_key` signature in `match_schema.py`, and a bare
+    alias deletes that anchor. The museum reported it as a HOLE -- NM-0006 free to ship
+    again with nothing to catch it. Losing a museum gate to tidy an import is a bad trade,
+    so the forwarder stays and these two tests carry the weight the alias would have.
+    """
+
+    def test_the_application_layer_restates_none_of_the_rule(self):
+        """
+        The structural half. `flattened_name` is the one token the rule cannot be written
+        without -- it IS the rule, "prefer the caller's own name" -- so its absence from
+        this function's code proves the rule is not restated here, whatever the body does.
+        The non-vacuity check comes first: the token has to be present in the definition
+        for its absence here to mean anything.
+        """
+        import inspect
+
+        from nexus_matcher.application.use_cases import match_schema
+        from nexus_matcher.domain.services import review_evidence
+
+        assert match_schema._result_key is review_evidence.result_key, (
+            "match_schema no longer forwards to the domain definition"
+        )
+
+        definition = inspect.getsource(review_evidence.result_key)
+        assert "flattened_name" in definition, (
+            "the rule no longer reads `flattened_name`, so the check below tests nothing"
+        )
+
+        source = inspect.getsource(field_result_key)
+        code = source.replace(field_result_key.__doc__ or "\0", "")
+        assert "flattened_name" not in code, (
+            "the field identity has two implementations again. A bypass keyed by one and "
+            "a consistency finding keyed by the other disagree about which column they "
+            "are discussing, with no exception and no symptom."
+        )
+        assert "_result_key(" in code, "the forwarder no longer calls the domain definition"
+
+    def test_the_definition_lives_in_the_domain_so_the_domain_can_import_it(self):
+        """
+        WHICH ONE survives is not free. `domain/services/review_evidence` may not import an
+        application module -- `tests/packaging/test_architecture.py` contract 1 forbids it
+        -- so the shared definition has to be the domain one and the application layer is
+        the side that imports. Pinned so a later tidy-up cannot reverse the direction and
+        find out at import time.
+        """
+        from nexus_matcher.domain.services import review_evidence
+
+        assert (
+            review_evidence.result_key.__module__ == "nexus_matcher.domain.services.review_evidence"
+        )
+
+    @pytest.mark.parametrize("flattened", [None, "", "cust__city", "  "])
+    @pytest.mark.parametrize("full_path", ["", "cust.city"])
+    @pytest.mark.parametrize("name", ["city", ""])
+    def test_the_two_agree_everywhere_they_could_have_disagreed(self, flattened, full_path, name):
+        """
+        THE BEHAVIOURAL HALF, searched rather than sampled.
+
+        The two implementations differed in exactly one expression -- `full_path` against
+        `full_path or name` -- and the claim that the difference is unreachable rests on
+        `SchemaField.__post_init__` filling a blank `full_path` from `name`. That is an
+        argument, so it is checked over the WHOLE input space in which the two could
+        disagree: a flattened name that is absent, empty, whitespace or real, against a
+        path that is present or blank, against a name that is present or blank. Sixteen
+        cases, not four examples.
+
+        Both oracles are asserted: the domain definition, and the pre-change application
+        rule written out here so a change to BOTH sides cannot pass by agreeing with
+        itself.
+        """
+        from nexus_matcher.domain.services.review_evidence import result_key
+
+        metadata = {} if flattened is None else {"flattened_name": flattened}
+        field = SchemaField(
+            name=name,
+            data_type=DataType.STRING,
+            full_path=full_path,
+            source_metadata=metadata,
+        )
+
+        # `match_schema.field_result_key` exactly as it read before the collapse.
+        raw = field.source_metadata.get("flattened_name")
+        expected = raw if isinstance(raw, str) and raw else field.full_path
+
+        assert field_result_key(field) == expected
+        assert result_key(field) == expected

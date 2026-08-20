@@ -18,8 +18,10 @@ import java.util.Optional;
  * away the evidence the endpoint exists to produce.
  *
  * <p>{@link #record()} is left as an open map because the server's record shape is an audit format
- * that may gain keys; the two that matter are named by {@link #receivedAt()} and
- * {@link #storedField()}.
+ * that may gain keys -- and it has: {@code verdict} was appended to it, so a stored record now
+ * carries nine keys where it carried eight, with an explicit null on every request that did not
+ * send one. That is exactly the growth this member was left open for. The three that matter are
+ * named by {@link #receivedAt()}, {@link #storedField()} and {@link #storedVerdict()}.
  */
 @JsonIgnoreProperties(ignoreUnknown = true)
 public record FeedbackReceipt(
@@ -49,6 +51,22 @@ public record FeedbackReceipt(
     /** The field path as stored. */
     public Optional<String> storedField() {
         return stringValue("field");
+    }
+
+    /**
+     * The verdict as stored, decoded.
+     *
+     * <p>Empty means the server stored a null -- which is what it stores for every request that did
+     * not send one, and what every record written before the member existed reads as. It does NOT
+     * mean the key is missing: the server writes {@code "verdict": null} rather than omitting it,
+     * so an absent key would mean a server predating the member entirely.
+     *
+     * <p>A value this build does not recognise decodes to {@link ReviewDecision#UNKNOWN} with the
+     * server's own string on {@link ReviewVerdict#wireValue()}, rather than being refused. See
+     * {@link ReviewDecision}.
+     */
+    public Optional<ReviewVerdict> storedVerdict() {
+        return stringValue("verdict").map(ReviewVerdict::fromWire);
     }
 
     private Optional<String> stringValue(String key) {

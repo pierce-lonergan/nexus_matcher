@@ -1,0 +1,311 @@
+#!/usr/bin/env bash
+# Regenerate every file in src/test/resources/captured/ from RUNNING services.
+#
+#     ./clients/java/serve-fixtures.sh        # in one shell, and leave it running
+#     ./clients/java/capture-fixtures.sh      # in another, from the repository root
+#
+# Why this script exists rather than a note saying "curl it":
+#
+# The captured bodies are the only thing the *Test classes decode, so they are the only thing
+# standing between a hand-written DTO and a wire shape that has moved. That is worth nothing if
+# a fixture is ever EDITED to make a test pass -- a body somebody typed tests what the author
+# believed the contract was, which is exactly the belief the fixture was supposed to check. The
+# defence against that is not discipline, it is being able to re-derive every byte on demand:
+# run this, `git diff`, and either the service changed or nothing did.
+#
+# Each capture writes the response body VERBATIM. No formatting, no key sorting, no pretty
+# printing -- the service promises byte-stable output and reformatting here would throw that
+# promise away before the test ever saw it.
+#
+# Three of the five fixture servers are captured from:
+#   8000  the example pack                      everything normal
+#   8003  the pack + an absolute-score floor    NO_MATCH is reachable
+#   8004  the pack + a reviewer's verdict       provenance APPROVED_PAIR is reachable
+# 8001 and 8002 are the 503 and 504 fixtures; nothing here is captured from them, because their
+# behaviour is a timing property that only a live *IT can assert.
+set -euo pipefail
+
+BASE="${NEXUS_MATCHER_BASE_URL:-http://127.0.0.1:8000}"
+FLOOR_BASE="${NEXUS_MATCHER_FLOOR_BASE_URL:-http://127.0.0.1:8003}"
+APPROVED_PAIR_BASE="${NEXUS_MATCHER_APPROVED_PAIR_BASE_URL:-http://127.0.0.1:8004}"
+OUT="clients/java/src/test/resources/captured"
+
+if [[ ! -d "$OUT" ]]; then
+    echo "run this from the repository root: $OUT not found" >&2
+    exit 1
+fi
+
+require_service() {
+    local base="$1"
+    local hint="$2"
+    if ! curl -fsS -m 5 "${base}/health/live" > /dev/null 2>&1; then
+        echo "no service at ${base}. ${hint}" >&2
+        exit 1
+    fi
+}
+
+require_service "$BASE" "Start it with ./clients/java/serve-fixtures.sh from the repository root."
+require_service "$FLOOR_BASE" \
+    "Start it with: NEXUS_API_DICTIONARY=examples/governance/glossary.csv \
+NEXUS_API_GOVERNANCE=examples/governance/protection_classes.json \
+NEXUS_API_MATCHING_CONFIG=clients/java/fixture-absolute-floor.json \
+.venv/Scripts/python.exe -m uvicorn nexus_matcher.presentation.api.app:create_app --factory \
+--host 127.0.0.1 --port 8003   (serve-fixtures.sh starts it too)"
+require_service "$APPROVED_PAIR_BASE" \
+    "Start it with: PYTHONPATH=clients/java \
+NEXUS_API_DICTIONARY=examples/governance/glossary.csv \
+NEXUS_API_GOVERNANCE=examples/governance/protection_classes.json \
+NEXUS_FIXTURE_APPROVED_PAIRS=clients/java/fixture-approved-pairs.jsonl \
+.venv/Scripts/python.exe -m uvicorn fixture_approved_pair_app:create_app --factory \
+--host 127.0.0.1 --port 8004   (serve-fixtures.sh starts it too)"
+
+# `--fail` is deliberately NOT used: half of these captures ARE failure bodies, and the point of
+# capturing them is that the client decodes an error envelope it did not write.
+get() {
+    local name="$1"
+    local base="$2"
+    local path="$3"
+    curl -sS -m 60 -o "${OUT}/${name}" "${base}${path}"
+    echo "  ${name}  <-  GET ${path}"
+}
+
+post() {
+    local name="$1"
+    local base="$2"
+    local path="$3"
+    local body="$4"
+    curl -sS -m 120 -o "${OUT}/${name}" \
+        -X POST "${base}${path}" \
+        -H "Content-Type: application/json" \
+        --data-binary "$body"
+    echo "  ${name}  <-  POST ${path}"
+}
+
+echo "capturing from ${BASE}, ${FLOOR_BASE} and ${APPROVED_PAIR_BASE}"
+
+# ---------------------------------------------------------------------------------------------
+# The happy paths
+# ---------------------------------------------------------------------------------------------
+
+get health.json "$BASE" /health
+get status.json "$BASE" /api/v1/status
+
+# Two fields chosen for the two documented meanings of a null class, in one body:
+# `booking.passenger.legal_name` matches an entry that carries a protection code (CONFERRED),
+# and `sailing.route_code` matches the pack's one row with an empty code column (OPEN_TIER),
+# whose runner-ups are REJECT and still carry theirs.
+post match-response.json "$BASE" /api/v1/match '{
+  "fields": [
+    {"name": "legal_name", "path": "booking.passenger.legal_name",
+     "doc": "Full legal name of the passenger as printed on the sailing manifest.",
+     "type": "string"},
+    {"name": "route_code", "path": "sailing.route_code",
+     "doc": "Short code identifying a scheduled route between two terminals.",
+     "type": "string"}
+  ],
+  "top_k": 3
+}'
+
+# `type` is omitted on purpose so the type signal scores its neutral 0.5 rather than 1.0, which
+# keeps the explain block showing a spread of component scores instead of a column of ones.
+post match-response-explain.json "$BASE" /api/v1/match '{
+  "fields": [
+    {"name": "terminal_name", "path": "published.terminal_name",
+     "doc": "The public name of a Gravel Bay ferry terminal."}
+  ],
+  "top_k": 1,
+  "explain": true
+}'
+
+post lookup-response.json "$BASE" /api/v1/lookup '{
+  "ids": ["GBF-0001", "GBF-0028", "GBF-NOT-A-REAL-ID"]
+}'
+
+# A field the glossary genuinely does not describe, against the entry somebody might have
+# expected it to find -- so `expected` shows a real rank rather than a null.
+post retrieval-diagnostic.json "$BASE" /api/v1/diag/retrieval '{
+  "field": {"name": "quasar_flux_index", "path": "telemetry.quasar_flux_index",
+            "doc": "Interstellar quasar flux index sampled by the orbital radio array.",
+            "type": "float"},
+  "expected_governance_id": "GBF-0022",
+  "top_k": 3
+}'
+
+post feedback-receipt.json "$BASE" /api/v1/feedback '{
+  "field": "booking.passenger.legal_name",
+  "doc": "Full legal name of the passenger.",
+  "chosenGovernanceId": "GBF-0001",
+  "wasCorrect": true,
+  "reviewer": "capture",
+  "ts": "2026-08-11T09:00:00Z"
+}'
+
+# The SAME body a build before `verdict` existed would have sent, deliberately unchanged above --
+# and the stored record it comes back with is no longer the same. It now carries a ninth key,
+# `"verdict": null`, and so does the appended trail line. That is additive and a tolerant reader
+# is unaffected, but it is not "nothing changed for an unchanged request", and the diff on this
+# file the first time it is recaptured is the evidence. See CHANGELOG.md.
+
+# A verdict the boolean cannot hold: the reviewer chose a term the matcher never proposed.
+# `wasCorrect` must be false beside it -- the server refuses the other pairing rather than
+# reconciling it -- and the Java client refuses it locally for the same reason.
+post feedback-receipt-verdict.json "$BASE" /api/v1/feedback '{
+  "field": "sailing.route_code",
+  "doc": "Short code identifying a scheduled route between two terminals.",
+  "chosenGovernanceId": "GBF-0028",
+  "wasCorrect": false,
+  "reviewer": "capture",
+  "ts": "2026-08-11T09:05:00Z",
+  "verdict": "MANUAL_OVERRIDE"
+}'
+
+# ---------------------------------------------------------------------------------------------
+# The review-evidence blocks
+# ---------------------------------------------------------------------------------------------
+#
+# Both are opt-in and both are appended to the response, so this is a SECOND capture of the match
+# route rather than a change to the first: match-response.json above is the body a caller who asks
+# for neither still gets, and diffing the two is what shows the addition is additive.
+#
+# TWO captures of the same three fields, differing only in `consistency_qualifier_segments`,
+# because the grouping dial is the whole feature and one capture can only show one side of it.
+#
+# The three fields: `published.terminal.name` and `booking.passenger.name` share the leaf `name`
+# and the type `string`; `sailing.route_code` shares its leaf with nothing. All three have a
+# runner-up, so `contrast.fields` is populated for all three.
+#
+#   * evidence.json takes the SERVER'S DEFAULT (qualifierSegments 1), where the two `name` columns
+#     hang off different records and are NOT grouped. The consistency block comes back with zero
+#     groups. That is the shipped behaviour and it is what a caller who turns the flag on sees.
+#   * evidence-leaf-key.json asks for 0 -- the leaf alone -- where the same two columns become one
+#     "concept" and their different answers are reported as a DISAGREE. A ferry terminal and a
+#     passenger are not one concept; the finding is a collision. Capturing it rather than a tidy
+#     AGREE is the point: ConsistencyReport's javadoc documents exactly this failure, and a warning
+#     with no fixture behind it is a warning nobody can check.
+post match-response-evidence.json "$BASE" /api/v1/match '{
+  "fields": [
+    {"name": "name", "path": "published.terminal.name",
+     "doc": "The public name of a Gravel Bay ferry terminal.",
+     "type": "string"},
+    {"name": "name", "path": "booking.passenger.name",
+     "doc": "Full legal name of the passenger as printed on the sailing manifest.",
+     "type": "string"},
+    {"name": "route_code", "path": "sailing.route_code",
+     "doc": "Short code identifying a scheduled route between two terminals.",
+     "type": "string"}
+  ],
+  "top_k": 2,
+  "contrast": true,
+  "consistency": true
+}'
+
+post match-response-evidence-leaf-key.json "$BASE" /api/v1/match '{
+  "fields": [
+    {"name": "name", "path": "published.terminal.name",
+     "doc": "The public name of a Gravel Bay ferry terminal.",
+     "type": "string"},
+    {"name": "name", "path": "booking.passenger.name",
+     "doc": "Full legal name of the passenger as printed on the sailing manifest.",
+     "type": "string"},
+    {"name": "route_code", "path": "sailing.route_code",
+     "doc": "Short code identifying a scheduled route between two terminals.",
+     "type": "string"}
+  ],
+  "top_k": 2,
+  "contrast": true,
+  "consistency": true,
+  "consistency_qualifier_segments": 0
+}'
+
+# ---------------------------------------------------------------------------------------------
+# NO_MATCH, from the floor fixture
+# ---------------------------------------------------------------------------------------------
+#
+# Two fields: one the glossary describes and one it does not. The second earns NO_MATCH and comes
+# back WITH its candidates, one of which carries a populated protection class -- which is the
+# whole reason this capture exists. A client that reads rank 1 instead of the field verdict
+# classifies a column from an entry the server has just said describes nothing.
+post match-response-no-match.json "$FLOOR_BASE" /api/v1/match '{
+  "fields": [
+    {"name": "legal_name", "path": "booking.passenger.legal_name",
+     "doc": "Full legal name of the passenger as printed on the sailing manifest.",
+     "type": "string"},
+    {"name": "lifejacket_locker_inspection_due",
+     "path": "vessel.safety.lifejacket_locker_inspection_due",
+     "doc": "Date the lifejacket locker is next due for inspection.",
+     "type": "date"}
+  ],
+  "top_k": 3
+}'
+
+# ---------------------------------------------------------------------------------------------
+# APPROVED_PAIR, from the reviewer-verdict fixture
+# ---------------------------------------------------------------------------------------------
+#
+# The one capture that shows both halves of `provenance`, and the only place either the client
+# or a reader can see that `confidence` does not separate them.
+#
+# `booking.passenger.legal_name` is the field clients/java/fixture-approved-pairs.jsonl carries a
+# standing APPROVED verdict for, so this server answers it from the human's decision and never
+# runs retrieval: ONE candidate however large top_k is, `absoluteScore` null and `explain`
+# absent because nothing measured it, at `confidence` 1.0. The verdict names GBF-0001, which is
+# the entry retrieval finds for that column anyway -- see match-response.json, captured from
+# 8000 with a byte-identical field spec. That is deliberate. A reviewer who had chosen a
+# different entry would leave the two answers distinguishable by `governanceId`, and the capture
+# would prove nothing about the member it was taken for.
+#
+# `published.terminal_nm` is the control, and it is the sharp half. Its `confidence` against the
+# shipped pack is exactly 1.0 -- all five signals are maximal, because the column name IS the
+# glossary's own logical_name for GBF-0027 -- with `decision` AUTO_APPROVE. So this one body
+# carries two candidates that agree on `(confidence 1.0, decision AUTO_APPROVE)`, one scored by
+# the pipeline and one decided by a human. That pair was once documented as identifying a
+# bypass. This file is the evidence, from a running service, that it identifies nothing, and
+# `provenance` is the only member that tells them apart.
+#
+# `explain: true` is asked for on purpose: the control carries an explain block and the approved
+# pair does not, in the same response, because the block promises sum(scores * weights) ==
+# confidence and a candidate nobody scored cannot keep it.
+post match-response-approved-pair.json "$APPROVED_PAIR_BASE" /api/v1/match '{
+  "fields": [
+    {"name": "legal_name", "path": "booking.passenger.legal_name",
+     "doc": "Full legal name of the passenger as printed on the sailing manifest.",
+     "type": "string"},
+    {"name": "terminal_nm", "path": "published.terminal_nm",
+     "doc": "The public name of a Gravel Bay ferry terminal.",
+     "type": "string", "signals": {"domain": "Published"}}
+  ],
+  "top_k": 3,
+  "explain": true
+}'
+
+# ---------------------------------------------------------------------------------------------
+# The failure envelopes
+# ---------------------------------------------------------------------------------------------
+
+# 101 fields against a cap of 100. Built here rather than typed out, so the body stays right if
+# the server's default cap moves and somebody re-runs this with a bigger number.
+FIELDS_101="$(
+    PYTHON=".venv/Scripts/python.exe"
+    [[ -x "$PYTHON" ]] || PYTHON=".venv/bin/python"
+    "$PYTHON" -c 'import json; print(json.dumps({"fields": [{"name": f"col_{i}"} for i in range(101)]}))'
+)"
+post error-413-field-cap.json "$BASE" /api/v1/match "$FIELDS_101"
+
+post error-422-duplicate-paths.json "$BASE" /api/v1/match '{
+  "fields": [{"name": "a", "path": "t.a"}, {"name": "b", "path": "t.a"}]
+}'
+
+post error-422-top-k-cap.json "$BASE" /api/v1/match '{
+  "fields": [{"name": "a"}],
+  "top_k": 50
+}'
+
+# The 422 two reviewers have already hit: pasting a row of the example pack's own fields.json
+# into a request. Those are the pack's INPUT spellings, not this API's.
+post error-422-unknown-field-key.json "$BASE" /api/v1/match '{
+  "fields": [{"flattenedName": "booking.passenger.legal_name", "dataType": "string"}]
+}'
+
+echo
+echo "done. Now: git diff --stat ${OUT}"
+echo "A diff here is the service having changed. Read it before you accept it."

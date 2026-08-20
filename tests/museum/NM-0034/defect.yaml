@@ -1,0 +1,35 @@
+id: NM-0034
+symptom: "a published confidence depended on where a glossary row was listed -- BM25's epsilon IDF floor was derived from ndarray.sum() over an array laid out in glossary row order, so on a corpus whose raw IDFs cancel the floor changed SIGN with the row order, the sparse arm returned three documents in one order and none in the other, and min-max fusion turned that into rank 1's confidence moving 0.88625 -> 0.95625"
+severity: HIGH
+fixed_in: 2.2.0
+gate_that_should_have_caught_it: "none -- tests/unit/infrastructure/test_bm25_vectorized.py pins BM25 against rank_bm25 at atol=1e-4 and rank_bm25 sums in the same order, so both were free to agree on an order-dependent answer; and every permutation test in the suite indexed its corpus once, so nothing ever asked whether the same rows in a different order give the same score"
+gate_that_catches_it_now: "tests/museum/NM-0034/test_nm_0034.py, plus tests/properties/test_metamorphic.py::TestTheOrderDependentIdfFloor and the hypothesis property TestPermutationInvariance::test_shuffling_the_glossary_leaves_every_score_where_it_was that found it"
+touches:
+  - src/nexus_matcher/infrastructure/adapters/sparse_retrievers/bm25.py
+notes: >
+  PRE-EXISTING, and reproduced bit-identically against a `git archive HEAD src` build, so
+  no recent wave introduced it. Found by hypothesis, not by a soak: a random search of 450
+  shuffles across 150 glossaries found nothing, and eight fresh runs of the property
+  against the broken code went 0/8 because the counterexample lives in `.hypothesis/`,
+  which is gitignored and does not travel. That is the worse kind of red -- one that will
+  not reliably reproduce in CI -- which is why the reduced example is pinned as a literal
+  in two places rather than left to the generator that found it.
+
+  Same class as NM-0020 (ranking that moved with PYTHONHASHSEED) reached by a different
+  route: there the order leaked out of a hash-ordered CONTAINER, here out of a float64
+  REDUCTION. Both are the same mistake -- a quantity that is a property of the corpus as a
+  SET was computed in a way that reads the corpus as a SEQUENCE.
+
+  Three things had to line up, and it is worth naming all three because fixing only the
+  first would have left the amplifier in place. (1) `_term_idf` took the average with
+  `ndarray.sum()`, a pairwise reduction over an array ordered by first-seen term, i.e. by
+  glossary row order; on the falsifying corpus the exact total is 0.0 and the pairwise one
+  is +/-2.220446e-16. (2) `search` admits a document only when its score is > 0, which
+  turns that sign into a membership decision for the whole arm. (3) `_minmax_normalize` is
+  scale-free, so an arm made entirely of 1e-17 dust is stretched across the full [0, 1]
+  range and its best document is handed a lexical component of 1.0 instead of the 0.0 an
+  absent arm gives -- 0.10 of fused score and, at semantic_weight 0.70, 0.07 of published
+  confidence. Only (1) is repaired here, because only (1) reads position where it should
+  read content; (3) remains an amplifier and is reported in
+  tests/properties/test_metamorphic.py rather than silently retuned, since min-max was
+  chosen by measurement (linear 0.702 P@1 against rrf 0.610).

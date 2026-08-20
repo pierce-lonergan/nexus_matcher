@@ -60,7 +60,11 @@ from nexus_matcher.presentation.api.app import create_app
 from nexus_matcher.presentation.api.body_limit import BodySizeLimitMiddleware
 from nexus_matcher.presentation.api.limits import MatchServiceLimits, worst_case_body_bytes
 from nexus_matcher.presentation.api.matching import MatchService
-from nexus_matcher.presentation.api.schemas import MAX_FIELD_SPEC_CHARS
+from nexus_matcher.presentation.api.schemas import (
+    MAX_FIELD_SPEC_CHARS,
+    MAX_REQUEST_SIGNAL_CHARS,
+    _signal_map_chars,
+)
 from tests.unit.presentation.api._support import FakeMatcher
 
 # Small enough that the tests are instant, and the arithmetic is the same at 9.9 MB.
@@ -700,9 +704,10 @@ def test_the_derived_cap_admits_the_largest_body_the_declared_bounds_allow():
     schema they generated their client from.
 
     Built as a REAL worst-case body -- every string at its `max_length`, every character
-    four UTF-8 bytes -- and measured, rather than asserting the formula against itself.
-    Three fields rather than 250 because the property is per-field and this runs instantly;
-    the framing allowance is what is actually under test.
+    four UTF-8 bytes, and a per-field `signals` map at its own budget -- and measured,
+    rather than asserting the formula against itself. Three fields rather than 250 because
+    the property is per-field and this runs instantly; the framing allowance is what is
+    actually under test.
     """
     fields = [
         {
@@ -710,6 +715,10 @@ def test_the_derived_cap_admits_the_largest_body_the_declared_bounds_allow():
             "path": FOUR_BYTE_CHAR * 1024,
             "doc": FOUR_BYTE_CHAR * 8192,
             "type": FOUR_BYTE_CHAR * 128,
+            # The query-signal channel is per-field payload too, so it belongs in the
+            # worst case. One key of 8 characters and a value that fills the rest of the
+            # 1024-character budget.
+            "signals": {"unknown_": FOUR_BYTE_CHAR * (1024 - 8)},
         }
         for _ in range(3)
     ]
@@ -720,12 +729,61 @@ def test_the_derived_cap_admits_the_largest_body_the_declared_bounds_allow():
         f"a body of {largest} bytes is inside every declared bound and outside the cap "
         f"of {worst_case_body_bytes(3)} derived for it"
     )
-    # And the shipped default is the ~10 MB the derivation implies, not the ~2.4 MB a
-    # character count alone would give: 250 x 9856 characters is 2.46 M characters and
-    # 9.86 M bytes. An 8 MiB cap -- the obvious round number -- sits below it.
-    assert MAX_FIELD_SPEC_CHARS == 9856
+    # And the shipped default is the ~14 MB the derivation implies, not the ~2.7 MB a
+    # character count alone would give: 250 x 10880 characters is 2.72 M characters and
+    # 10.88 M bytes. An 8 MiB cap -- the obvious round number -- sits below it.
+    assert MAX_FIELD_SPEC_CHARS == 512 + 1024 + 8192 + 128 + 1024
     assert MatchServiceLimits().body_byte_cap == worst_case_body_bytes(250)
     assert MatchServiceLimits().body_byte_cap > 8 * 1024 * 1024
+
+
+def test_the_derived_cap_admits_a_realistic_body_carrying_a_full_abbreviation_overlay():
+    """
+    The ENVELOPE-level half of the same property, and the honest limit of it.
+
+    `worst_case_body_bytes` derives its floor from `FieldSpec`'s bounds multiplied by the
+    field cap, plus a fixed 1 KiB of envelope framing. The request-level `signals` map --
+    which is where a several-thousand-row abbreviation overlay travels -- has no term in
+    that derivation and cannot be given one through `MAX_FIELD_SPEC_CHARS`, because that
+    constant is multiplied by `max_batch_fields` and an envelope allowance added to it
+    would be counted up to 250 times.
+
+    So what is pinned here is what actually holds: a full 250-field batch of REALISTIC
+    ASCII fields carrying a maximal overlay is comfortably inside the derived cap. The
+    corner that is not covered -- the same maximal body with every character four UTF-8
+    bytes -- is stated in `schemas.py` beside `MAX_REQUEST_SIGNAL_CHARS`, has
+    `NEXUS_API_MAX_BODY_BYTES` as its escape hatch, and is fixed by an envelope term in
+    `worst_case_body_bytes` itself. This test exists so that corner cannot quietly widen.
+    """
+    # Grown until it is AT the request-level budget, not merely under it: the point is the
+    # bound, not this particular catalog. A row is ~29 characters, so this is ~18,000 of
+    # them -- comfortably over the several-thousand-row catalogs the channel was sized for.
+    overlay: dict[str, str] = {}
+    while _signal_map_chars({"abbreviations": overlay}) < MAX_REQUEST_SIGNAL_CHARS - 64:
+        overlay[f"ab{len(overlay):05d}"] = "expanded business word"
+    assert _signal_map_chars({"abbreviations": overlay}) >= MAX_REQUEST_SIGNAL_CHARS - 64
+    assert _signal_map_chars({"abbreviations": overlay}) <= MAX_REQUEST_SIGNAL_CHARS
+    assert len(overlay) > 8_000
+
+    body = {
+        "fields": [
+            {
+                "name": "customer_account_identifier",
+                "path": f"originations.customer.account_{i}",
+                "doc": "The identifier of the account this application was booked under." * 4,
+                "type": "string",
+            }
+            for i in range(250)
+        ],
+        "top_k": 5,
+        "signals": {"abbreviations": overlay, "domain": "originations"},
+    }
+    measured = len(json.dumps(body).encode("utf-8"))
+    cap = MatchServiceLimits().body_byte_cap
+    assert measured < cap, (
+        f"a realistic 250-field body carrying a maximal overlay is {measured} bytes, "
+        f"over the derived cap of {cap}"
+    )
 
 
 def test_the_cap_follows_the_field_cap_rather_than_a_typed_number():

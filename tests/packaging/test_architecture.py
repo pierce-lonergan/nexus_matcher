@@ -10,6 +10,24 @@ What is enforced
      allowed only by name, with a written reason, in `ALLOWED_DEFERRED` below.
   2. Nothing outside `presentation/api` imports fastapi or starlette.
   3. Nothing outside `presentation/cli` imports typer or rich.
+  4. Every module under `domain/ports/` is exported from the ports package.
+
+What is NOT enforced, said plainly
+----------------------------------
+This file has no opinion on PRIVATE-ATTRIBUTE reach. `presentation/api/lookup.py` used to
+resolve ids by reading `NexusMatcher._dictionary_entries`, which inverted no import and
+crossed no framework boundary, so contracts 1-3 were green throughout -- and stayed green
+when the reach was replaced by a port. A layering check built on imports cannot see a
+`getattr`, and pretending otherwise would be worse than the gap. The property that lookup
+depends on `domain.ports.entry_lookup.EntryLookup` and not on a matcher is held where it
+can actually be observed: `test_lookup_endpoint.TestThePlaneDependsOnThePortAndNotOnAMatcher`
+drives the whole plane from a domain object with no application layer in the process.
+
+Contract 4 exists because that is the failure this file CAN see: a port added to
+`domain/ports/` and left out of the package's exports is a seam that is documented,
+implemented and unreachable by the name the package publishes -- and every adapter then
+imports the module path directly, which is how a "port" quietly becomes a module nobody
+treats as an interface.
 
 Why ast and not import-linter
 -----------------------------
@@ -309,3 +327,72 @@ def test_each_framework_contract_has_something_to_constrain():
         f"FRAMEWORK_OWNERS constrains packages this codebase never imports: {unused}. "
         "Delete the rule or the dependency."
     )
+
+
+# =============================================================================
+# CONTRACT 4 -- a port the package does not publish is not a port
+# =============================================================================
+
+
+def _port_modules() -> list[str]:
+    """Every module under `domain/ports/`, excluding the package's own `__init__`."""
+    return sorted(
+        path.stem for path in (PACKAGE / INNER / "ports").glob("*.py") if path.stem != "__init__"
+    )
+
+
+def test_every_port_module_is_reachable_from_the_ports_package():
+    """
+    A port added to the directory and left out of `__init__` is a seam nobody can import by
+    the name the package publishes, so every adapter reaches for the module path instead and
+    the package stops being the list of this library's interfaces.
+
+    Checked by IMPORTING the package and looking for a public name defined in each module,
+    rather than by parsing `__all__`: a name listed in `__all__` and not actually importable
+    is the same defect one step later, and it fails at a user's first import instead of here.
+    """
+    import importlib
+
+    package = importlib.import_module(f"{PACKAGE_ROOT}.{INNER}.ports")
+    exported = {
+        name
+        for name in dir(package)
+        if not name.startswith("_") and getattr(getattr(package, name), "__module__", "") != ""
+    }
+
+    modules = _port_modules()
+    assert modules, "no port modules found -- this contract would be vacuous"
+
+    unreachable = []
+    for module_name in modules:
+        qualified = f"{PACKAGE_ROOT}.{INNER}.ports.{module_name}"
+        defined_here = {
+            name
+            for name in exported
+            if getattr(getattr(package, name), "__module__", None) == qualified
+        }
+        if not defined_here:
+            unreachable.append(module_name)
+
+    assert not unreachable, (
+        "these port modules export nothing through `domain.ports`, so the package is no "
+        "longer the list of this library's interfaces:\n  "
+        + "\n  ".join(unreachable)
+        + "\nAdd the protocol to domain/ports/__init__.py, or move the module out of ports/."
+    )
+
+
+def test_the_ports_package_publishes_only_names_it_can_actually_import():
+    """
+    The other direction, and the vacuity guard for the check above: `__all__` is a promise
+    that `from nexus_matcher.domain.ports import X` works. A name listed there and not bound
+    fails at a user's import, and would let contract 4 pass while the package was broken.
+    """
+    import importlib
+
+    package = importlib.import_module(f"{PACKAGE_ROOT}.{INNER}.ports")
+    declared = list(getattr(package, "__all__", []))
+    assert len(declared) > 10, f"__all__ has {len(declared)} names -- this check is near-vacuous"
+
+    missing = sorted(name for name in declared if not hasattr(package, name))
+    assert not missing, f"`domain.ports.__all__` promises names it does not bind: {missing}"

@@ -45,11 +45,29 @@
       Where the integration tests find a running service. Overridable, so the same suite can be
       pointed at a service somebody else started:
           mvn verify -Dnexus.matcher.baseUrl=http://127.0.0.1:8000
-      See README.md for the three fixture servers `verify` needs and the script that starts them.
+      See README.md for the five fixture servers `verify` needs and the script that starts them.
     -->
     <nexus.matcher.baseUrl>http://127.0.0.1:8000</nexus.matcher.baseUrl>
     <nexus.matcher.unavailableBaseUrl>http://127.0.0.1:8001</nexus.matcher.unavailableBaseUrl>
     <nexus.matcher.deadlineBaseUrl>http://127.0.0.1:8002</nexus.matcher.deadlineBaseUrl>
+    <!--
+      The pack with an absolute-score floor configured. A NO_MATCH field decision is reachable
+      only two ways: a field that came back with no candidates at all, or a configured floor that
+      rank 1 fails. The library ships no floor and will not invent one, so without a fixture that
+      sets one, the client's handling of NO_MATCH could only ever be tested against a response
+      body somebody typed. See clients/java/fixture-absolute-floor.json.
+    -->
+    <nexus.matcher.floorBaseUrl>http://127.0.0.1:8003</nexus.matcher.floorBaseUrl>
+    <!--
+      The pack with one reviewer verdict standing, so a candidate carrying
+      `provenance: APPROVED_PAIR` exists. That value is reachable only on a deployment that has
+      attached a feedback consumer, and the service ships none: `create_app()` builds none and
+      `NexusMatcher()` takes `feedback_consumer=None`, which its own source documents as a
+      measured decision rather than an unfinished wire-up. So on every other fixture port every
+      candidate is RETRIEVAL, and the other half of the vocabulary could only ever be tested
+      against a response body somebody typed. See clients/java/fixture_approved_pair_app.py.
+    -->
+    <nexus.matcher.approvedPairBaseUrl>http://127.0.0.1:8004</nexus.matcher.approvedPairBaseUrl>
 
     <!--
       Extra JVM arguments for the integration-test fork.
@@ -150,6 +168,8 @@
             <nexus.matcher.baseUrl>${nexus.matcher.baseUrl}</nexus.matcher.baseUrl>
             <nexus.matcher.unavailableBaseUrl>${nexus.matcher.unavailableBaseUrl}</nexus.matcher.unavailableBaseUrl>
             <nexus.matcher.deadlineBaseUrl>${nexus.matcher.deadlineBaseUrl}</nexus.matcher.deadlineBaseUrl>
+            <nexus.matcher.floorBaseUrl>${nexus.matcher.floorBaseUrl}</nexus.matcher.floorBaseUrl>
+            <nexus.matcher.approvedPairBaseUrl>${nexus.matcher.approvedPairBaseUrl}</nexus.matcher.approvedPairBaseUrl>
           </systemPropertyVariables>
         </configuration>
         <executions>

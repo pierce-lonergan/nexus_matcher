@@ -51,9 +51,12 @@ Usage
 from __future__ import annotations
 
 import argparse
+import contextlib
 import importlib.util
+import os
 import subprocess
 import sys
+from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -231,6 +234,47 @@ def replay_one(entry: Entry, verbose: bool = False) -> tuple[bool, str]:
     return True, "green -> red -> green"
 
 
+_LOCK = REPO / ".museum-replay.lock"
+
+
+@contextlib.contextmanager
+def _exclusive_run() -> Iterator[None]:
+    """Refuse to start if another replay is already mutating the tree.
+
+    This runner injects a defect into real source, runs pytest, and restores from a byte
+    snapshot. That is safe alone and corrupting in parallel: two runs interleave, one
+    restores a snapshot it took while the other's defect was applied, and the tree is left
+    holding an injected defect nobody typed. Several are pure DELETIONS -- NM-0025 removes
+    a line rather than adding a marker -- so nothing greps for evidence and a commit taken
+    mid-run ships a re-introduced museum defect with every gate green.
+
+    That is not hypothetical: three concurrent lanes hit it in one session, one had to
+    `git checkout` a file it did not own to remove another's injection, and each saw
+    disjoint false HOLEs.
+
+    An advisory lock file, not a mutex: this is a developer tool, and the failure it must
+    prevent is two well-meaning runs, not an adversary. O_EXCL makes the check atomic, and
+    a stale lock names the pid that left it so a human can judge rather than guess.
+    """
+    try:
+        fd = os.open(_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        held = _LOCK.read_text(encoding="utf-8").strip() or "an unrecorded process"
+        raise SystemExit(
+            f"another museum replay is running (started by {held}). Two replays "
+            "cannot share a working tree: each injects a defect into real source and "
+            "restores from its own snapshot, so interleaving them leaves the tree "
+            "holding a defect nobody typed. "
+            f"If nothing is running, delete {_LOCK.name} and re-run."
+        ) from None
+    try:
+        os.write(fd, f"pid {os.getpid()}".encode())
+        os.close(fd)
+        yield
+    finally:
+        _LOCK.unlink(missing_ok=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("ids", nargs="*", help="only these entries (e.g. NM-0005)")
@@ -259,13 +303,16 @@ def main() -> int:
     print(f"\nMuseum replay: {len(entries)} entries")
     print("=" * 78)
     failures: list[tuple[Entry, str]] = []
-    for entry in entries:
-        ok, detail = replay_one(entry, args.verbose)
-        mark = "PASS" if ok else "HOLE"
-        print(f"  {mark}  {entry.id}  {entry.symptom[:60]}")
-        if not ok:
-            print(f"        {detail.splitlines()[0]}")
-            failures.append((entry, detail))
+    # Held across the WHOLE loop, not per entry: two runs alternating entry-by-entry
+    # corrupt the tree just as thoroughly as two running the same one.
+    with _exclusive_run():
+        for entry in entries:
+            ok, detail = replay_one(entry, args.verbose)
+            mark = "PASS" if ok else "HOLE"
+            print(f"  {mark}  {entry.id}  {entry.symptom[:60]}")
+            if not ok:
+                print(f"        {detail.splitlines()[0]}")
+                failures.append((entry, detail))
 
     print("=" * 78)
     print(f"  {len(entries) - len(failures)} replayed and caught, {len(failures)} holes")

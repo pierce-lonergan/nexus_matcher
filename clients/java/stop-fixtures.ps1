@@ -3,12 +3,12 @@
 #     .\clients\java\stop-fixtures.ps1
 #
 # Matches on the LISTENING PORT rather than on the process name, so it cannot take down an
-# unrelated python.exe -- three of which is exactly what a developer running this repository is
+# unrelated python.exe -- four of which is exactly what a developer running this repository is
 # likely to have.
 
 $ErrorActionPreference = "Stop"
 
-foreach ($port in 8000, 8001, 8002) {
+foreach ($port in 8000, 8001, 8002, 8003) {
     $connections = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue
     if (-not $connections) {
         Write-Host "nothing listening on $port"

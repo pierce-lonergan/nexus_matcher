@@ -349,12 +349,18 @@ STAND_IN_SIGNALS: tuple[float, float, float, float, float] = (0.9012, 0.5, 0.421
 # that derives its expected value from the code under test proves nothing (H-004).
 STAND_IN_CONFIDENCE = 0.754395
 
+# The stand-in RAW dense score. Chosen away from every value in STAND_IN_SIGNALS so a
+# response that emitted a weighted component where it meant the absolute score is
+# distinguishable from one that got it right.
+STAND_IN_ABSOLUTE_COSINE = 0.7657
+
 
 def governed_match(
     field: SchemaField,
     entry: DictionaryEntry,
     rank: int = 1,
     decision: MatchDecision = MatchDecision.REVIEW,
+    absolute_cosine: float | None = STAND_IN_ABSOLUTE_COSINE,
 ) -> MatchResult:
     """
     A REAL `MatchResult` with hand-chosen scores, carrying the class the entry's code
@@ -370,6 +376,12 @@ def governed_match(
     would silently test the null path while claiming to test the populated one. That is
     now the only rank it applies to: `rank=2, decision=REJECT` keeps its class, which is
     what the rejected-runner-up test in `test_match_endpoint` reads.
+
+    `absolute_cosine` is a parameter, and `None` is a real value for it: the dense arm did
+    not return this candidate at all, so it reached the shortlist through the lexical arm.
+    A real matcher over the fictional glossary cannot produce that state -- every entry is
+    within the dense top-k of every query on a five-entry index -- so it has to be
+    constructed, and it is the state an absolute floor cannot evaluate.
     """
     sem, lex, edit, type_, domain = STAND_IN_SIGNALS
     return MatchResult(
@@ -383,7 +395,7 @@ def governed_match(
             edit_distance_score=edit,
             type_compatibility_score=type_,
             domain_score=domain,
-            absolute_cosine=0.7657,
+            absolute_cosine=absolute_cosine,
         ),
         decision=decision,
         performance=PerformanceMetrics(latency_ms=1.0),
@@ -411,9 +423,13 @@ class FakeMatcher:
         empty_paths: tuple[str, ...] = (),
         mangle_keys: bool = False,
         serve_wrong_field: bool = False,
+        absolute_cosine: float | None = STAND_IN_ABSOLUTE_COSINE,
     ) -> None:
         self._entries = entries
         self._config = config or MatchingConfig()
+        # What every candidate this matcher serves reports as its raw dense score. `None`
+        # is the lexical-only candidate a five-entry real index cannot produce.
+        self._absolute_cosine = absolute_cosine
         self._delay_seconds = delay_seconds
         self._raises = raises
         self._drop_last_field = drop_last_field
@@ -425,11 +441,23 @@ class FakeMatcher:
         self._mangle_keys = mangle_keys
         self._serve_wrong_field = serve_wrong_field
         self.calls = 0
+        # One entry per call: the `signals` keyword as it arrived, or None when the
+        # endpoint used the unextended call.
+        self.signals_seen: list[dict[str, object] | None] = []
         self.started = threading.Event()
         self.release = threading.Event()
         self.release.set()
 
-    def _match_fields(self, fields: list[SchemaField]) -> dict[str, tuple[MatchResult, ...]]:
+    def _match_fields(
+        self,
+        fields: list[SchemaField],
+        signals: dict[str, object] | None = None,
+    ) -> dict[str, tuple[MatchResult, ...]]:
+        # `signals` is recorded, never acted on. The endpoint's contract is that it hands
+        # the channel over intact and passes it ONLY when the caller sent one, so a test
+        # needs to see both the value and whether the keyword arrived at all; a stub that
+        # merely accepted it could not tell those apart.
+        self.signals_seen.append(signals)
         self.calls += 1
         self.started.set()
         if self._delay_seconds:
@@ -458,7 +486,7 @@ class FakeMatcher:
                 results[key] = ()
                 continue
             results[key] = tuple(
-                governed_match(field, entry, rank=rank)
+                governed_match(field, entry, rank=rank, absolute_cosine=self._absolute_cosine)
                 for rank, entry in enumerate(self._entries[:3], 1)
             )
         return results

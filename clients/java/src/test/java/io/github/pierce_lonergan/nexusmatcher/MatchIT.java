@@ -1,5 +1,9 @@
 package io.github.pierce_lonergan.nexusmatcher;
 
+import io.github.pierce_lonergan.nexusmatcher.model.ConceptGroup;
+import io.github.pierce_lonergan.nexusmatcher.model.ConsistencyReport;
+import io.github.pierce_lonergan.nexusmatcher.model.Contrast;
+import io.github.pierce_lonergan.nexusmatcher.model.ContrastReport;
 import io.github.pierce_lonergan.nexusmatcher.model.Explain;
 import io.github.pierce_lonergan.nexusmatcher.model.FieldSpec;
 import io.github.pierce_lonergan.nexusmatcher.model.Governance;
@@ -7,6 +11,7 @@ import io.github.pierce_lonergan.nexusmatcher.model.MatchCandidate;
 import io.github.pierce_lonergan.nexusmatcher.model.MatchDecision;
 import io.github.pierce_lonergan.nexusmatcher.model.MatchRequest;
 import io.github.pierce_lonergan.nexusmatcher.model.MatchResponse;
+import io.github.pierce_lonergan.nexusmatcher.model.SignalDifference;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -15,7 +20,9 @@ import java.util.ArrayList;
 import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 /**
@@ -161,5 +168,115 @@ class MatchIT {
 
         assertEquals(first.results(), second.results());
         assertEquals(first.vocabulary(), second.vocabulary());
+    }
+
+    // =============================================================================
+    // THE REVIEW-EVIDENCE BLOCKS, against a live server
+    // =============================================================================
+    //
+    // The decoding tests read captured bodies. These three read a running service, and the
+    // property they are here for is the one a capture cannot show: that asking for the blocks
+    // changes NOTHING ELSE, and that the server's defaults are what this client's javadoc says
+    // they are. A default that moves in the service and not in the javadoc is exactly the drift
+    // tests/packaging/test_java_client_contract.py keeps a gate on for the SHAPE of the wire,
+    // and the shape is not the only thing a client documents.
+
+    /** Two columns that share the leaf `name` and are not the same concept. */
+    private static List<FieldSpec> twoColumnsNamedName() {
+        return List.of(
+                FieldSpec.of("name", "published.terminal.name",
+                        "The public name of a Gravel Bay ferry terminal.", "string"),
+                FieldSpec.of("name", "booking.passenger.name",
+                        "Full legal name of the passenger as printed on the sailing manifest.",
+                        "string"));
+    }
+
+    @Test
+    @DisplayName("asking for the evidence blocks changes nothing else in the response")
+    void theEvidenceBlocksAreAdditive() {
+        MatchRequest plain = MatchRequest.of(twoColumnsNamedName(), 2);
+
+        MatchResponse without = client.match(plain);
+        MatchResponse with = client.match(plain.withContrast(true).withConsistency(true));
+
+        assertNull(without.contrast(), "not asked for, so not sent");
+        assertNull(without.consistency());
+        assertNotNull(with.contrast(), "asked for, so sent");
+        assertNotNull(with.consistency());
+
+        assertEquals(
+                without.results(),
+                with.results(),
+                "the evidence blocks are reporting-only; a candidate that moved because a "
+                        + "reviewer asked why it won would make the answer depend on the question");
+        assertEquals(without.fieldDecisions(), with.fieldDecisions());
+        assertEquals(without.vocabulary(), with.vocabulary());
+        assertFalse(
+                with.consistency().promotionApplied(),
+                "and the server says so machine-readably rather than leaving it to be inferred");
+    }
+
+    @Test
+    @DisplayName("the contrast closes against the confidences sent beside it")
+    void theContrastArithmeticClosesLive() {
+        MatchResponse response = client.match(
+                MatchRequest.of(twoColumnsNamedName(), 2).withContrast(true));
+
+        ContrastReport report = response.contrastValue().orElseThrow();
+        assertEquals(
+                List.copyOf(response.paths()),
+                List.copyOf(report.paths()),
+                "every input path is a key of the contrast, in the order sent");
+
+        for (String path : report.paths()) {
+            Contrast contrast = report.contrastFor(path).orElseThrow();
+            double summed = contrast.signals().stream()
+                    .mapToDouble(SignalDifference::weightedDelta)
+                    .sum();
+            // One order of magnitude above the published resolution: that is the server's own
+            // tolerance, and it is there because both operands of every delta are rounded before
+            // being subtracted. See ReviewEvidenceDecodingTest for the worked case.
+            assertEquals(contrast.signalGap(), summed, report.resolution() * 10.0, path);
+            assertEquals(
+                    contrast.topConfidence(),
+                    response.topCandidateFor(path).orElseThrow().confidence(),
+                    0.0,
+                    path + ": the contrast is about the candidates in THIS response, and its "
+                            + "top confidence is the one rank 1 carries");
+        }
+    }
+
+    @Test
+    @DisplayName("the shipped grouping default reports nothing; the loose key manufactures a find")
+    void theGroupingDialBehavesAsDocumented() {
+        MatchRequest asking = MatchRequest.of(twoColumnsNamedName(), 2).withConsistency(true);
+
+        ConsistencyReport shipped = client.match(asking).consistencyValue().orElseThrow();
+        assertEquals(
+                1,
+                shipped.qualifierSegments().orElseThrow(),
+                "ConsistencyReport's javadoc tells a reader the default is 1 and that it reports "
+                        + "nothing. If the server's default moves, that javadoc is wrong and this "
+                        + "is where a reader finds out");
+        assertEquals(
+                0,
+                shipped.groupsFound(),
+                "these two columns hang off different records, so at the shipped default they "
+                        + "are not one concept and nothing is reported");
+
+        ConsistencyReport loose = client.match(asking.withConsistencyQualifierSegments(0))
+                .consistencyValue()
+                .orElseThrow();
+        assertEquals(0, loose.qualifierSegments().orElseThrow());
+        assertEquals(1, loose.groupsFound());
+        assertEquals(1, loose.groupsDisagreeing());
+
+        ConceptGroup collision = loose.disagreeingGroups().get(0);
+        assertEquals(
+                collision.answeredCount(),
+                collision.distinctAnswers(),
+                "a ferry terminal and a passenger are not one concept. Every column that "
+                        + "answered gave a different answer, which is the collision signature, "
+                        + "not a matcher that contradicted itself");
     }
 }

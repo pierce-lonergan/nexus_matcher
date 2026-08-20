@@ -50,13 +50,18 @@ vector store.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
+import pytest
 from hypothesis import assume, given
 from hypothesis import strategies as st
 
 from nexus_matcher.application.use_cases.match_schema import _tokenize_identifier
-from nexus_matcher.domain.models.entities import DictionaryEntry
+from nexus_matcher.domain.models.entities import DictionaryEntry, SchemaField
+from nexus_matcher.domain.ports.retrieval import SparseDocument
 from nexus_matcher.domain.ports.vector_store import SearchResult
+from nexus_matcher.infrastructure.adapters.sparse_retrievers.bm25 import BM25Retriever
 from nexus_matcher.shared.types.base import DataType
 from tests.properties._support import (
     PROPERTY_SETTINGS,
@@ -90,6 +95,45 @@ from tests.properties._support import (
 # 1e-6 is ~14x the largest movement ever seen here and orders of magnitude below any
 # scoring change that could reorder a pair that was not already tied. RATCHET: it may be
 # tightened, it may never be loosened.
+#
+# CORRECTION, 2026-08-20. The three figures above are UNOBSERVED MAXIMA, not measured
+# ones, and the difference matters: hypothesis found a glossary permutation that moves a
+# rank-1 confidence by 7.0e-02 -- 1.8 MILLION times the 3.9e-08 stated above. The cause is
+# not float32 reassociation either. `fusedRetrieval` itself moved 0.90 -> 1.00, and 0.90 is
+# exactly `fusion_alpha`: an arm's MIN-MAX POSITION changed with corpus order, which is a
+# tie-break question, not an arithmetic one. This library already has a museum entry for
+# order-dependent ranking (NM-0020, PYTHONHASHSEED), so the class is known.
+#
+# The tolerance is NOT loosened -- the ratchet holds and the property is right to be red.
+# What is corrected is the claim: a search that did not find something is not a measurement
+# that it does not exist. A later random search of 450 shuffles across 150 glossaries also
+# found nothing, so the construction is narrow; "narrow" is not "absent".
+#
+# RESOLVED, 2026-08-20, as NM-0034 -- and the diagnosis above is itself half wrong, so it
+# is left standing rather than quietly rewritten. The min-max POSITION did move, exactly as
+# stated; what moved it was arithmetic after all, just not in the arm anyone was watching.
+# BM25 floors a negative IDF at `epsilon * average_idf`, and the average was taken with
+# `ndarray.sum()` over an array laid out in first-seen term order -- i.e. in GLOSSARY ROW
+# ORDER. On the falsifying corpus the raw IDFs cancel exactly, so the true total is 0.0 and
+# the pairwise total is +2.220446e-16 in one row order and -2.220446e-16 in the other. The
+# floor changes SIGN, and `BM25Retriever.search` keeps a document only when its score is
+# > 0, so the sparse arm returned three documents in one order and NOTHING in the other.
+# Min-max is scale-free, so an arm made entirely of 1e-17 dust was stretched over the full
+# [0, 1] range: rank 1's lexical component went 0.0 -> 1.0, its fused score 0.90 -> 1.00,
+# and its confidence 0.88625 -> 0.95625. The repair is `math.fsum`, whose result is the
+# correctly-rounded exact sum and therefore identical for every permutation of its input.
+# `TestTheOrderDependentIdfFloor` below pins the reduced example, because the hypothesis
+# database that found it is gitignored and does not travel.
+#
+# THE TOLERANCE IS NOT TIGHTENED EITHER, and that is a measurement rather than caution.
+# What sets the floor here is the dense arm's float32 GEMM, which NM-0034 does not touch.
+# Soaked after the fix, two 20,000-example runs at different seeds:
+#     seed 1   238,073 confidence comparisons   worst 6.389e-08
+#     seed 7   234,531 confidence comparisons   worst 8.198e-08
+# So the band is if anything WIDER than the 7.1e-08 that forced this constant in the first
+# place -- 40,000 examples see more of it than six seeds did. 1e-6 is ~12x the largest
+# movement now observed, which is the same margin it was chosen with. It stays. Anyone who
+# can bound the GEMM band tighter may tighten it; it may never be loosened.
 FLOAT32_REASSOCIATION = 1e-6
 
 
@@ -158,7 +202,9 @@ class TestPermutationInvariance:
         Had it shipped bit-exact it would have reddened on correct code roughly one run in
         six, which is the definition of the gate this package refuses to write. Measured
         maximum across 42,320 confidence comparisons drawn by hypothesis: 3.9e-08, and
-        7.1e-08 for the run that caught it. The tolerance is 1e-6, ~14x the largest
+        7.1e-08 for the run that caught it -- but see the CORRECTION above the constant:
+        a 7.0e-02 movement was later found, so those are unobserved maxima rather than
+        measured ones. The tolerance is 1e-6, ~14x the largest
         movement ever observed here and far below any scoring change that could reorder a
         pair that was not already tied.
         """
@@ -257,6 +303,209 @@ class TestPermutationInvariance:
                         f"margin yet changed with field order: {ids_before[rank]!r} -> "
                         f"{ids_after[rank]!r}"
                     )
+
+
+class TestTheOrderDependentIdfFloor:
+    """
+    NM-0034, pinned as a literal so it survives without the hypothesis database.
+
+    The example below is hypothesis's own shrink of the counterexample that reddened
+    `test_shuffling_the_glossary_leaves_every_score_where_it_was`: four entries, one field,
+    and `numpy.random.default_rng(0)` for the permutation. On the broken code
+    `customer.customer` came back at confidence 0.8862500000000001 when the glossary was
+    listed e0 e1 e2 e3 and 0.95625 when it was listed e2 e0 e1 e3 -- 0.07 of published
+    confidence, from re-ordering rows.
+
+    THIS IS PINNED RATHER THAN LEFT TO THE PROPERTY BECAUSE THE PROPERTY DOES NOT
+    RELIABLY FIND IT. A random search of 450 shuffles across 150 glossaries found nothing;
+    hypothesis reached it by construction, and a fresh 8-run sweep of the property against
+    the BROKEN code went 0/8 because `.hypothesis/examples/` is gitignored and a fresh
+    clone inherits no counterexample. A property that only fails on the machine that
+    already knows the answer is not a gate anywhere else, so the answer is written down
+    here.
+
+    Both levels are asserted, for the same reason NM-0020 asserts both: the confidence is
+    the symptom a caller meets, and the BM25 output is where the order actually leaked, so
+    a future regression is reported against the stage that caused it.
+    """
+
+    ENTRIES = (
+        ("e0", "Customer", "account", ""),
+        ("e1", "Address", "balance", "email"),
+        ("e2", "Customer Address Account", "email", ""),
+        ("e3", "Transaction Identifier Opened", "account_balance", "customer email address amount"),
+    )
+    PERMUTATION_SEED = 0
+
+    @classmethod
+    def _entries(cls) -> list[DictionaryEntry]:
+        return [
+            DictionaryEntry(
+                id=entry_id,
+                business_name=business_name,
+                logical_name=logical_name,
+                definition=definition,
+                data_type=DataType.STRING,
+                domain="CUSTOMER",
+            )
+            for entry_id, business_name, logical_name, definition in cls.ENTRIES
+        ]
+
+    @staticmethod
+    def _field() -> SchemaField:
+        return SchemaField(
+            name="customer",
+            data_type=DataType.STRING,
+            full_path="customer.customer",
+            parent_path="customer",
+            description="",
+        )
+
+    @classmethod
+    def _shuffled(cls) -> list[DictionaryEntry]:
+        shuffled = cls._entries()
+        np.random.default_rng(cls.PERMUTATION_SEED).shuffle(shuffled)
+        return shuffled
+
+    def test_the_permutation_really_is_a_permutation(self):
+        """
+        Guards the guard.
+
+        `default_rng(0).shuffle` on four elements is entitled to return them unchanged, and
+        a future numpy could change the stream. If it ever does, every assertion below
+        would hold by comparing a run against itself.
+        """
+        before = [e.id for e in self._entries()]
+        after = [e.id for e in self._shuffled()]
+        assert sorted(before) == sorted(after)
+        assert before != after, (
+            f"the permutation seed no longer permutes anything ({after}), so this class "
+            f"compares a run against itself and proves nothing"
+        )
+
+    def test_the_corpus_still_sits_on_the_knife_edge_that_caused_it(self):
+        """
+        Guards the guard, at the cause.
+
+        The sign flip needed raw IDFs that cancel EXACTLY: five terms at -0.847298 and four
+        at +0.847298, total 0.0, which a pairwise float64 reduction returns as
+        +/-2.220446e-16 depending on the row order it walked. Edit any of the four
+        definitions above and that cancellation is gone -- the floor becomes an ordinary
+        number, both orders agree for a reason that has nothing to do with the fix, and
+        this class goes on printing PASS while covering nothing.
+        """
+        retriever = BM25Retriever()
+        documents = [
+            SparseDocument(id=entry.id, text=entry.to_searchable_text())
+            for entry in self._entries()
+        ]
+        assert retriever.index(documents).is_success
+
+        n_docs = len(documents)
+        tokenized = [retriever._tokenize(doc.text) for doc in documents]
+        raw = [
+            math.log(n_docs - df + 0.5) - math.log(df + 0.5)
+            for df in (
+                sum(1 for tokens in tokenized if term in tokens) for term in retriever._vocab
+            )
+        ]
+
+        assert any(value < 0 for value in raw), (
+            "no term appears in more than half this corpus, so the epsilon floor is never "
+            "applied and the defect cannot be reproduced by this fixture"
+        )
+        assert math.fsum(raw) == 0.0, (
+            f"the raw IDFs no longer cancel (exact total {math.fsum(raw)!r}), so the "
+            f"average is no longer a quantity whose SIGN a reduction order can decide"
+        )
+
+    def test_bm25_returns_the_same_documents_whatever_order_they_were_indexed_in(self):
+        """
+        EXACT, ids and scores both, and exact is the right assertion here: a BM25 score is
+        a function of the corpus as a SET, and every input to it -- document frequency,
+        average document length, the epsilon floor -- is a statistic of that set.
+
+        This is the assertion that fails first when the floor goes back to an
+        order-dependent reduction, and it fails at full strength rather than as a rounding
+        difference: the arm returns three documents in one order and none in the other.
+        """
+        query = "customer customer"
+        runs = []
+        for order in (self._entries(), self._shuffled()):
+            retriever = BM25Retriever()
+            assert retriever.index(
+                [SparseDocument(id=e.id, text=e.to_searchable_text()) for e in order]
+            ).is_success
+            found = retriever.search(query, top_k=100)
+            assert found.is_success
+            runs.append([(hit.id, hit.score) for hit in found.unwrap()])
+
+        assert runs[0] == runs[1], (
+            f"BM25 returned {runs[0]} for one glossary order and {runs[1]} for a "
+            f"permutation of the same rows, so a lexical score depends on where an entry "
+            f"sits in the corpus rather than on what it says"
+        )
+
+    def test_the_published_confidence_does_not_move_when_the_rows_are_re_ordered(self):
+        """
+        The symptom a caller meets, asserted at the tolerance the property itself uses.
+
+        1e-6 rather than bit-identity for the reason `FLOAT32_REASSOCIATION` exists: the
+        dense arm's cosines come out of a float32 GEMM whose panels are packed from the
+        corpus rows, so permuting the rows is entitled to move a confidence by a few ULPs.
+        The measured band is 8.2e-08 over two 20,000-example soaks; the defect moved this
+        confidence by 7.0e-02, a million times that. There is no tolerance question here,
+        only a defect question.
+
+        ONE `SchemaField` INSTANCE, reused. `_by_field` joins on the field OBJECT, which
+        is the honest key across a permutation -- see its docstring -- so handing the two
+        runs two equal-but-distinct fields would make the two result maps share no key and
+        the loop below iterate zero times.
+        """
+        field = self._field()
+        before = _by_field(build_matcher(self._entries())._match_fields([field]))
+        after = _by_field(build_matcher(self._shuffled())._match_fields([field]))
+
+        assert set(before) == set(after)
+        assert before, "the matcher returned nothing, so every comparison below is vacuous"
+        for key in before:
+            ranked_before, ranked_after = ranked_ids(before[key]), ranked_ids(after[key])
+            scores_before, scores_after = confidences(before[key]), confidences(after[key])
+            assert ranked_before == ranked_after, (
+                f"re-ordering the glossary rows changed the ranking from {ranked_before} "
+                f"to {ranked_after}"
+            )
+            for rank, (was, now) in enumerate(zip(scores_before, scores_after, strict=True)):
+                assert abs(was - now) <= FLOAT32_REASSOCIATION, (
+                    f"rank {rank} confidence moved {abs(was - now):.3e} on row order "
+                    f"alone: {was!r} -> {now!r}. This is NM-0034; the sparse arm's "
+                    f"epsilon IDF floor is being derived from an order-dependent sum "
+                    f"again."
+                )
+
+    def test_the_rank_one_confidence_is_the_one_the_defect_moved(self):
+        """
+        Names the number, so a future reader can check the story rather than trust it.
+
+        0.88625 is what both orders produce once the floor is exact, and it is the LOWER of
+        the two values the defect produced -- the sparse arm is genuinely empty for this
+        query, so rank 1's fused score is `fusion_alpha` = 0.90 and nothing else. The
+        broken code's 0.95625 was 0.90 plus a full lexical 1.0 that min-max manufactured
+        out of scores of 1.6e-17.
+        """
+        for label, order in (("as listed", self._entries()), ("permuted", self._shuffled())):
+            matches = next(iter(build_matcher(order)._match_fields([self._field()]).values()))
+            top = matches[0]
+            assert top.dictionary_entry.id == "e0", f"{label}: rank 1 is {top.dictionary_entry.id}"
+            assert top.final_confidence == pytest.approx(0.88625, abs=1e-9), (
+                f"{label}: rank 1 confidence is {top.final_confidence!r}, not the 0.88625 "
+                f"this defect was measured against"
+            )
+            assert top.score_breakdown.fused_retrieval_score == pytest.approx(0.90, abs=1e-9), (
+                f"{label}: fused retrieval score is "
+                f"{top.score_breakdown.fused_retrieval_score!r}; the defect showed as this "
+                f"number moving to 1.00, so it is the one worth naming"
+            )
 
 
 class TestDuplicateInsertion:

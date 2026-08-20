@@ -87,7 +87,7 @@ from __future__ import annotations
 # CHANGELOG's latest release, the built wheel, the API and the log envelope all
 # said 2.0.0, so `python -m build` would have produced a 1.0.0 artifact and the
 # publish workflow would have tried to release it over the existing 2.0.0.
-__version__ = "2.1.0"
+__version__ = "2.2.0"
 __author__ = "Pierce Lonergan"
 __email__ = "lonerganpierce@gmail.com"
 __license__ = "Apache-2.0"

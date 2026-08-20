@@ -11,9 +11,14 @@ import io.github.pierce_lonergan.nexusmatcher.model.Feedback;
 import io.github.pierce_lonergan.nexusmatcher.model.FeedbackReceipt;
 import io.github.pierce_lonergan.nexusmatcher.model.FieldSpec;
 import io.github.pierce_lonergan.nexusmatcher.model.HealthStatus;
+import io.github.pierce_lonergan.nexusmatcher.model.LookupRequest;
+import io.github.pierce_lonergan.nexusmatcher.model.LookupResponse;
 import io.github.pierce_lonergan.nexusmatcher.model.MatchRequest;
 import io.github.pierce_lonergan.nexusmatcher.model.MatchResponse;
 import io.github.pierce_lonergan.nexusmatcher.model.Readiness;
+import io.github.pierce_lonergan.nexusmatcher.model.RetrievalDiagnostic;
+import io.github.pierce_lonergan.nexusmatcher.model.RetrievalDiagnosticRequest;
+import io.github.pierce_lonergan.nexusmatcher.model.ServiceStatus;
 
 import java.io.IOException;
 import java.net.URI;
@@ -44,17 +49,19 @@ import java.util.function.Supplier;
  *         .maxRetries(2)
  *         .build();
  *
+ * String path = "booking.passenger.legal_name";
  * MatchResponse response = client.match(List.of(
- *         FieldSpec.of("legal_name", "booking.passenger.legal_name",
+ *         FieldSpec.of("legal_name", path,
  *                      "Full legal name as printed on the sailing manifest.", "string")));
  *
- * response.topCandidateFor("booking.passenger.legal_name").ifPresent(candidate -> {
- *     switch (candidate.governanceStatus()) {
- *         case CONFERRED -> apply(candidate.governance());
- *         case OPEN_TIER -> applyOpenTier(response.vocabulary().openClassification());
- *         case WITHHELD_REJECTED_TOP_MATCH -> sendToAHuman();
- *     }
- * });
+ * // The field verdict first. It is the authority for a COLUMN; a candidate's own decision is
+ * // about that candidate, and a NO_MATCH field still arrives with candidates that look fine.
+ * switch (response.verdictFor(path).map(FieldVerdict::decision).orElse(FieldDecision.UNKNOWN)) {
+ *     case AUTO_APPROVE -> response.inheritableGovernanceFor(path).ifPresentOrElse(
+ *             governance -> apply(governance),
+ *             () -> applyOpenTier(response.vocabulary().openClassification()));
+ *     case REVIEW, REJECT, NO_MATCH, UNKNOWN -> sendToAHuman(response.candidatesFor(path));
+ * }
  * }</pre>
  *
  * <p>Instances are immutable and safe to share between threads; the underlying
@@ -70,6 +77,9 @@ public final class NexusMatcherClient {
 
     private static final String MATCH_PATH = "/api/v1/match";
     private static final String MATCH_BATCH_PATH = "/api/v1/match/batch";
+    private static final String LOOKUP_PATH = "/api/v1/lookup";
+    private static final String STATUS_PATH = "/api/v1/status";
+    private static final String DIAG_RETRIEVAL_PATH = "/api/v1/diag/retrieval";
     private static final String FEEDBACK_PATH = "/api/v1/feedback";
     private static final String HEALTH_PATH = "/health";
     private static final String READY_PATH = "/health/ready";
@@ -166,6 +176,103 @@ public final class NexusMatcherClient {
         Exchange exchange = send("POST", path, request, requestId, 200);
         MatchResponse body = decode(exchange, MatchResponse.class);
         return body.withTransport(exchange.requestId(), exchange.responseTimeMs());
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Lookup -- exact resolution by id, which is not matching
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * Resolve dictionary ids the caller already knows, exactly.
+     *
+     * <p><strong>Use this rather than {@link #match(List)} whenever you already hold the id.</strong>
+     * A lookup hit is exact by construction: no encoder runs, no corpus is scanned, nothing is
+     * ranked, and there is no confidence to misread. Sending a known id through matching costs all
+     * of that and is <em>less</em> accurate, because matching can rank a different entry first.
+     *
+     * <p>Every id comes back exactly once in the order sent. An id the dictionary does not carry is
+     * a {@code null} in {@link LookupResponse#results()} and an entry in
+     * {@link LookupResponse#missing()} -- a 200, not a 404 and not an exception. On this service a
+     * 404 means the route does not exist, and a caller who mistakes that for "the term was retired"
+     * reaches a wrong conclusion about the glossary rather than about their own URL.
+     *
+     * <p>The id cap is {@link io.github.pierce_lonergan.nexusmatcher.model.ServiceLimits#maxBatchFields()},
+     * which {@link #status()} reports; over it the server answers 413.
+     */
+    public LookupResponse lookup(List<String> ids) {
+        return lookup(LookupRequest.of(ids), null);
+    }
+
+    /**
+     * Resolve one id.
+     *
+     * <p>Goes over {@code POST /api/v1/lookup} rather than the service's single-id
+     * {@code GET /api/v1/lookup/{id}}, deliberately. A dictionary id is an opaque caller-supplied
+     * string that may contain a slash, a question mark, a space or a non-ASCII character; placing
+     * one in a path segment means percent-encoding it correctly against a route declared as a
+     * catch-all, where an encoded {@code %2F} and a raw {@code /} mean the same thing to the server
+     * and different things to every proxy between here and it. The POST route carries the identical
+     * string in a JSON body, where that question does not arise, and answers the identical DTO --
+     * which is exactly why the service publishes one model for both. The GET form remains useful
+     * from a terminal; it is not the shape to build a client on.
+     */
+    public LookupResponse lookup(String id) {
+        return lookup(LookupRequest.of(id), null);
+    }
+
+    /** Resolve ids under a correlation id you choose. */
+    public LookupResponse lookup(LookupRequest request, String requestId) {
+        Objects.requireNonNull(request, "request");
+        return decode(send("POST", LOOKUP_PATH, request, requestId, 200), LookupResponse.class);
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Introspection -- what is loaded, and why a field missed
+    // ---------------------------------------------------------------------------------------
+
+    /**
+     * {@code GET /api/v1/status}: what this server is loaded with, and whether it is degraded.
+     *
+     * <p><strong>This is the check to run before a bulk run, not {@link #readiness()}.</strong>
+     * Readiness answers "has the process finished starting", and a server can be perfectly ready
+     * while answering every field out of an encoder the selection ladder fell through to -- which
+     * has cost the adopting pipeline an entire bulk run before, six hours of quietly worse results
+     * with nothing down. Gate on
+     * {@link io.github.pierce_lonergan.nexusmatcher.model.ServiceStatus#fitForBulkRun()}.
+     *
+     * <p>Answers 200 even when the server is not ready: a diagnostic that fails when things are
+     * broken is a diagnostic nobody can use. The body is byte-stable, so two hosts can be diffed.
+     */
+    public ServiceStatus status() {
+        return decode(send("GET", STATUS_PATH, null, null, 200), ServiceStatus.class);
+    }
+
+    /**
+     * {@code POST /api/v1/diag/retrieval}: why did this field not match?
+     *
+     * <p>Reports what the query text became, what each retrieval channel returned with its raw
+     * scores, and -- when the request names an expected entry -- where that entry ranked in each
+     * channel, or that it is not in the dictionary at all. Those last two are different diagnoses
+     * and the answer says which;
+     * {@link io.github.pierce_lonergan.nexusmatcher.model.RetrievalDiagnostic#diagnosis()} renders
+     * it as a line.
+     *
+     * <p>Retrieval only, and the returned object says so at length: this is not the ranking
+     * {@link #match(MatchRequest)} produces. It is also the one introspection route that costs real
+     * CPU on the server, so it goes through the same admission control and the same deadline a match
+     * does -- which means it can answer 503 or 504 like one.
+     */
+    public RetrievalDiagnostic diagnoseRetrieval(RetrievalDiagnosticRequest request) {
+        return diagnoseRetrieval(request, null);
+    }
+
+    /** Diagnose one field's retrieval under a correlation id you choose. */
+    public RetrievalDiagnostic diagnoseRetrieval(
+            RetrievalDiagnosticRequest request, String requestId) {
+        Objects.requireNonNull(request, "request");
+        return decode(
+                send("POST", DIAG_RETRIEVAL_PATH, request, requestId, 200),
+                RetrievalDiagnostic.class);
     }
 
     // ---------------------------------------------------------------------------------------

@@ -36,6 +36,11 @@ VERDICT = {
 
 # The key order of a stored record, pinned as a literal. A JSONL audit trail whose key
 # order wanders cannot be diffed across hosts or across days.
+#
+# `verdict` was APPENDED when the vocabulary widened (WC-11), so the eight keys above it
+# keep their positions and a trail spanning that upgrade still diffs cleanly. The verdicts
+# themselves, and the fact that an absent one is stored as null rather than inferred, are
+# tested in `test_feedback_vocabulary.py`; this file's interest is that the ORDER holds.
 RECORD_KEYS = (
     "ts",
     "receivedAt",
@@ -45,6 +50,7 @@ RECORD_KEYS = (
     "chosenGovernanceId",
     "suggestedGovernanceId",
     "wasCorrect",
+    "verdict",
 )
 
 
@@ -224,10 +230,46 @@ class TestFeedbackDoesNotAffectRanking:
         """
         The structural half. The behavioural test above can only see leakage that changes
         THIS fixture's ranking; a dependency that fires on other data would slip past it.
-        """
-        from nexus_matcher.presentation.api import matching
 
-        source = Path(matching.__file__).read_text(encoding="utf-8")
-        assert "feedback" not in source.lower(), (
-            "the matching path names the feedback store; recording must stay one-way"
+        NARROWED FROM A SUBSTRING TO THE RECORDER, and the reason is that the substring
+        stopped asking the right question when AR-7 landed. `matching.py` now imports
+        `domain.ports.review_feedback` for the candidate `provenance` vocabulary -- a
+        two-value enum and one reader over a `MatchResult` the matcher has ALREADY
+        produced. It carries no verdict, no reviewer, no trail and no store, and it runs
+        after ranking is over, so it cannot move one. Refusing it would have made a wire
+        member that states where an answer came from impossible to publish, which is the
+        opposite of what this test protects.
+
+        WHAT MUST STAY ABSENT is the RECORDER: the module that writes the trail, its key
+        table, and the store it writes to. Named token by token below, and each token is
+        checked to be PRESENT in the recorder first -- a banned list that could never fire
+        is the vacuity this directory exists to refuse.
+        """
+        from nexus_matcher.presentation.api import feedback, matching
+
+        recorder = Path(feedback.__file__).read_text(encoding="utf-8").lower()
+        source = Path(matching.__file__).read_text(encoding="utf-8").lower()
+
+        # Tokens of the RECORDING path. Not "feedback": the port that names the seam is
+        # `domain.ports.review_feedback`, and naming a port is not reading a store.
+        banned = (
+            "feedbackrecorder",
+            "feedbackrequest",
+            "create_feedback_router",
+            "_stored_record",
+            "_record_keys",
+        )
+
+        unfireable = [token for token in banned if token not in recorder]
+        assert not unfireable, (
+            f"these tokens are no longer in the recorder, so banning them from the "
+            f"matching path proves nothing: {unfireable}"
+        )
+
+        leaked = [token for token in banned if token in source]
+        assert not leaked, (
+            f"the matching path names the feedback recorder ({leaked}); recording must stay one-way"
+        )
+        assert "presentation.api.feedback" not in source, (
+            "the matching path imports the feedback recorder module"
         )

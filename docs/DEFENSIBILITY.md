@@ -167,7 +167,7 @@ tree it verifies **96 claims and reports 141 mismatches**, across nine documents
 
 | Document | Mismatches | What is wrong |
 |---|---|---|
-| `docs/BENCHMARK_REGISTRY.md` | 69 | every A-grade number is **pre-leakage-fix**: P@1 0.6999, 652.3 fields/sec, the whole EXP-QUERY-REPR table, the whole EXP-CALIBRATION table, and a **+0.0555 reranker gain** the README explicitly retracts as a loss of 1.3 |
+| `docs/BENCHMARK_REGISTRY.md` | 69 -> **0** | RESOLVED 2026-08-11. Every A-grade number was pre-leakage-fix: P@1 0.6999, 652.3 fields/sec, the EXP-QUERY-REPR and EXP-CALIBRATION tables, and a **+0.0555 reranker gain** the README retracts as a loss of 1.3. The file was re-derived against its artifacts and its 69 entries went away, taking the ledger from 141 findings to 72. The rows below are the state as first audited and are kept as the record of what was found, not as a claim about today. |
 | `docs/ENHANCEMENT_JOURNEY.md` | 27 | the same era, same numbers |
 | `CHANGELOG.md` | 11 | P@1 0.700 / bird 0.490 / omop 0.819, and "94.7% precise over 42.7% coverage" (artifact: 91.6% over 20.8%) |
 | `docs/RESEARCH_ALIGNMENT.md` | 8 | "real measured performance P@1 0.700 / P@5 0.888 / MRR@10 0.781" |
@@ -230,8 +230,8 @@ wrong claims in one document collapse to one entry.
 
 | Hole | Severity |
 |---|---|
-| 141 documented numbers still contradict their artifacts; the gate records them, nobody has fixed them | **HIGH** |
-| `docs/BENCHMARK_REGISTRY.md` is the designated source of truth for every claim in the repo and is stale throughout — a reader sent there by the README gets retracted numbers | **HIGH** |
+| ~~141~~ **72** documented numbers contradict their artifacts; the gate records them. 69 were fixed on 2026-08-11 by re-deriving BENCHMARK_REGISTRY.md; the rest remain | MEDIUM |
+| ~~`docs/BENCHMARK_REGISTRY.md` is stale throughout~~ RESOLVED — re-derived against its artifacts on 2026-08-11. A reader sent there by the README now gets numbers that match what produced them | RESOLVED |
 | No museum entry for this class. The replay exists (`--report` plus a doc mutation) but was not built as `tests/museum/NM-XXXX/`, being outside this lane's files | MEDIUM |
 | Derived quantities are unchecked, and "+19.3 / +19.9 / +20.1 points of P@1" are three different answers to one question | MEDIUM |
 | The checker cannot distinguish a stale number from a deliberately-quoted retracted one, so ~5 ledger entries are quotations rather than errors | LOW |

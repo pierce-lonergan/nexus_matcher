@@ -41,9 +41,19 @@ MATCH_ROUTES = ("/api/v1/match", "/api/v1/match/batch")
 # because they answer 200 unconditionally -- `/health` reports `status: "degraded"` in a
 # 200 body rather than refusing, which is a deliberate choice `create_health_router`
 # documents, not a missing entry.
+#
+# `/api/v1/status` is absent for the same kind of reason and it is worth spelling out,
+# because this is the one entry whose absence could be mistaken for an omission: it answers
+# 200 whether or not a dictionary is loaded, and reports the trouble in `degraded` and
+# `warnings` instead. A pre-run degradation check that refused when the condition it checks
+# for is true would be unusable at the one moment it is needed, so it publishes no failure
+# because it has none to publish.
 ROUTES_THAT_PUBLISH_FAILURES = {
     "/api/v1/match",
     "/api/v1/match/batch",
+    "/api/v1/lookup",
+    "/api/v1/lookup/{governance_id}",
+    "/api/v1/diag/retrieval",
     "/api/v1/feedback",
     "/health/ready",
     "/health/startup",
