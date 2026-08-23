@@ -1,2 +1,35 @@
 # Auto detect text files and perform LF normalization
 * text=auto
+
+# Shell scripts MUST be LF, whatever the checkout platform.
+#
+# `text=auto` above converts to CRLF on checkout under core.autocrlf=true, which is the
+# Windows default. bash then reads the trailing \r as part of the command and dies with
+#     line 34: $'\r': command not found
+# That is exactly how a release failed: scripts/publish.sh was committed from Windows,
+# checked out with CRLF, and aborted before it uploaded anything. Git printed
+# "LF will be replaced by CRLF" on every commit that touched one of these files, which is
+# a warning nobody reads until it costs a deploy.
+*.sh          text eol=lf
+*.bash        text eol=lf
+
+# Files a POSIX tool reads directly and would choke on the same way.
+Makefile      text eol=lf
+*.mk          text eol=lf
+Dockerfile*   text eol=lf
+*.pem         -text
+
+# PowerShell is happy either way, but pinning it stops a diff churning when a file is
+# edited on one platform and committed from another.
+*.ps1         text eol=crlf
+
+# Binary: never touch these.
+*.onnx        binary
+*.whl         binary
+*.gz          binary
+*.png         binary
+*.jpg         binary
+*.ico         binary
+*.pkl         binary
+*.parquet     binary
+*.xlsx        binary
