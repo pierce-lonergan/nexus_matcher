@@ -1,5 +1,8 @@
 # NexusMatcher
 
+[![PyPI](https://img.shields.io/pypi/v/nexus-matcher)](https://pypi.org/project/nexus-matcher/)
+[![Downloads](https://img.shields.io/pypi/dm/nexus-matcher)](https://pypi.org/project/nexus-matcher/)
+[![Total downloads](https://static.pepy.tech/badge/nexus-matcher)](https://pepy.tech/project/nexus-matcher)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache%202.0-green.svg)](https://github.com/pierce-lonergan/nexus_matcher/blob/main/LICENSE)
 
