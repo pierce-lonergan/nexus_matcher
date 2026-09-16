@@ -358,7 +358,7 @@ retrieval on, BGE query-instruction prefix on
 | MRR@10 | 0.685 |
 | Recall@10 | 0.878 |
 | Throughput | ~364 fields/sec |
-| Index build (688 entries) | ~1.8 s |
+| Index build (688 entries) | ~2.1 s |
 
 Accuracy figures vary by about ±0.002 between runs and throughput varies more than that with machine load, which is why they are
 quoted to three decimals and with a `~`. Treat a change smaller than ±0.005 P@1 as noise
@@ -541,11 +541,12 @@ Read this before trusting the headline number.
 - **One machine, CPU only.** Every measurement here was taken on a single Windows 11
   workstation (AMD64, 32 logical cores, no AVX-512/VNNI), Python 3.13, torch 2.13 CPU
   build. Throughput figures will not transfer to your hardware. No GPU numbers exist.
-- **Abbreviation-heavy schemas are hard.** bird P@1 is 0.598. Roughly half the fields in
+- **Abbreviation-heavy schemas are hard.** bird P@1 is 0.601 (`eval_pipeline_bird.json`).
+  Roughly half the fields in
   a BIRD-style schema will *not* have the right answer at rank 1. Recall@10 is much
   better than P@1, which is why the product surface is a ranked review list, not a
   silent auto-mapping.
-- **793-entry dictionary for the headline numbers.** The corpus those are measured on is
+- **688-entry dictionary for the headline numbers.** The corpus those are measured on is
   enterprise-glossary-sized, not catalogue-sized. Accuracy at catalogue scale IS measured,
   separately: `benchmarks/results/exp_scale_combined.json` records P@1 **0.589** (in-memory)
   and **0.591** (HNSW) at **100,000 entries** — so it degrades with corpus size, as the
@@ -607,6 +608,59 @@ on a low score means configuring `absolute_score_floor`, which ships **off**: a 
 statement about a score distribution and the distribution belongs to your glossary, not to
 this library. Measuring one is
 [docs/guides/absolute_score_floor.md](https://github.com/pierce-lonergan/nexus_matcher/blob/main/docs/guides/absolute_score_floor.md).
+
+### Carrying your own columns through: `sourceMetadata`
+
+Your dictionary almost certainly has columns this library has no opinion about — an owning
+team, a retention period, a source-system id. Any column the loader is not told to map
+arrives on every candidate under `sourceMetadata`, byte-for-byte, and on the matching entry
+returned by `/api/v1/lookup`:
+
+```json
+"sourceMetadata": {
+  "values": {"owning_team": "Port Ops", "retention_years": "7"},
+  "droppedKeyCount": 0,
+  "renderedKeys": []
+}
+```
+
+Three properties make it safe to rely on. **The core never reads it** — no score, filter,
+threshold or governance decision depends on a key in there, so a column you add cannot
+change a match. **It is exempt from the content hash**, so editing one does not re-embed
+the entry on the next `sync()`. And **it is bounded**: past a per-entry cap, keys are
+dropped and counted in `droppedKeyCount` rather than silently truncated, so a careless
+mapping cannot quietly double the size of every response.
+
+If the core needs a value, that value gets promoted to a real field with a defined meaning
+— which is what `governance_code` is. `sourceMetadata` is for everything else.
+
+### Per-request context: `signals`
+
+Some things only the caller knows, and they change between requests. A `signals` object on
+a field (or on the request, merged key by key) carries them:
+
+```json
+{"name": "brth_no", "path": "v.brth_no", "type": "string",
+ "signals": {"abbreviations": {"brth": "berth", "no": "number"}}}
+```
+
+That overlay applies to **that request only** — it is never merged into the running
+matcher, which matters when the abbreviations come from a service that can change between
+calls. Measured on the field above, via `/api/v1/diag/retrieval`:
+
+```
+query WITHOUT signals : brth no
+query WITH signals    : berth number
+```
+
+`entity` (the parent record name) and `domain` (a namespace or domain hint) travel the same
+way. A key this library does not recognise is **carried, not rejected** — that is the point
+of the channel. Note the asymmetry: an unknown key inside `signals` is fine, while an
+unknown key *beside* `doc` is still a 422, because a typo and an extension are different
+events and a misspelled `doc` silently costs you retrieval signal.
+
+Both features are off the critical path — a request that sends no `signals` gets byte-identical
+results to one sent before the channel existed.
 
 ### The two members you build against, and the one way to get them wrong
 

@@ -12,7 +12,7 @@ build-backend = "hatchling.build"
 [project]
 name = "nexus-matcher"
 dynamic = ["version"]
-description = "Enterprise-grade semantic schema matching system using neural embeddings, ColBERT reranking, and multi-signal scoring for automated data dictionary mapping"
+description = "Match schema fields to data dictionary entries by meaning. Hybrid dense + BM25 retrieval on a bundled CPU encoder, with governance classification, a no-match verdict, and measured accuracy."
 readme = "README.md"
 # PEP 639. `license = {file = "LICENSE"}` inlined all 11315 characters of the Apache-2.0
 # text into the metadata's License: field (12915 chars over 201 continuation lines), and
@@ -36,7 +36,6 @@ keywords = [
     "data-catalog",
     "embeddings",
     "vector-search",
-    "colbert",
     "sentence-transformers",
     "nlp",
     "machine-learning",

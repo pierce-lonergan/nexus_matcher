@@ -853,14 +853,7 @@ KNOWN_MISMATCHES: frozenset[tuple[str, str, str, str]] = frozenset(
             "exp_query_repr_combined.json variants.abbrev.mrr_at_10=0.482244",
         ),
         ("README.md", "P@1", "0.046", "eval_pipeline_omop.json p_at_1=0.574924"),
-        ("README.md", "P@1", "0.598", "exp_scale_combined.json runs[1].p_at_1=0.591425"),
         ("README.md", "P@1", "0.715", "eval_pipeline_bird.json p_at_1=0.601108"),
-        (
-            "README.md",
-            "index build (688 entries)",
-            "~1.8",
-            "eval_pipeline_combined.json index_seconds=2.06657",
-        ),
         ("README.md", "p@1", "0.361", "exp_query_repr_combined.json variants.raw.p_at_1=0.360465"),
         (
             "README.md",
